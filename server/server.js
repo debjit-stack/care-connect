@@ -3,6 +3,7 @@ import dotenv from 'dotenv';
 import cors from 'cors';
 import connectDB from './config/db.js';
 
+
 // Import route files
 import authRoutes from './routes/authRoutes.js';
 import doctorRoutes from './routes/doctorRoutes.js'; // <-- ADD THIS LINE
@@ -25,6 +26,15 @@ const app = express();
 app.use(cors()); // Enable Cross-Origin Resource Sharing
 app.use(express.json()); // Enable JSON body parsing
 
+
+// CORS Configuration: This is crucial for your live site to work.
+// It tells your backend to accept requests from your Netlify frontend.
+const corsOptions = {
+  origin: 'https://ccmanagement.netlify.app/', 
+  optionsSuccessStatus: 200 
+};
+
+
 // API Routes
 app.use('/api/auth', authRoutes);
 app.use('/api/doctors', doctorRoutes); // <-- ADD THIS LINE (and uncomment it)
@@ -41,5 +51,7 @@ app.get('/', (req, res) => {
 });
 
 const PORT = process.env.PORT || 5000;
+
+
 
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
