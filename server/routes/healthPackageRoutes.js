@@ -5,7 +5,7 @@ import {
     createHealthPackage,
     updateHealthPackage,
     deleteHealthPackage
-} from '../controllers/healthpackageController.js';
+} from '../controllers/healthPackageController.js';
 import { protect, admin } from '../middleware/authMiddleware.js';
 
 router.route('/')
