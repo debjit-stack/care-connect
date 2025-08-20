@@ -1,7 +1,8 @@
 import axios from 'axios';
 
+
 const API = axios.create({
-  baseURL: 'https://care-connect-api-1m1s.onrender.com', // Your backend server URL
+  baseURL: 'https://care-connect-api-1m1s.onrender.com/api', // Your backend server URL
 });
 
 // This is a request interceptor. It will attach the JWT token to every
