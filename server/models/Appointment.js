@@ -39,5 +39,13 @@ const appointmentSchema = mongoose.Schema({
     timestamps: true,
 });
 
+appointmentSchema.index(
+    { doctor: 1, appointmentDate: 1, appointmentTime: 1 },
+    {
+        unique: true,
+        partialFilterExpression: { status: { $ne: 'Cancelled' } },
+    }
+);
+
 const Appointment = mongoose.model('Appointment', appointmentSchema);
 export default Appointment;

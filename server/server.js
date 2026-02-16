@@ -11,6 +11,7 @@ import receptionistRoutes from './routes/receptionistRoutes.js';
 import patientRoutes from './routes/patientRoutes.js';
 import healthPackageRoutes from './routes/healthPackageRoutes.js';
 import dashboardRoutes from './routes/dashboardRoutes.js';
+import { notFound, errorHandler } from './middleware/errorMiddleware.js';
 
 // Load environment variables
 dotenv.config();
@@ -57,6 +58,9 @@ app.use('/api/dashboard', dashboardRoutes);
 app.get('/', (req, res) => {
     res.send('CareConnect API is up and running!');
 });
+
+app.use(notFound);
+app.use(errorHandler);
 
 const PORT = process.env.PORT || 5000;
 

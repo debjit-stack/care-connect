@@ -1,4 +1,6 @@
 import express from 'express';
+import asyncHandler from '../middleware/asyncHandler.js';
+
 const router = express.Router();
 import {
     registerPatient,
@@ -21,10 +23,10 @@ const isReceptionistOrAdmin = (req, res, next) => {
 // All routes in this file are protected
 router.use(protect, isReceptionistOrAdmin);
 
-router.route('/register-patient').post(registerPatient);
-router.route('/book-appointment').post(bookOfflineAppointment);
-router.route('/search-patients').get(searchPatients);
-router.route('/appointments').get(getAppointmentsByDate);
-router.route('/book-package').post(bookHealthPackageForPatient);
+router.route('/register-patient').post(asyncHandler(registerPatient));
+router.route('/book-appointment').post(asyncHandler(bookOfflineAppointment));
+router.route('/search-patients').get(asyncHandler(searchPatients));
+router.route('/appointments').get(asyncHandler(getAppointmentsByDate));
+router.route('/book-package').post(asyncHandler(bookHealthPackageForPatient));
 
 export default router;

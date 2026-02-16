@@ -1,10 +1,27 @@
 import Appointment from '../models/Appointment.js';
+import Doctor from '../models/Doctor.js';
 
 // @desc    Create a new appointment
 // @route   POST /api/appointments
 // @access  Private (Patient)
 const createAppointment = async (req, res) => {
     const { doctorId, appointmentDate, appointmentTime, type } = req.body;
+
+    const doctor = await Doctor.findById(doctorId);
+    if (!doctor) {
+        return res.status(404).json({ message: 'Doctor not found' });
+    }
+
+    const existingAppointment = await Appointment.findOne({
+        doctor: doctorId,
+        appointmentDate,
+        appointmentTime,
+        status: { $ne: 'Cancelled' },
+    });
+
+    if (existingAppointment) {
+        return res.status(409).json({ message: 'This time slot is already booked' });
+    }
 
     const appointment = new Appointment({
         doctor: doctorId,

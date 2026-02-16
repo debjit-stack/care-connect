@@ -1,5 +1,4 @@
 import Doctor from '../models/Doctor.js';
-import User from '../models/User.js';
 import Appointment from '../models/Appointment.js';
 
 // --- Public Routes ---
@@ -8,7 +7,7 @@ import Appointment from '../models/Appointment.js';
 // @route   GET /api/doctors
 // @access  Public
 const getDoctors = async (req, res) => {
-    const doctors = await Doctor.find({}).populate('user', 'name email specialty');
+    const doctors = await Doctor.find({}).populate('user', 'name email');
     res.json(doctors);
 };
 
@@ -133,23 +132,26 @@ const updateAppointment = async (req, res) => {
     const { notes, prescription, status } = req.body;
 
     const appointment = await Appointment.findById(req.params.appointmentId);
+    if (!appointment) {
+        return res.status(404).json({ message: 'Appointment not found' });
+    }
+
+    const doctorProfile = await Doctor.findOne({ user: req.user._id });
+    if (!doctorProfile) {
+        return res.status(404).json({ message: 'Doctor profile not found for this user.' });
+    }
 
     // Ensure the appointment belongs to the doctor trying to update it
-    const doctorProfile = await Doctor.findOne({ user: req.user._id });
     if (appointment.doctor.toString() !== doctorProfile._id.toString()) {
         return res.status(401).json({ message: 'Not authorized to update this appointment' });
     }
 
-    if (appointment) {
-        appointment.notes = notes || appointment.notes;
-        appointment.prescription = prescription || appointment.prescription;
-        appointment.status = status || appointment.status;
+    appointment.notes = notes || appointment.notes;
+    appointment.prescription = prescription || appointment.prescription;
+    appointment.status = status || appointment.status;
 
-        const updatedAppointment = await appointment.save();
-        res.json(updatedAppointment);
-    } else {
-        res.status(404).json({ message: 'Appointment not found' });
-    }
+    const updatedAppointment = await appointment.save();
+    res.json(updatedAppointment);
 };
 
 // @desc    Update the logged-in doctor's own availability

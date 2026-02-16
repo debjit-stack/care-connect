@@ -1,6 +1,7 @@
 import User from '../models/User.js';
 import Appointment from '../models/Appointment.js';
 import PackageBooking from '../models/PackageBooking.js';
+import Doctor from '../models/Doctor.js';
 
 // @desc    Register a new patient
 // @route   POST /api/receptionist/register-patient
@@ -46,7 +47,21 @@ const bookOfflineAppointment = async (req, res) => {
         res.status(404).json({ message: 'Patient not found' });
         return;
     }
-    // In a full implementation, you would also validate the doctorId
+    const doctor = await Doctor.findById(doctorId);
+    if (!doctor) {
+        return res.status(404).json({ message: 'Doctor not found' });
+    }
+
+    const existingAppointment = await Appointment.findOne({
+        doctor: doctorId,
+        appointmentDate,
+        appointmentTime,
+        status: { $ne: 'Cancelled' },
+    });
+
+    if (existingAppointment) {
+        return res.status(409).json({ message: 'This time slot is already booked' });
+    }
 
     const appointment = new Appointment({
         doctor: doctorId,
