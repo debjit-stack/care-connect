@@ -3,9 +3,6 @@ import Doctor from '../models/Doctor.js';
 
 // --- User Management ---
 
-// @desc    Get all users (can filter by role)
-// @route   GET /api/admin/users
-// @access  Private (Admin)
 const getUsers = async (req, res) => {
     const { role } = req.query;
     const filter = role ? { role } : {};
@@ -13,9 +10,6 @@ const getUsers = async (req, res) => {
     res.json(users);
 };
 
-// @desc    Get user by ID
-// @route   GET /api/admin/users/:id
-// @access  Private (Admin)
 const getUserById = async (req, res) => {
     const user = await User.findById(req.params.id).select('-password');
     if (user) {
@@ -25,19 +19,12 @@ const getUserById = async (req, res) => {
     }
 };
 
-// @desc    Update user
-// @route   PUT /api/admin/users/:id
-// @access  Private (Admin)
 const updateUser = async (req, res) => {
     const user = await User.findById(req.params.id);
-
     if (user) {
         user.name = req.body.name || user.name;
         user.email = req.body.email || user.email;
         user.role = req.body.role || user.role;
-        // You might not want to allow password changes here for security reasons
-        // but if you do, you'd handle it here.
-
         const updatedUser = await user.save();
         res.json({
             _id: updatedUser._id,
@@ -50,14 +37,9 @@ const updateUser = async (req, res) => {
     }
 };
 
-// @desc    Delete user
-// @route   DELETE /api/admin/users/:id
-// @access  Private (Admin)
 const deleteUser = async (req, res) => {
     const user = await User.findById(req.params.id);
-
     if (user) {
-        // If the user is a doctor, also delete their doctor profile
         if (user.role === 'doctor') {
             await Doctor.deleteOne({ user: user._id });
         }
@@ -68,27 +50,18 @@ const deleteUser = async (req, res) => {
     }
 };
 
-
 // --- Doctor Profile Management ---
 
-// @desc    Create a new doctor profile
-// @route   POST /api/admin/doctors
-// @access  Private (Admin)
 const createDoctor = async (req, res) => {
     const { name, email, password, specialty, qualifications, experienceYears } = req.body;
-
     const userExists = await User.findOne({ email });
     if (userExists) {
-        res.status(400).json({ message: 'A user with this email already exists' });
-        return;
+        return res.status(400).json({ message: 'A user with this email already exists' });
     }
-
     const user = await User.create({ name, email, password, role: 'doctor' });
     if (!user) {
-        res.status(400).json({ message: 'Failed to create user for the doctor' });
-        return;
+        return res.status(400).json({ message: 'Failed to create user for the doctor' });
     }
-
     const doctor = await Doctor.create({ user: user._id, specialty, qualifications, experienceYears });
     if (doctor) {
         res.status(201).json({ message: 'Doctor created successfully', user, doctor });
@@ -98,18 +71,13 @@ const createDoctor = async (req, res) => {
     }
 };
 
-// @desc    Update a doctor's profile details
-// @route   PUT /api/admin/doctors/:id
-// @access  Private (Admin)
 const updateDoctorProfile = async (req, res) => {
     const doctor = await Doctor.findById(req.params.id);
-
     if (doctor) {
         doctor.specialty = req.body.specialty || doctor.specialty;
         doctor.qualifications = req.body.qualifications || doctor.qualifications;
         doctor.experienceYears = req.body.experienceYears || doctor.experienceYears;
         doctor.availability = req.body.availability || doctor.availability;
-
         const updatedDoctor = await doctor.save();
         res.json(updatedDoctor);
     } else {
@@ -117,31 +85,16 @@ const updateDoctorProfile = async (req, res) => {
     }
 };
 
-// @desc    Create a staff user (receptionist or admin)
-// @route   POST /api/admin/staff
-// @access  Private (Admin)
 const createStaff = async (req, res) => {
     const { name, email, password, role } = req.body;
-
-    // Ensure only valid staff roles can be created through this endpoint
     if (!['receptionist', 'admin'].includes(role)) {
-        res.status(400).json({ message: 'Invalid role specified. Can only create receptionist or admin.' });
-        return;
+        return res.status(400).json({ message: 'Invalid role specified.' });
     }
-
     const userExists = await User.findOne({ email });
     if (userExists) {
-        res.status(400).json({ message: 'A user with this email already exists' });
-        return;
+        return res.status(400).json({ message: 'A user with this email already exists' });
     }
-
-    const user = await User.create({
-        name,
-        email,
-        password,
-        role,
-    });
-
+    const user = await User.create({ name, email, password, role });
     if (user) {
         res.status(201).json({
             _id: user._id,
@@ -157,9 +110,7 @@ const createStaff = async (req, res) => {
 const resetPassword = async (req, res) => {
     const { newPassword } = req.body;
     const user = await User.findById(req.params.id);
-
     if (user) {
-        // The 'save' pre-hook in the User model will automatically hash the password
         user.password = newPassword;
         await user.save();
         res.json({ message: 'Password updated successfully' });
@@ -168,7 +119,16 @@ const resetPassword = async (req, res) => {
     }
 };
 
-
+// NEW: Returns full Doctor documents (with user populated) so frontend
+// can get the real Doctor._id for availability updates
+const getDoctorsWithProfiles = async (req, res) => {
+    try {
+        const doctors = await Doctor.find({}).populate('user', 'name email');
+        res.json(doctors);
+    } catch (error) {
+        res.status(500).json({ message: 'Server Error' });
+    }
+};
 
 export {
     getUsers,
@@ -178,5 +138,6 @@ export {
     createDoctor,
     updateDoctorProfile,
     createStaff,
-    resetPassword
+    resetPassword,
+    getDoctorsWithProfiles,
 };

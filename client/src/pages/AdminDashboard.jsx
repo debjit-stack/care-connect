@@ -1,5 +1,16 @@
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
-import { getDashboardStats, getAllUsers, deleteUser, createStaff, createDoctor, updateUser, registerPatientByAdmin, updateDoctorAvailability, resetPassword } from '../api/admin';
+import {
+    getDashboardStats,
+    getAllUsers,
+    deleteUser,
+    createStaff,
+    createDoctor,
+    updateUser,
+    registerPatientByAdmin,
+    updateDoctorAvailability,
+    resetPassword,
+    getDoctorProfiles,
+} from '../api/admin';
 import { fetchPackages, createPackage, deletePackage, updatePackage } from '../api/packages';
 import { useAuth } from '../context/AuthContext';
 
@@ -22,9 +33,12 @@ const AdminDashboard = () => {
     const { user: loggedInUser } = useAuth();
     const [stats, setStats] = useState(null);
     const [users, setUsers] = useState([]);
+    // doctorProfiles = full Doctor documents { _id, user: {name,email}, specialty, availability, ... }
+    const [doctorProfiles, setDoctorProfiles] = useState([]);
     const [packages, setPackages] = useState([]);
     const [loading, setLoading] = useState(true);
-    
+    const [error, setError] = useState('');
+
     const [doctorSearch, setDoctorSearch] = useState('');
     const [patientSearch, setPatientSearch] = useState('');
     const [staffSearch, setStaffSearch] = useState('');
@@ -35,16 +49,20 @@ const AdminDashboard = () => {
     const loadDashboardData = useCallback(async () => {
         try {
             setLoading(true);
-            const [statsData, usersData, packagesData] = await Promise.all([
+            setError('');
+            const [statsData, usersData, packagesData, doctorProfilesData] = await Promise.all([
                 getDashboardStats(),
                 getAllUsers(),
-                fetchPackages()
+                fetchPackages(),
+                getDoctorProfiles(),
             ]);
             setStats(statsData.data);
             setUsers(usersData.data);
             setPackages(packagesData.data);
-        } catch (error) {
-            console.error("Failed to load dashboard data:", error);
+            setDoctorProfiles(doctorProfilesData.data);
+        } catch (err) {
+            console.error('Failed to load dashboard data:', err);
+            setError('Failed to load dashboard data. Please refresh.');
         } finally {
             setLoading(false);
         }
@@ -54,54 +72,110 @@ const AdminDashboard = () => {
         loadDashboardData();
     }, [loadDashboardData]);
 
+    const closeModal = () => setModal({ type: null, data: null });
+
     const handleSave = async (type, data) => {
-        switch (type) {
-            case 'staff': await createStaff(data); break;
-            case 'doctor': await createDoctor(data); break;
-            case 'patient': await registerPatientByAdmin(data); break;
-            case 'package': await createPackage(data); break;
-            case 'editUser': await updateUser(modal.data._id, data); break;
-            case 'editPackage': await updatePackage(modal.data._id, data); break;
-            case 'resetPassword': await resetPassword(modal.data._id, data.newPassword); break;
-            case 'availability': await updateDoctorAvailability(modal.data._id, data); break;
-            default: break;
+        try {
+            switch (type) {
+                case 'staff': await createStaff(data); break;
+                case 'doctor': await createDoctor(data); break;
+                case 'patient': await registerPatientByAdmin(data); break;
+                case 'package': await createPackage(data); break;
+                case 'editUser': await updateUser(modal.data._id, data); break;
+                case 'editPackage': await updatePackage(modal.data._id, data); break;
+                case 'resetPassword': await resetPassword(modal.data._id, data.newPassword); break;
+                // modal.data here is a Doctor document, so modal.data._id = Doctor._id ✓
+                case 'availability': await updateDoctorAvailability(modal.data._id, data); break;
+                default: break;
+            }
+            closeModal();
+            loadDashboardData();
+        } catch (err) {
+            console.error(`Failed to save (${type}):`, err);
+            alert(err?.response?.data?.message || 'Save failed. Please try again.');
         }
-        setModal({ type: null, data: null });
-        loadDashboardData();
     };
 
     const handleDelete = (type, id) => {
         const confirmAction = async () => {
-            if (type === 'user') await deleteUser(id);
-            if (type === 'package') await deletePackage(id);
-            setModal({ type: null, data: null });
-            loadDashboardData();
+            try {
+                if (type === 'user') await deleteUser(id);
+                if (type === 'package') await deletePackage(id);
+                closeModal();
+                loadDashboardData();
+            } catch (err) {
+                console.error('Delete failed:', err);
+                alert('Delete failed. Please try again.');
+            }
         };
-        setModal({ type: 'confirm', data: { title: `Delete ${type}`, message: 'Are you sure?', onConfirm: confirmAction } });
+        setModal({
+            type: 'confirm',
+            data: {
+                title: `Delete ${type}`,
+                message: `Are you sure you want to delete this ${type}? This cannot be undone.`,
+                onConfirm: confirmAction,
+            },
+        });
     };
 
-    const filteredDoctors = useMemo(() => 
-        users.filter(u => u.role === 'doctor' && (u.name.toLowerCase().includes(doctorSearch.toLowerCase()) || u.email.toLowerCase().includes(doctorSearch.toLowerCase()))),
-        [users, doctorSearch]
+    // DoctorList needs: _id (User._id for edit/delete/resetPw), name, email
+    // BUT SetAvailabilityModal needs Doctor._id → we pass the Doctor document as `doctorProfile`
+    // We enrich each doctor user with their Doctor profile
+    const enrichedDoctors = useMemo(() => {
+        return users
+            .filter((u) => u.role === 'doctor')
+            .map((u) => {
+                const profile = doctorProfiles.find(
+                    (dp) => dp.user && dp.user._id === u._id
+                );
+                return { ...u, doctorProfile: profile || null };
+            });
+    }, [users, doctorProfiles]);
+
+    const filteredDoctors = useMemo(
+        () =>
+            enrichedDoctors.filter(
+                (u) =>
+                    u.name.toLowerCase().includes(doctorSearch.toLowerCase()) ||
+                    u.email.toLowerCase().includes(doctorSearch.toLowerCase())
+            ),
+        [enrichedDoctors, doctorSearch]
     );
 
-    const filteredPatients = useMemo(() =>
-        users.filter(u => u.role === 'patient' && (u.name.toLowerCase().includes(patientSearch.toLowerCase()) || u.email.toLowerCase().includes(patientSearch.toLowerCase()))),
+    const filteredPatients = useMemo(
+        () =>
+            users
+                .filter((u) => u.role === 'patient')
+                .filter(
+                    (u) =>
+                        u.name.toLowerCase().includes(patientSearch.toLowerCase()) ||
+                        u.email.toLowerCase().includes(patientSearch.toLowerCase())
+                ),
         [users, patientSearch]
     );
 
-    const filteredStaff = useMemo(() =>
-        users.filter(u => (u.role === 'admin' || u.role === 'receptionist') && (u.name.toLowerCase().includes(staffSearch.toLowerCase()) || u.email.toLowerCase().includes(staffSearch.toLowerCase()))),
+    const filteredStaff = useMemo(
+        () =>
+            users
+                .filter((u) => u.role === 'admin' || u.role === 'receptionist')
+                .filter(
+                    (u) =>
+                        u.name.toLowerCase().includes(staffSearch.toLowerCase()) ||
+                        u.email.toLowerCase().includes(staffSearch.toLowerCase())
+                ),
         [users, staffSearch]
     );
-
 
     if (loading) return <p>Loading Dashboard...</p>;
 
     const TabButton = ({ tabName, label }) => (
         <button
             onClick={() => setActiveTab(tabName)}
-            className={`py-2 px-4 font-semibold rounded-t-lg ${activeTab === tabName ? 'bg-white text-blue-600' : 'bg-gray-200 text-gray-600 hover:bg-gray-300'}`}
+            className={`py-2 px-4 font-semibold rounded-t-lg ${
+                activeTab === tabName
+                    ? 'bg-white text-blue-600'
+                    : 'bg-gray-200 text-gray-600 hover:bg-gray-300'
+            }`}
         >
             {label}
         </button>
@@ -110,12 +184,20 @@ const AdminDashboard = () => {
     return (
         <div>
             <h1 className="text-3xl font-bold mb-6">Admin Dashboard</h1>
+
+            {error && (
+                <p className="bg-red-100 text-red-700 p-3 rounded mb-4">{error}</p>
+            )}
+
             {stats && (
-                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-8">
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-8">
                     <StatsCard title="Total Patients" value={stats.kpi.totalPatients} />
                     <StatsCard title="Total Doctors" value={stats.kpi.totalDoctors} />
                     <StatsCard title="Total Appointments" value={stats.kpi.totalAppointments} />
-                    <StatsCard title="Simulated Revenue" value={`₹${stats.kpi.totalRevenue.toLocaleString('en-IN')}`} />
+                    <StatsCard
+                        title="Simulated Revenue"
+                        value={`₹${stats.kpi.totalRevenue.toLocaleString('en-IN')}`}
+                    />
                 </div>
             )}
 
@@ -132,15 +214,35 @@ const AdminDashboard = () => {
                         <div>
                             <div className="flex justify-between items-center mb-4">
                                 <h2 className="text-2xl font-semibold">Doctors</h2>
-                                <button onClick={() => setModal({ type: 'doctor' })} className="bg-purple-500 text-white py-2 px-4 rounded hover:bg-purple-600">Add Doctor</button>
+                                <button
+                                    onClick={() => setModal({ type: 'doctor' })}
+                                    className="bg-purple-500 text-white py-2 px-4 rounded hover:bg-purple-600"
+                                >
+                                    Add Doctor
+                                </button>
                             </div>
-                            <input type="text" placeholder="Search doctors..." value={doctorSearch} onChange={(e) => setDoctorSearch(e.target.value)} className="w-full p-2 border rounded mb-4" />
-                            <DoctorList 
-                                doctors={filteredDoctors} 
-                                onEdit={(user) => setModal({ type: 'editUser', data: user })} 
-                                onDelete={(id) => handleDelete('user', id)} 
-                                onSetAvailability={(doctor) => setModal({ type: 'availability', data: doctor })}
-                                onResetPassword={(user) => setModal({ type: 'resetPassword', data: user })}
+                            <input
+                                type="text"
+                                placeholder="Search doctors..."
+                                value={doctorSearch}
+                                onChange={(e) => setDoctorSearch(e.target.value)}
+                                className="w-full p-2 border rounded mb-4"
+                            />
+                            <DoctorList
+                                doctors={filteredDoctors}
+                                onEdit={(user) => setModal({ type: 'editUser', data: user })}
+                                onDelete={(id) => handleDelete('user', id)}
+                                // Pass the Doctor document so SetAvailabilityModal gets Doctor._id
+                                onSetAvailability={(user) => {
+                                    if (!user.doctorProfile) {
+                                        alert('Doctor profile not found. Please refresh.');
+                                        return;
+                                    }
+                                    setModal({ type: 'availability', data: user.doctorProfile });
+                                }}
+                                onResetPassword={(user) =>
+                                    setModal({ type: 'resetPassword', data: user })
+                                }
                             />
                         </div>
                     )}
@@ -149,14 +251,27 @@ const AdminDashboard = () => {
                         <div>
                             <div className="flex justify-between items-center mb-4">
                                 <h2 className="text-2xl font-semibold">Patients</h2>
-                                <button onClick={() => setModal({ type: 'patient' })} className="bg-cyan-500 text-white py-2 px-4 rounded hover:bg-cyan-600">Add Patient</button>
+                                <button
+                                    onClick={() => setModal({ type: 'patient' })}
+                                    className="bg-cyan-500 text-white py-2 px-4 rounded hover:bg-cyan-600"
+                                >
+                                    Add Patient
+                                </button>
                             </div>
-                            <input type="text" placeholder="Search patients..." value={patientSearch} onChange={(e) => setPatientSearch(e.target.value)} className="w-full p-2 border rounded mb-4" />
-                            <PatientList 
-                                patients={filteredPatients} 
-                                onEdit={(user) => setModal({ type: 'editUser', data: user })} 
+                            <input
+                                type="text"
+                                placeholder="Search patients..."
+                                value={patientSearch}
+                                onChange={(e) => setPatientSearch(e.target.value)}
+                                className="w-full p-2 border rounded mb-4"
+                            />
+                            <PatientList
+                                patients={filteredPatients}
+                                onEdit={(user) => setModal({ type: 'editUser', data: user })}
                                 onDelete={(id) => handleDelete('user', id)}
-                                onResetPassword={(user) => setModal({ type: 'resetPassword', data: user })}
+                                onResetPassword={(user) =>
+                                    setModal({ type: 'resetPassword', data: user })
+                                }
                             />
                         </div>
                     )}
@@ -165,15 +280,28 @@ const AdminDashboard = () => {
                         <div>
                             <div className="flex justify-between items-center mb-4">
                                 <h2 className="text-2xl font-semibold">Staff</h2>
-                                <button onClick={() => setModal({ type: 'staff' })} className="bg-blue-500 text-white py-2 px-4 rounded hover:bg-blue-600">Add Staff</button>
+                                <button
+                                    onClick={() => setModal({ type: 'staff' })}
+                                    className="bg-blue-500 text-white py-2 px-4 rounded hover:bg-blue-600"
+                                >
+                                    Add Staff
+                                </button>
                             </div>
-                            <input type="text" placeholder="Search staff..." value={staffSearch} onChange={(e) => setStaffSearch(e.target.value)} className="w-full p-2 border rounded mb-4" />
-                            <UserList 
-                                users={filteredStaff} 
-                                loggedInUser={loggedInUser} 
-                                onEdit={(user) => setModal({ type: 'editUser', data: user })} 
+                            <input
+                                type="text"
+                                placeholder="Search staff..."
+                                value={staffSearch}
+                                onChange={(e) => setStaffSearch(e.target.value)}
+                                className="w-full p-2 border rounded mb-4"
+                            />
+                            <UserList
+                                users={filteredStaff}
+                                loggedInUser={loggedInUser}
+                                onEdit={(user) => setModal({ type: 'editUser', data: user })}
                                 onDelete={(id) => handleDelete('user', id)}
-                                onResetPassword={(user) => setModal({ type: 'resetPassword', data: user })}
+                                onResetPassword={(user) =>
+                                    setModal({ type: 'resetPassword', data: user })
+                                }
                             />
                         </div>
                     )}
@@ -182,12 +310,17 @@ const AdminDashboard = () => {
                         <div>
                             <div className="flex justify-between items-center mb-4">
                                 <h2 className="text-2xl font-semibold">Health Packages</h2>
-                                <button onClick={() => setModal({ type: 'package' })} className="bg-green-500 text-white py-2 px-4 rounded hover:bg-green-600">Add Package</button>
+                                <button
+                                    onClick={() => setModal({ type: 'package' })}
+                                    className="bg-green-500 text-white py-2 px-4 rounded hover:bg-green-600"
+                                >
+                                    Add Package
+                                </button>
                             </div>
-                            <PackageList 
-                                packages={packages} 
+                            <PackageList
+                                packages={packages}
                                 onEdit={(pkg) => setModal({ type: 'editPackage', data: pkg })}
-                                onDelete={(id) => handleDelete('package', id)} 
+                                onDelete={(id) => handleDelete('package', id)}
                             />
                         </div>
                     )}
@@ -195,15 +328,55 @@ const AdminDashboard = () => {
             </div>
 
             {/* Modals */}
-            {modal.type === 'staff' && <AddStaffModal onClose={() => setModal({ type: null })} onSave={(data) => handleSave('staff', data)} />}
-            {modal.type === 'doctor' && <AddDoctorModal onClose={() => setModal({ type: null })} onSave={(data) => handleSave('doctor', data)} />}
-            {modal.type === 'patient' && <AddPatientModal onClose={() => setModal({ type: null })} onSave={(data) => handleSave('patient', data)} />}
-            {modal.type === 'package' && <AddPackageModal onClose={() => setModal({ type: null })} onSave={(data) => handleSave('package', data)} />}
-            {modal.type === 'editUser' && <EditUserModal user={modal.data} onClose={() => setModal({ type: null })} onSave={(data) => handleSave('editUser', data)} />}
-            {modal.type === 'editPackage' && <EditPackageModal pkg={modal.data} onClose={() => setModal({ type: null })} onSave={(data) => handleSave('editPackage', data)} />}
-            {modal.type === 'resetPassword' && <ResetPasswordModal user={modal.data} onClose={() => setModal({ type: null })} onSave={(data) => handleSave('resetPassword', data)} />}
-            {modal.type === 'availability' && <SetAvailabilityModal doctor={modal.data} onClose={() => setModal({ type: null })} onSave={(data) => handleSave('availability', data)} />}
-            {modal.type === 'confirm' && <ConfirmModal title={modal.data.title} message={modal.data.message} onConfirm={modal.data.onConfirm} onCancel={() => setModal({ type: null })} />}
+            {modal.type === 'staff' && (
+                <AddStaffModal onClose={closeModal} onSave={(d) => handleSave('staff', d)} />
+            )}
+            {modal.type === 'doctor' && (
+                <AddDoctorModal onClose={closeModal} onSave={(d) => handleSave('doctor', d)} />
+            )}
+            {modal.type === 'patient' && (
+                <AddPatientModal onClose={closeModal} onSave={(d) => handleSave('patient', d)} />
+            )}
+            {modal.type === 'package' && (
+                <AddPackageModal onClose={closeModal} onSave={(d) => handleSave('package', d)} />
+            )}
+            {modal.type === 'editUser' && (
+                <EditUserModal
+                    user={modal.data}
+                    onClose={closeModal}
+                    onSave={(d) => handleSave('editUser', d)}
+                />
+            )}
+            {modal.type === 'editPackage' && (
+                <EditPackageModal
+                    pkg={modal.data}
+                    onClose={closeModal}
+                    onSave={(d) => handleSave('editPackage', d)}
+                />
+            )}
+            {modal.type === 'resetPassword' && (
+                <ResetPasswordModal
+                    user={modal.data}
+                    onClose={closeModal}
+                    onSave={(d) => handleSave('resetPassword', d)}
+                />
+            )}
+            {modal.type === 'availability' && (
+                // modal.data is now a Doctor document with real _id and availability[]
+                <SetAvailabilityModal
+                    doctor={modal.data}
+                    onClose={closeModal}
+                    onSave={(d) => handleSave('availability', d)}
+                />
+            )}
+            {modal.type === 'confirm' && (
+                <ConfirmModal
+                    title={modal.data.title}
+                    message={modal.data.message}
+                    onConfirm={modal.data.onConfirm}
+                    onCancel={closeModal}
+                />
+            )}
         </div>
     );
 };

@@ -8,7 +8,8 @@ import Appointment from '../models/Appointment.js';
 // @route   GET /api/doctors
 // @access  Public
 const getDoctors = async (req, res) => {
-    const doctors = await Doctor.find({}).populate('user', 'name email specialty');
+    // 'specialty' lives on Doctor model, NOT on User — removed from populate
+    const doctors = await Doctor.find({}).populate('user', 'name email');
     res.json(doctors);
 };
 
@@ -42,13 +43,13 @@ const getDoctorAvailability = async (req, res) => {
         const requestedDate = new Date(date);
         const dayOfWeek = requestedDate.toLocaleString('en-US', { weekday: 'long' });
 
-        // 1. Find the doctor's working hours for that day
-        const workHours = doctor.availability.find(a => a.day.toLowerCase() === dayOfWeek.toLowerCase());
-        if (!workHours) {
-            return res.json([]); // Doctor does not work on this day
+        const workHours = doctor.availability.find(
+            (a) => a.day.toLowerCase() === dayOfWeek.toLowerCase()
+        );
+        if (!workHours || !workHours.startTime || !workHours.endTime) {
+            return res.json([]);
         }
 
-        // 2. Get all appointments for that doctor on that day
         const startDate = new Date(date);
         startDate.setHours(0, 0, 0, 0);
         const endDate = new Date(date);
@@ -58,11 +59,10 @@ const getDoctorAvailability = async (req, res) => {
             doctor: doctor._id,
             appointmentDate: { $gte: startDate, $lte: endDate },
         });
-        const bookedSlots = existingAppointments.map(app => app.appointmentTime);
+        const bookedSlots = existingAppointments.map((app) => app.appointmentTime);
 
-        // 3. Generate all possible slots and filter out booked ones
         const availableSlots = [];
-        const slotDuration = 30; // in minutes
+        const slotDuration = 30;
         const [startHour, startMinute] = workHours.startTime.split(':').map(Number);
         const [endHour, endMinute] = workHours.endTime.split(':').map(Number);
 
@@ -73,7 +73,11 @@ const getDoctorAvailability = async (req, res) => {
         endTime.setHours(endHour, endMinute, 0, 0);
 
         while (currentTime < endTime) {
-            const timeString = currentTime.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true });
+            const timeString = currentTime.toLocaleTimeString('en-US', {
+                hour: '2-digit',
+                minute: '2-digit',
+                hour12: true,
+            });
             if (!bookedSlots.includes(timeString)) {
                 availableSlots.push(timeString);
             }
@@ -81,13 +85,11 @@ const getDoctorAvailability = async (req, res) => {
         }
 
         res.json(availableSlots);
-
     } catch (error) {
         console.error(error);
         res.status(500).json({ message: 'Server Error' });
     }
 };
-
 
 // --- Protected Doctor-Only Routes ---
 
@@ -95,69 +97,58 @@ const getDoctorAvailability = async (req, res) => {
 // @route   GET /api/doctors/my-appointments
 // @access  Private (Doctor)
 const getMyAssignedAppointments = async (req, res) => {
-    // Find the doctor profile linked to the logged-in user
     const doctorProfile = await Doctor.findOne({ user: req.user._id });
     if (!doctorProfile) {
         return res.status(404).json({ message: 'Doctor profile not found for this user.' });
     }
-
     const appointments = await Appointment.find({ doctor: doctorProfile._id })
         .populate('patient', 'name email')
         .sort({ appointmentDate: -1 });
-
     res.json(appointments);
 };
 
-// @desc    Get a patient's medical history (past completed appointments)
+// @desc    Get a patient's medical history
 // @route   GET /api/doctors/patient-history/:patientId
 // @access  Private (Doctor)
 const getPatientHistory = async (req, res) => {
     const appointments = await Appointment.find({
         patient: req.params.patientId,
-        status: 'Completed' // Only show completed appointments as history
+        status: 'Completed',
     })
-    .populate({
-        path: 'doctor',
-        populate: { path: 'user', select: 'name' }
-    })
-    .sort({ appointmentDate: -1 });
-
+        .populate({ path: 'doctor', populate: { path: 'user', select: 'name' } })
+        .sort({ appointmentDate: -1 });
     res.json(appointments);
 };
 
-
-// @desc    Update an appointment (add notes, prescription, mark as complete)
+// @desc    Update an appointment
 // @route   PUT /api/doctors/appointments/:appointmentId
 // @access  Private (Doctor)
 const updateAppointment = async (req, res) => {
     const { notes, prescription, status } = req.body;
-
     const appointment = await Appointment.findById(req.params.appointmentId);
 
-    // Ensure the appointment belongs to the doctor trying to update it
+    if (!appointment) {
+        return res.status(404).json({ message: 'Appointment not found' });
+    }
+
     const doctorProfile = await Doctor.findOne({ user: req.user._id });
-    if (appointment.doctor.toString() !== doctorProfile._id.toString()) {
+    if (!doctorProfile || appointment.doctor.toString() !== doctorProfile._id.toString()) {
         return res.status(401).json({ message: 'Not authorized to update this appointment' });
     }
 
-    if (appointment) {
-        appointment.notes = notes || appointment.notes;
-        appointment.prescription = prescription || appointment.prescription;
-        appointment.status = status || appointment.status;
+    appointment.notes = notes || appointment.notes;
+    appointment.prescription = prescription || appointment.prescription;
+    appointment.status = status || appointment.status;
 
-        const updatedAppointment = await appointment.save();
-        res.json(updatedAppointment);
-    } else {
-        res.status(404).json({ message: 'Appointment not found' });
-    }
+    const updatedAppointment = await appointment.save();
+    res.json(updatedAppointment);
 };
 
 // @desc    Update the logged-in doctor's own availability
 // @route   PUT /api/doctors/my-availability
 // @access  Private (Doctor)
 const updateMyAvailability = async (req, res) => {
-    const { availability } = req.body; // Expects an array: [{ day, startTime, endTime }]
-
+    const { availability } = req.body;
     const doctorProfile = await Doctor.findOne({ user: req.user._id });
 
     if (doctorProfile) {
@@ -169,7 +160,6 @@ const updateMyAvailability = async (req, res) => {
     }
 };
 
-
 export {
     getDoctors,
     getDoctorById,
@@ -177,5 +167,5 @@ export {
     getMyAssignedAppointments,
     getPatientHistory,
     updateAppointment,
-    updateMyAvailability
+    updateMyAvailability,
 };

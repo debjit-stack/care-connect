@@ -12,15 +12,15 @@ const Header = () => {
   };
 
   const getDashboardLink = () => {
-      if (!user) return null;
-      switch(user.role) {
-          case 'admin': return '/admin';
-          case 'doctor': return '/doctor';
-          case 'receptionist': return '/receptionist';
-          case 'patient': return '/patient';
-          default: return '/';
-      }
-  }
+    if (!user) return '/';
+    switch (user.role) {
+      case 'admin': return '/admin';
+      case 'doctor': return '/doctor';
+      case 'receptionist': return '/receptionist';
+      case 'patient': return '/patient';
+      default: return '/';
+    }
+  };
 
   return (
     <header className="bg-white shadow-md">
@@ -29,11 +29,18 @@ const Header = () => {
           CareConnect
         </Link>
         <div className="flex items-center space-x-4">
-          <Link to="/doctors" className="text-gray-600 hover:text-blue-600">Find a Doctor</Link>
-          
+          <Link to="/doctors" className="text-gray-600 hover:text-blue-600">
+            Find a Doctor
+          </Link>
+          <Link to="/packages" className="text-gray-600 hover:text-blue-600">
+            Packages
+          </Link>
+
           {user ? (
             <>
-              <Link to={getDashboardLink()} className="text-gray-600 hover:text-blue-600">My Dashboard</Link>
+              <Link to={getDashboardLink()} className="text-gray-600 hover:text-blue-600">
+                My Dashboard
+              </Link>
               <button
                 onClick={handleLogout}
                 className="bg-red-500 hover:bg-red-700 text-white font-bold py-2 px-4 rounded"
