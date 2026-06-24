@@ -1,96 +1,77 @@
-import User from '../models/User.js';
-import Doctor from '../models/Doctor.js';
-import Appointment from '../models/Appointment.js';
+import User           from '../models/User.js';
+import Doctor         from '../models/Doctor.js';
+import Appointment    from '../models/Appointment.js';
 import PackageBooking from '../models/PackageBooking.js';
 
-// @desc    Get data for the admin dashboard
-// @route   GET /api/dashboard/stats
-// @access  Private (Admin)
+// GET /api/dashboard/stats  (admin only, scoped to their org)
 const getDashboardStats = async (req, res) => {
     try {
-        // 1. KPI Cards Data
-        const totalPatients = await User.countDocuments({ role: 'patient' });
-        const totalDoctors = await User.countDocuments({ role: 'doctor' });
-        const totalAppointments = await Appointment.countDocuments({});
+        const orgId = req.orgId; // set by tenantMiddleware
 
-        // Calculate total simulated revenue from package bookings
+        // ── KPI counts ────────────────────────────────────────────────────────
+        const [totalPatients, totalDoctors, totalAppointments] = await Promise.all([
+            User.countDocuments({ organisationId: orgId, role: 'patient',  deletedAt: null }).skipTenantFilter(),
+            User.countDocuments({ organisationId: orgId, role: 'doctor',   deletedAt: null }).skipTenantFilter(),
+            Appointment.countDocuments({ organisationId: orgId }).skipTenantFilter(),
+        ]);
+
+        // ── Revenue from package bookings ─────────────────────────────────────
         const revenueData = await PackageBooking.aggregate([
+            { $match: { organisationId: orgId } },
             {
                 $lookup: {
-                    from: 'healthpackages', // the collection name for HealthPackage model
-                    localField: 'healthPackage',
+                    from:         'healthpackages',
+                    localField:   'healthPackage',
                     foreignField: '_id',
-                    as: 'packageDetails'
-                }
+                    as:           'packageDetails',
+                },
             },
             { $unwind: '$packageDetails' },
-            {
-                $group: {
-                    _id: null,
-                    totalRevenue: { $sum: '$packageDetails.price' }
-                }
-            }
+            { $group: { _id: null, totalRevenue: { $sum: '$packageDetails.price' } } },
         ]);
-        const totalRevenue = revenueData.length > 0 ? revenueData[0].totalRevenue : 0;
+        const totalRevenue = revenueData[0]?.totalRevenue ?? 0;
 
-        // 2. Recent Activity Data
+        // ── New patients in last 30 days ───────────────────────────────────────
         const thirtyDaysAgo = new Date();
         thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+
         const newPatientsLast30Days = await User.countDocuments({
-            role: 'patient',
-            createdAt: { $gte: thirtyDaysAgo }
-        });
+            organisationId: orgId,
+            role:           'patient',
+            deletedAt:      null,
+            createdAt:      { $gte: thirtyDaysAgo },
+        }).skipTenantFilter();
 
-        const recentAppointments = await Appointment.find({})
+        // ── Recent appointments ────────────────────────────────────────────────
+        const recentAppointments = await Appointment.find({ organisationId: orgId })
             .populate('patient', 'name')
-            .populate({
-                path: 'doctor',
-                populate: { path: 'user', select: 'name' }
-            })
+            .populate({ path: 'doctor', populate: { path: 'user', select: 'name' } })
             .sort({ createdAt: -1 })
-            .limit(5);
+            .limit(5)
+            .lean()
+            .skipTenantFilter();
 
-        // 3. Chart Data: Appointments per month for the last 12 months
+        // ── Appointments by month ──────────────────────────────────────────────
         const appointmentsByMonth = await Appointment.aggregate([
+            { $match: { organisationId: orgId } },
             {
                 $group: {
-                    _id: {
-                        year: { $year: '$appointmentDate' },
-                        month: { $month: '$appointmentDate' }
-                    },
-                    count: { $sum: 1 }
-                }
+                    _id:   { year: { $year: '$appointmentDate' }, month: { $month: '$appointmentDate' } },
+                    count: { $sum: 1 },
+                },
             },
             { $sort: { '_id.year': 1, '_id.month': 1 } },
-            {
-                $project: {
-                    _id: 0,
-                    month: '$_id.month',
-                    year: '$_id.year',
-                    count: '$count'
-                }
-            }
+            { $project: { _id: 0, year: '$_id.year', month: '$_id.month', count: 1 } },
         ]);
 
         res.json({
-            kpi: {
-                totalPatients,
-                totalDoctors,
-                totalAppointments,
-                totalRevenue
-            },
-            recentActivity: {
-                newPatientsLast30Days,
-                recentAppointments
-            },
-            charts: {
-                appointmentsByMonth
-            }
+            kpi: { totalPatients, totalDoctors, totalAppointments, totalRevenue },
+            recentActivity: { newPatientsLast30Days, recentAppointments },
+            charts: { appointmentsByMonth },
         });
-
-    } catch (error) {
-        console.error(error);
-        res.status(500).json({ message: 'Server Error' });
+    } catch (err) {
+        console.error('[Dashboard] getDashboardStats:', err.message);
+        res.status(500).json({ message: 'Failed to load dashboard stats' });
     }
 };
 

@@ -11,8 +11,16 @@ const AddDoctorModal = ({ onClose, onSave }) => {
     });
 
     const handleChange = (e) => {
-        setFormData({ ...formData, [e.target.name]: e.target.value });
-    };
+    const { name, value } = e.target;
+
+    setFormData({
+        ...formData,
+        [name]:
+            name === "experienceYears"
+                ? Number(value)
+                : value
+    });
+};
 
     const handleSubmit = (e) => {
         e.preventDefault();

@@ -1,29 +1,42 @@
 import mongoose from 'mongoose';
+import tenantPlugin from '../plugins/tenantPlugin.js';
 
-const doctorSchema = mongoose.Schema({
-    user: {
-        type: mongoose.Schema.Types.ObjectId,
-        required: true,
-        ref: 'User',
+const doctorSchema = mongoose.Schema(
+    {
+        user: {
+            type:     mongoose.Schema.Types.ObjectId,
+            required: true,
+            ref:      'User',
+        },
+        specialty: {
+            type:     String,
+            required: true,
+            trim:     true,
+        },
+        qualifications: {
+            type: String,
+            trim: true,
+        },
+        experienceYears: {
+            type: Number,
+        },
+        availability: [
+            {
+                day:       String,
+                startTime: String,
+                endTime:   String,
+            },
+        ],
+        deletedAt: { type: Date, default: null },
     },
-    specialty: {
-        type: String,
-        required: true,
-    },
-    qualifications: {
-        type: String,
-    },
-    experienceYears: {
-        type: Number,
-    },
-    availability: [{
-        day: String, // e.g., "Monday"
-        startTime: String, // e.g., "09:00"
-        endTime: String, // e.g., "17:00"
-    }],
-}, {
-    timestamps: true,
-});
+    { timestamps: true }
+);
+
+doctorSchema.plugin(tenantPlugin);
+
+doctorSchema.index({ user: 1, organisationId: 1 }, { unique: true });
+doctorSchema.index({ organisationId: 1 });
+doctorSchema.index({ deletedAt: 1 });
 
 const Doctor = mongoose.model('Doctor', doctorSchema);
 export default Doctor;

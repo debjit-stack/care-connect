@@ -2,64 +2,60 @@ import React from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { useAuth } from '../../context/AuthContext';
 
+const DASHBOARD_ROUTES = {
+    admin:        '/admin',
+    doctor:       '/doctor',
+    receptionist: '/receptionist',
+    patient:      '/patient',
+};
+
 const Header = () => {
-  const { user, logout } = useAuth();
-  const navigate = useNavigate();
+    const { user, logout } = useAuth();
+    const navigate         = useNavigate();
 
-  const handleLogout = () => {
-    logout();
-    navigate('/login');
-  };
+    const handleLogout = async () => {
+        await logout(); // revokes refresh token server-side before clearing local state
+        navigate('/login');
+    };
 
-  const getDashboardLink = () => {
-    if (!user) return '/';
-    switch (user.role) {
-      case 'admin': return '/admin';
-      case 'doctor': return '/doctor';
-      case 'receptionist': return '/receptionist';
-      case 'patient': return '/patient';
-      default: return '/';
-    }
-  };
+    return (
+        <header className="bg-white shadow-md">
+            <nav className="container mx-auto px-6 py-4 flex justify-between items-center">
+                <Link to="/" className="text-2xl font-bold text-blue-600">
+                    CareConnect
+                </Link>
 
-  return (
-    <header className="bg-white shadow-md">
-      <nav className="container mx-auto px-6 py-4 flex justify-between items-center">
-        <Link to="/" className="text-2xl font-bold text-blue-600">
-          CareConnect
-        </Link>
-        <div className="flex items-center space-x-4">
-          <Link to="/doctors" className="text-gray-600 hover:text-blue-600">
-            Find a Doctor
-          </Link>
-          <Link to="/packages" className="text-gray-600 hover:text-blue-600">
-            Packages
-          </Link>
+                <div className="flex items-center space-x-4">
+                    <Link to="/doctors"  className="text-gray-600 hover:text-blue-600">Find a Doctor</Link>
+                    <Link to="/packages" className="text-gray-600 hover:text-blue-600">Packages</Link>
 
-          {user ? (
-            <>
-              <Link to={getDashboardLink()} className="text-gray-600 hover:text-blue-600">
-                My Dashboard
-              </Link>
-              <button
-                onClick={handleLogout}
-                className="bg-red-500 hover:bg-red-700 text-white font-bold py-2 px-4 rounded"
-              >
-                Logout
-              </button>
-            </>
-          ) : (
-            <Link
-              to="/login"
-              className="bg-blue-500 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded"
-            >
-              Login
-            </Link>
-          )}
-        </div>
-      </nav>
-    </header>
-  );
+                    {user ? (
+                        <>
+                            <Link
+                                to={DASHBOARD_ROUTES[user.role] ?? '/'}
+                                className="text-gray-600 hover:text-blue-600"
+                            >
+                                My Dashboard
+                            </Link>
+                            <button
+                                onClick={handleLogout}
+                                className="bg-red-500 hover:bg-red-700 text-white font-bold py-2 px-4 rounded transition-colors"
+                            >
+                                Logout
+                            </button>
+                        </>
+                    ) : (
+                        <Link
+                            to="/login"
+                            className="bg-blue-500 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded transition-colors"
+                        >
+                            Login
+                        </Link>
+                    )}
+                </div>
+            </nav>
+        </header>
+    );
 };
 
 export default Header;

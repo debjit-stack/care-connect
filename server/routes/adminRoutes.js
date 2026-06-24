@@ -1,5 +1,4 @@
 import express from 'express';
-const router = express.Router();
 import {
     getUsers,
     getUserById,
@@ -12,17 +11,34 @@ import {
     getDoctorsWithProfiles,
 } from '../controllers/adminController.js';
 import { protect, admin } from '../middleware/authMiddleware.js';
+import {
+    validate,
+    getUsersSchema,
+    createDoctorSchema,
+    createStaffSchema,
+    updateUserSchema,
+    resetPasswordSchema,
+    updateDoctorProfileSchema,
+} from '../validators/adminValidators.js';
+import { idParam } from '../validators/shared.js';
+
+const router = express.Router();
 
 router.use(protect, admin);
 
-router.route('/users').get(getUsers);
-router.route('/users/:id').get(getUserById).put(updateUser).delete(deleteUser);
-router.route('/users/:id/reset-password').put(resetPassword);
+// Users
+router.get('/users',          validate(getUsersSchema), getUsers);
+router.get('/users/:id',      validate(idParam),        getUserById);
+router.put('/users/:id',      validate(updateUserSchema),    updateUser);
+router.delete('/users/:id',   validate(idParam),        deleteUser);
+router.put('/users/:id/reset-password', validate(resetPasswordSchema), resetPassword);
 
-router.route('/doctors').post(createDoctor);
-// NEW: fetch full doctor profiles (Doctor._id + user info)
-router.route('/doctors-full').get(getDoctorsWithProfiles);
-router.route('/doctors/:id').put(updateDoctorProfile);
-router.route('/staff').post(createStaff);
+// Doctors
+router.post('/doctors',       validate(createDoctorSchema),        createDoctor);
+router.get('/doctors-full',                                         getDoctorsWithProfiles);
+router.put('/doctors/:id',    validate(updateDoctorProfileSchema),  updateDoctorProfile);
+
+// Staff
+router.post('/staff',         validate(createStaffSchema),         createStaff);
 
 export default router;

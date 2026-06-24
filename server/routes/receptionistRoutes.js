@@ -1,5 +1,4 @@
 import express from 'express';
-const router = express.Router();
 import {
     registerPatient,
     bookOfflineAppointment,
@@ -7,24 +6,24 @@ import {
     getAppointmentsByDate,
     bookHealthPackageForPatient,
 } from '../controllers/receptionistController.js';
-import { protect } from '../middleware/authMiddleware.js';
+import { protect, isReceptionistOrAdmin } from '../middleware/authMiddleware.js';
+import {
+    validate,
+    registerPatientSchema,
+    bookOfflineAppointmentSchema,
+    bookPackageForPatientSchema,
+    searchPatientsSchema,
+    getAppointmentsByDateSchema,
+} from '../validators/receptionistValidators.js';
 
-// Middleware to check if user is Receptionist or Admin
-const isReceptionistOrAdmin = (req, res, next) => {
-    if (req.user && (req.user.role === 'receptionist' || req.user.role === 'admin')) {
-        next();
-    } else {
-        res.status(401).json({ message: 'Not authorized for this role' });
-    }
-};
+const router = express.Router();
 
-// All routes in this file are protected
 router.use(protect, isReceptionistOrAdmin);
 
-router.route('/register-patient').post(registerPatient);
-router.route('/book-appointment').post(bookOfflineAppointment);
-router.route('/search-patients').get(searchPatients);
-router.route('/appointments').get(getAppointmentsByDate);
-router.route('/book-package').post(bookHealthPackageForPatient);
+router.post('/register-patient',  validate(registerPatientSchema),         registerPatient);
+router.post('/book-appointment',  validate(bookOfflineAppointmentSchema),   bookOfflineAppointment);
+router.post('/book-package',      validate(bookPackageForPatientSchema),    bookHealthPackageForPatient);
+router.get('/search-patients',    validate(searchPatientsSchema),           searchPatients);
+router.get('/appointments',       validate(getAppointmentsByDateSchema),    getAppointmentsByDate);
 
 export default router;

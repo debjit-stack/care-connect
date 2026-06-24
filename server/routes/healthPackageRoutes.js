@@ -1,19 +1,24 @@
 import express from 'express';
-const router = express.Router();
 import {
     getHealthPackages,
     createHealthPackage,
     updateHealthPackage,
-    deleteHealthPackage
+    deleteHealthPackage,
 } from '../controllers/healthPackageController.js';
 import { protect, admin } from '../middleware/authMiddleware.js';
+import {
+    validate,
+    createPackageSchema,
+    updatePackageSchema,
+    deletePackageSchema,
+} from '../validators/packageValidators.js';
 
-router.route('/')
-    .get(getHealthPackages)
-    .post(protect, admin, createHealthPackage);
+const router = express.Router();
 
-router.route('/:id')
-    .put(protect, admin, updateHealthPackage)
-    .delete(protect, admin, deleteHealthPackage);
+router.get('/', getHealthPackages);
+
+router.post('/',    protect, admin, validate(createPackageSchema), createHealthPackage);
+router.put('/:id',  protect, admin, validate(updatePackageSchema), updateHealthPackage);
+router.delete('/:id', protect, admin, validate(deletePackageSchema), deleteHealthPackage);
 
 export default router;

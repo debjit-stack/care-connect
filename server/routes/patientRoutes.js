@@ -1,17 +1,22 @@
 import express from 'express';
-const router = express.Router();
 import {
     bookMyAppointment,
     bookMyHealthPackage,
-    getMyHistory
+    getMyHistory,
 } from '../controllers/patientController.js';
 import { protect, isPatient } from '../middleware/authMiddleware.js';
+import {
+    validate,
+    bookAppointmentSchema,
+    bookPackageSchema,
+} from '../validators/patientValidators.js';
 
-// All routes in this file are protected and for patients only
+const router = express.Router();
+
 router.use(protect, isPatient);
 
-router.route('/book-appointment').post(bookMyAppointment);
-router.route('/book-package').post(bookMyHealthPackage);
-router.route('/my-history').get(getMyHistory);
+router.post('/book-appointment', validate(bookAppointmentSchema), bookMyAppointment);
+router.post('/book-package',     validate(bookPackageSchema),     bookMyHealthPackage);
+router.get('/my-history',                                         getMyHistory);
 
 export default router;

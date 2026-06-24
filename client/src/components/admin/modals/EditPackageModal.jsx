@@ -8,8 +8,16 @@ const EditPackageModal = ({ pkg, onClose, onSave }) => {
     });
 
     const handleChange = (e) => {
-        setFormData({ ...formData, [e.target.name]: e.target.value });
-    };
+    const { name, value } = e.target;
+
+    setFormData({
+        ...formData,
+        [name]:
+            name === "price"
+                ? Number(value)
+                : value
+    });
+};
 
     const handleSubmit = (e) => {
         e.preventDefault();

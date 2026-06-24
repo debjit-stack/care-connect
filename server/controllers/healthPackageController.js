@@ -1,64 +1,86 @@
 import HealthPackage from '../models/HealthPackage.js';
+import audit         from '../utils/audit.js';
 
-// @desc    Get all health packages
-// @route   GET /api/packages
-// @access  Public
+// GET /api/packages
 const getHealthPackages = async (req, res) => {
-    const packages = await HealthPackage.find({});
-    res.json(packages);
+    try {
+        const packages = await HealthPackage.find({ deletedAt: null }).lean();
+        res.json(packages);
+    } catch (err) {
+        console.error('[Package] getHealthPackages:', err.message);
+        res.status(500).json({ message: 'Failed to fetch packages' });
+    }
 };
 
-// @desc    Create a health package
-// @route   POST /api/packages
-// @access  Private (Admin)
+// POST /api/packages
 const createHealthPackage = async (req, res) => {
-    const { name, price, details } = req.body;
-    const healthPackage = new HealthPackage({
-        name,
-        price,
-        details,
-    });
-    const createdPackage = await healthPackage.save();
-    res.status(201).json(createdPackage);
+    try {
+        const { name, price, details } = req.body;
+
+        const pkg = await HealthPackage.create({ name, price, details });
+
+        audit(req, 'DATA_CREATE', {
+            actorId:      req.user._id,
+            actorRole:    req.user.role,
+            resourceType: 'HealthPackage',
+            resourceId:   pkg._id,
+        });
+
+        res.status(201).json(pkg);
+    } catch (err) {
+        console.error('[Package] createHealthPackage:', err.message);
+        res.status(500).json({ message: 'Failed to create package' });
+    }
 };
 
-// @desc    Update a health package
-// @route   PUT /api/packages/:id
-// @access  Private (Admin)
+// PUT /api/packages/:id
 const updateHealthPackage = async (req, res) => {
-    const { name, price, details } = req.body;
-    const healthPackage = await HealthPackage.findById(req.params.id);
+    try {
+        const { name, price, details } = req.body;
 
-    if (healthPackage) {
-        healthPackage.name = name || healthPackage.name;
-        healthPackage.price = price || healthPackage.price;
-        healthPackage.details = details || healthPackage.details;
+        const pkg = await HealthPackage.findById(req.params.id);
+        if (!pkg) return res.status(404).json({ message: 'Package not found' });
 
-        const updatedPackage = await healthPackage.save();
-        res.json(updatedPackage);
-    } else {
-        res.status(404).json({ message: 'Health package not found' });
+        if (name    !== undefined) pkg.name    = name;
+        if (price   !== undefined) pkg.price   = price;
+        if (details !== undefined) pkg.details = details;
+
+        const updated = await pkg.save();
+
+        audit(req, 'DATA_UPDATE', {
+            actorId:      req.user._id,
+            actorRole:    req.user.role,
+            resourceType: 'HealthPackage',
+            resourceId:   updated._id,
+        });
+
+        res.json(updated);
+    } catch (err) {
+        console.error('[Package] updateHealthPackage:', err.message);
+        res.status(500).json({ message: 'Failed to update package' });
     }
 };
 
-// @desc    Delete a health package
-// @route   DELETE /api/packages/:id
-// @access  Private (Admin)
+// DELETE /api/packages/:id
 const deleteHealthPackage = async (req, res) => {
-    const healthPackage = await HealthPackage.findById(req.params.id);
+    try {
+        const pkg = await HealthPackage.findById(req.params.id);
+        if (!pkg) return res.status(404).json({ message: 'Package not found' });
 
-    if (healthPackage) {
-        await healthPackage.deleteOne();
-        res.json({ message: 'Health package removed' });
-    } else {
-        res.status(404).json({ message: 'Health package not found' });
+        await pkg.deleteOne();
+
+        audit(req, 'DATA_DELETE', {
+            actorId:      req.user._id,
+            actorRole:    req.user.role,
+            resourceType: 'HealthPackage',
+            resourceId:   req.params.id,
+        });
+
+        res.json({ message: 'Package removed' });
+    } catch (err) {
+        console.error('[Package] deleteHealthPackage:', err.message);
+        res.status(500).json({ message: 'Failed to delete package' });
     }
 };
 
-
-export {
-    getHealthPackages,
-    createHealthPackage,
-    updateHealthPackage,
-    deleteHealthPackage
-};
+export { getHealthPackages, createHealthPackage, updateHealthPackage, deleteHealthPackage };

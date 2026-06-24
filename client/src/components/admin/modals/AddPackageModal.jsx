@@ -1,11 +1,23 @@
 import React, { useState } from 'react';
 
 const AddPackageModal = ({ onClose, onSave }) => {
-    const [formData, setFormData] = useState({ name: '', price: '', details: '' });
+    const [formData, setFormData] = useState({ 
+        name: '', 
+        price: '', 
+        details: '' 
+    });
 
     const handleChange = (e) => {
-        setFormData({ ...formData, [e.target.name]: e.target.value });
-    };
+    const { name, value } = e.target;
+
+    setFormData({
+        ...formData,
+        [name]:
+            name === "price"
+                ? Number(value)
+                : value
+    });
+};
 
     const handleSubmit = (e) => {
         e.preventDefault();

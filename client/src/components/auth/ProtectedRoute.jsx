@@ -3,23 +3,26 @@ import { Navigate } from 'react-router-dom';
 import { useAuth } from '../../context/AuthContext';
 
 const ProtectedRoute = ({ children, allowedRoles }) => {
-  const { user, loading } = useAuth();
+    const { user, loading } = useAuth();
 
-  if (loading) {
-    return <div>Loading...</div>; // Or a spinner component
-  }
+    // While the silent refresh on mount is running, show nothing (no flicker to /login)
+    if (loading) {
+        return (
+            <div className="flex items-center justify-center min-h-screen">
+                <div className="animate-spin rounded-full h-10 w-10 border-b-2 border-blue-500" />
+            </div>
+        );
+    }
 
-  if (!user) {
-    // User not logged in
-    return <Navigate to="/login" />;
-  }
+    if (!user) {
+        return <Navigate to="/login" replace />;
+    }
 
-  if (allowedRoles && !allowedRoles.includes(user.role)) {
-    // User does not have the required role
-    return <Navigate to="/" />; // Or a dedicated "Unauthorized" page
-  }
+    if (allowedRoles && !allowedRoles.includes(user.role)) {
+        return <Navigate to="/" replace />;
+    }
 
-  return children;
+    return children;
 };
 
 export default ProtectedRoute;

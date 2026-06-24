@@ -1,144 +1,192 @@
-import User from '../models/User.js';
-import Appointment from '../models/Appointment.js';
+import User         from '../models/User.js';
+import Appointment  from '../models/Appointment.js';
 import PackageBooking from '../models/PackageBooking.js';
+import audit        from '../utils/audit.js';
 
-// @desc    Register a new patient
-// @route   POST /api/receptionist/register-patient
-// @access  Private (Receptionist/Admin)
+// ─── POST /api/receptionist/register-patient ─────────────────────────────────
 const registerPatient = async (req, res) => {
-    const { name, email, password } = req.body;
+    try {
+        const { name, email, password } = req.body;
 
-    // Check if patient already exists
-    const patientExists = await User.findOne({ email });
-    if (patientExists) {
-        res.status(400).json({ message: 'Patient with this email already exists' });
-        return;
+        const existingUser = await User.findOne({ email });
+
+    if (existingUser && existingUser.deletedAt) {
+        existingUser.name = name;
+        existingUser.password = password;
+        existingUser.role = 'patient';
+        existingUser.deletedAt = undefined;
+
+        await existingUser.save();
+
+        return res.status(200).json({
+            message: 'Patient restored successfully',
+            patient: existingUser,
+        });
     }
 
-    // Create a new user with the 'patient' role
-    const patient = await User.create({
-        name,
-        email,
-        password, // In a real app, you might auto-generate a temporary password
-        role: 'patient',
-    });
+    if (existingUser) {
+        return res.status(409).json({
+            message: 'A patient with this email already exists',
+        });
+    }
 
-    if (patient) {
+        const patient = await User.create({ name, email, password, role: 'patient' });
+
+        audit(req, 'DATA_CREATE', {
+            actorId:      req.user._id,
+            actorRole:    req.user.role,
+            resourceType: 'User',
+            resourceId:   patient._id,
+            meta:         { createdRole: 'patient' },
+        });
+
         res.status(201).json({
-            _id: patient._id,
-            name: patient.name,
+            _id:   patient._id,
+            name:  patient.name,
             email: patient.email,
         });
-    } else {
-        res.status(400).json({ message: 'Invalid patient data' });
+    } catch (err) {
+        console.error('[Receptionist] registerPatient:', err.message);
+        res.status(500).json({ message: 'Failed to register patient' });
     }
 };
 
-// @desc    Book an offline appointment for a patient
-// @route   POST /api/receptionist/book-appointment
-// @access  Private (Receptionist/Admin)
+// ─── POST /api/receptionist/book-appointment ─────────────────────────────────
 const bookOfflineAppointment = async (req, res) => {
-    const { patientId, doctorId, appointmentDate, appointmentTime } = req.body;
+    try {
+        const { patientId, doctorId, appointmentDate, appointmentTime } = req.body;
 
-    // Validate that the patient and doctor exist
-    const patient = await User.findById(patientId);
-    if (!patient || patient.role !== 'patient') {
-        res.status(404).json({ message: 'Patient not found' });
-        return;
+        const patient = await User.findOne({ _id: patientId, role: 'patient', deletedAt: null }).lean();
+        if (!patient) {
+            return res.status(404).json({ message: 'Patient not found' });
+        }
+
+        const appointment = await Appointment.create({
+            doctor:          doctorId,
+            patient:         patientId,
+            appointmentDate: new Date(appointmentDate),
+            appointmentTime,
+            type:            'Offline',
+            status:          'Scheduled',
+        });
+
+        audit(req, 'DATA_CREATE', {
+            actorId:      req.user._id,
+            actorRole:    req.user.role,
+            resourceType: 'Appointment',
+            resourceId:   appointment._id,
+            meta:         { bookedFor: patientId, type: 'Offline' },
+        });
+
+        res.status(201).json(appointment);
+    } catch (err) {
+        if (err.code === 11000) {
+            return res.status(409).json({
+                message: 'This slot was just booked. Please choose another time.',
+            });
+        }
+        console.error('[Receptionist] bookOfflineAppointment:', err.message);
+        res.status(500).json({ message: 'Failed to book appointment' });
     }
-    // In a full implementation, you would also validate the doctorId
-
-    const appointment = new Appointment({
-        doctor: doctorId,
-        patient: patientId,
-        appointmentDate,
-        appointmentTime,
-        type: 'Offline', // Hardcoded for receptionist bookings
-        status: 'Scheduled',
-    });
-
-    const createdAppointment = await appointment.save();
-    res.status(201).json(createdAppointment);
 };
 
-// @desc    Search for patients by name or email
-// @route   GET /api/receptionist/search-patients?q=...
-// @access  Private (Receptionist/Admin)
+// ─── GET /api/receptionist/search-patients?q= ────────────────────────────────
+// The query string `q` arrives here already regex-escaped by the Zod validator.
+// We use it directly — no additional escaping needed.
 const searchPatients = async (req, res) => {
-    const keyword = req.query.q ? {
-        role: 'patient', // Ensure we only search for patients
-        $or: [
-            { name: { $regex: req.query.q, $options: 'i' } },
-            { email: { $regex: req.query.q, $options: 'i' } },
-        ],
-    } : { role: 'patient' };
+    try {
+        const { q } = req.query; // pre-sanitised by receptionistValidators.js
 
-    const users = await User.find(keyword).select('-password').limit(10);
-    res.json(users);
+        const patients = await User.find({
+            role:      'patient',
+            deletedAt: null,
+            $or: [
+                { name:  { $regex: q, $options: 'i' } },
+                { email: { $regex: q, $options: 'i' } },
+            ],
+        })
+            .select('_id name email')
+            .limit(10)
+            .lean();
+
+        res.json(patients);
+    } catch (err) {
+        console.error('[Receptionist] searchPatients:', err.message);
+        res.status(500).json({ message: 'Search failed' });
+    }
 };
 
-// @desc    Get all appointments for a specific date
-// @route   GET /api/receptionist/appointments?date=YYYY-MM-DD
-// @access  Private (Receptionist/Admin)
+// ─── GET /api/receptionist/appointments?date= ────────────────────────────────
 const getAppointmentsByDate = async (req, res) => {
-    const { date } = req.query;
-    if (!date) {
-        return res.status(400).json({ message: 'Date query parameter is required' });
+    try {
+        const { date } = req.query;
+
+        const startOfDay = new Date(date);
+        startOfDay.setUTCHours(0, 0, 0, 0);
+        const endOfDay = new Date(date);
+        endOfDay.setUTCHours(23, 59, 59, 999);
+
+        const appointments = await Appointment.find({
+            appointmentDate: { $gte: startOfDay, $lte: endOfDay },
+            status: { $ne: 'Cancelled' }
+        })
+            .populate('patient', 'name')
+            .populate({
+                path:     'doctor',
+                populate: { path: 'user', select: 'name' },
+                select:   'specialty',
+            })
+            .sort({ appointmentTime: 1 })
+            .lean();
+            const activeAppointments = appointments.filter(
+            appointment =>
+                appointment.patient &&
+                appointment.doctor &&
+                appointment.doctor.user
+        );
+
+        res.json(activeAppointments);
+    } catch (err) {
+        console.error('[Receptionist] getAppointmentsByDate:', err.message);
+        res.status(500).json({ message: 'Failed to fetch appointments' });
     }
-
-    const startDate = new Date(date);
-    startDate.setHours(0, 0, 0, 0);
-
-    const endDate = new Date(date);
-    endDate.setHours(23, 59, 59, 999);
-
-    const appointments = await Appointment.find({
-        appointmentDate: {
-            $gte: startDate,
-            $lte: endDate,
-        },
-    })
-    .populate('patient', 'name')
-    .populate({
-        path: 'doctor',
-        populate: {
-            path: 'user',
-            select: 'name'
-        },
-        select: 'specialty'
-    })
-    .sort({ appointmentTime: 1 });
-
-    res.json(appointments);
 };
 
-// @desc    Book a health package for a patient
-// @route   POST /api/receptionist/book-package
-// @access  Private (Receptionist/Admin)
+// ─── POST /api/receptionist/book-package ─────────────────────────────────────
 const bookHealthPackageForPatient = async (req, res) => {
-    const { patientId, packageId } = req.body;
+    try {
+        const { patientId, packageId } = req.body;
 
-    // Validate patient exists
-    const patient = await User.findById(patientId);
-    if (!patient || patient.role !== 'patient') {
-        return res.status(404).json({ message: 'Patient not found' });
+        const patient = await User.findOne({ _id: patientId, role: 'patient', deletedAt: null }).lean();
+        if (!patient) {
+            return res.status(404).json({ message: 'Patient not found' });
+        }
+
+        const booking = await PackageBooking.create({
+            patient:       patientId,
+            healthPackage: packageId,
+            bookedBy:      req.user._id,
+        });
+
+        audit(req, 'DATA_CREATE', {
+            actorId:      req.user._id,
+            actorRole:    req.user.role,
+            resourceType: 'PackageBooking',
+            resourceId:   booking._id,
+            meta:         { bookedFor: patientId },
+        });
+
+        res.status(201).json(booking);
+    } catch (err) {
+        console.error('[Receptionist] bookHealthPackageForPatient:', err.message);
+        res.status(500).json({ message: 'Failed to book package' });
     }
-
-    const booking = new PackageBooking({
-        patient: patientId,
-        healthPackage: packageId,
-        bookedBy: req.user._id, // The logged-in receptionist/admin
-    });
-
-    const createdBooking = await booking.save();
-    res.status(201).json(createdBooking);
 };
-
 
 export {
     registerPatient,
     bookOfflineAppointment,
     searchPatients,
     getAppointmentsByDate,
-    bookHealthPackageForPatient
+    bookHealthPackageForPatient,
 };

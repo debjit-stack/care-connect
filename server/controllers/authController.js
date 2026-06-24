@@ -1,65 +1,337 @@
-import User from '../models/User.js';
-import jwt from 'jsonwebtoken';
+import User         from '../models/User.js';
+import Organisation from '../models/Organisation.js';
+import {
+    generateAccessToken, generateRefreshToken, verifyRefreshToken,
+    revokeRefreshToken, revokeAllRefreshTokens,
+    setRefreshCookie, clearRefreshCookie, getRefreshCookie,
+} from '../utils/tokens.js';
+import audit             from '../utils/audit.js';
+import { runWithTenant } from '../plugins/tenantPlugin.js';
 
-// Helper to generate JWT
-const generateToken = (id) => {
-    return jwt.sign({ id }, process.env.JWT_SECRET, {
-        expiresIn: '30d',
-    });
+// ─── Safe user payload ────────────────────────────────────────────────────────
+const safeUser = (user, org) => ({
+    _id:            user._id,
+    name:           user.name,
+    email:          user.email,
+    role:           user.role,
+    mfaEnabled:     user.mfaEnabled,
+    organisationId: user.organisationId ?? null,
+    organisation: org ? {
+        _id:      org._id,
+        name:     org.name,
+        slug:     org.slug,
+        settings: org.settings,
+        features: org.features,
+    } : null,
+});
+
+// ─── Resolve org from request ─────────────────────────────────────────────────
+// Auth routes bypass tenantMiddleware (PUBLIC_PATHS), so we resolve org here.
+//
+// Resolution order:
+//   1. X-Organisation-Slug header
+//   2. X-Organisation-ID header
+//   3. Subdomain  (hospital-abc.careconnect.in)
+//   4. Auto-fallback: 1 org in DB  → use it  (single-tenant / dev / post-migration)
+//                     0 orgs in DB → return null (pre-migration, legacy data)
+//                     2+ orgs      → return null (header required)
+const resolveOrgFromRequest = async (req) => {
+    // 1. Slug header
+    const slug = req.headers['x-organisation-slug'];
+    if (slug) {
+        return Organisation.findOne({ slug: slug.toLowerCase().trim(), deletedAt: null });
+    }
+
+    // 2. ID header
+    const id = req.headers['x-organisation-id'];
+    if (id) {
+        return Organisation.findOne({ _id: id, deletedAt: null });
+    }
+
+    // 3. Subdomain
+    const host  = req.headers.host || '';
+    const parts = host.split('.');
+    if (
+        parts.length >= 3 &&
+        !['www', 'api', 'careconnect', 'localhost'].includes(parts[0])
+    ) {
+        return Organisation.findOne({ slug: parts[0], deletedAt: null });
+    }
+
+    // 4. Auto-fallback
+    const count = await Organisation.countDocuments({ deletedAt: null, isActive: true });
+
+    if (count === 1) {
+        // Exactly one org — use it automatically.
+        // Covers: after migration 003 runs on a single-hospital deployment.
+        return Organisation.findOne({ deletedAt: null, isActive: true });
+    }
+
+    // 0 orgs (pre-migration) or 2+ orgs without header → return null
+    return null;
 };
 
-// @desc    Register a new user (FOR PATIENTS ONLY)
-// @route   POST /api/auth/register
-// @access  Public
+// ─── POST /api/auth/register ──────────────────────────────────────────────────
 const registerUser = async (req, res) => {
-    // The 'role' is intentionally ignored from the request body for security.
-    const { name, email, password } = req.body;
+    try {
+        const { name, email, password } = req.body;
 
-    const userExists = await User.findOne({ email });
+        const org   = await resolveOrgFromRequest(req);
+        const orgId = org?._id ?? null;
 
-    if (userExists) {
-        res.status(400).json({ message: 'User already exists' });
-        return;
-    }
+        if (org) {
+            if (!org.isAccessible) {
+                return res.status(403).json({ message: 'Organisation account is not active.' });
+            }
+            if (org.features?.patientPortal === false) {
+                return res.status(403).json({ message: 'Patient self-registration is disabled.' });
+            }
+        }
 
-    // User is always created with the 'patient' role via this public route.
-    const user = await User.create({
-        name,
-        email,
-        password,
-        role: 'patient',
-    });
+        // Check email uniqueness — scoped to org if one exists
+        const existsFilter = orgId
+            ? { email, organisationId: orgId, deletedAt: null }
+            : { email, deletedAt: null };
 
-    if (user) {
-        res.status(201).json({
-            _id: user._id,
-            name: user.name,
-            email: user.email,
-            role: user.role,
-            token: generateToken(user._id),
+        const exists = await User.findOne(existsFilter).skipTenantFilter();
+        if (exists) {
+            return res.status(409).json({ message: 'An account with this email already exists' });
+        }
+
+        let user;
+        if (orgId) {
+            await runWithTenant(orgId, async () => {
+                user = await User.create({ name, email, password, role: 'patient' });
+            });
+        } else {
+            // Pre-migration — create without org scope
+            user = await User.create({ name, email, password, role: 'patient' });
+        }
+
+        const accessToken  = generateAccessToken(user);
+        const refreshToken = await generateRefreshToken(user._id);
+        setRefreshCookie(res, refreshToken);
+
+        audit(req, 'AUTH_LOGIN_SUCCESS', {
+            actorId:   user._id,
+            actorRole: user.role,
+            meta:      { event: 'registration', orgId },
         });
-    } else {
-        res.status(400).json({ message: 'Invalid user data' });
+
+        return res.status(201).json({ user: safeUser(user, org), accessToken });
+    } catch (err) {
+        console.error('[Auth] registerUser:', err.message);
+        return res.status(500).json({ message: 'Registration failed. Please try again.' });
     }
 };
 
-// ... (loginUser function remains the same)
+// ─── POST /api/auth/login ─────────────────────────────────────────────────────
 const loginUser = async (req, res) => {
-    const { email, password } = req.body;
+    //console.log("LOGIN USER REACHED");
+    try {
+        const { email, password } = req.body;
 
-    const user = await User.findOne({ email });
+        const org   = await resolveOrgFromRequest(req);
+        const orgId = org?._id ?? null;
 
-    if (user && (await user.matchPassword(password))) {
-        res.json({
-            _id: user._id,
-            name: user.name,
-            email: user.email,
-            role: user.role,
-            token: generateToken(user._id),
+        // Only block if multiple orgs exist and none was identified
+        if (!org) {
+            const count = await Organisation.countDocuments({ deletedAt: null, isActive: true });
+            if (count > 1) {
+                return res.status(400).json({
+                    message: 'Organisation not specified. Include X-Organisation-Slug header.',
+                });
+            }
+            // count === 0 (pre-migration) or count === 1 (already handled above)
+            // → allow login without org scoping
+        }
+
+        if (org && !org.isAccessible) {
+            return res.status(403).json({ message: 'Organisation account is not active.' });
+        }
+
+        // Build user lookup — scope to org when one is resolved
+        const userFilter = orgId
+            ? { email, organisationId: orgId, deletedAt: null }
+            : { email, deletedAt: null };
+
+        const user = await User
+            .findOne(userFilter)
+            .select('+password +loginAttempts +lockUntil +passwordChangedAt')
+            .skipTenantFilter();
+
+        if (!user) {
+            audit(req, 'AUTH_LOGIN_FAILED', {
+                success: false,
+                meta:    { reason: 'user_not_found', email, orgId },
+            });
+            return res.status(401).json({ message: 'Invalid email or password' });
+        }
+
+        if (user.isLocked) {
+            const m = Math.ceil((user.lockUntil - Date.now()) / 60000);
+            audit(req, 'AUTH_LOGIN_FAILED', {
+                actorId: user._id, actorRole: user.role, success: false,
+                meta:    { reason: 'account_locked' },
+            });
+            return res.status(423).json({
+                message: `Account locked. Try again in ${m} minute${m === 1 ? '' : 's'}.`,
+            });
+        }
+
+        const isMatch = await user.matchPassword(password);
+        if (!isMatch) {
+            await user.recordFailedLogin();
+            const after     = user.loginAttempts + 1;
+            const remaining = 5 - after;
+            audit(req, 'AUTH_LOGIN_FAILED', {
+                actorId: user._id, actorRole: user.role, success: false,
+                meta:    { reason: 'wrong_password', after },
+            });
+            if (after >= 5) {
+                audit(req, 'AUTH_ACCOUNT_LOCKED', { actorId: user._id, actorRole: user.role });
+                return res.status(423).json({ message: 'Account locked. Try again in 15 minutes.' });
+            }
+            return res.status(401).json({
+                message: `Invalid email or password. ${remaining} attempt${remaining === 1 ? '' : 's'} remaining.`,
+            });
+        }
+
+        await user.resetLoginAttempts();
+
+        const accessToken  = generateAccessToken(user);
+        const refreshToken = await generateRefreshToken(user._id);
+        setRefreshCookie(res, refreshToken);
+
+        audit(req, 'AUTH_LOGIN_SUCCESS', {
+            actorId: user._id, actorRole: user.role,
+            meta:    { orgId },
         });
-    } else {
-        res.status(401).json({ message: 'Invalid email or password' });
+
+        return res.status(200).json({ user: safeUser(user, org), accessToken });
+    } catch (err) {
+        console.error('[Auth] loginUser:', err.message);
+        return res.status(500).json({ message: 'Login failed. Please try again.' });
     }
 };
 
-export { registerUser, loginUser };
+// ─── POST /api/auth/refresh ───────────────────────────────────────────────────
+const refreshAccessToken = async (req, res) => {
+    try {
+        const token = getRefreshCookie(req);
+        if (!token) {
+            // No cookie yet — not an error, just not logged in
+            return res.status(401).json({ message: 'No refresh token' });
+        }
+
+        const payload = await verifyRefreshToken(token);
+
+        const user = await User
+            .findById(payload.id)
+            .select('+passwordChangedAt')
+            .skipTenantFilter();
+
+        if (!user || user.deletedAt) {
+            clearRefreshCookie(res);
+            return res.status(401).json({ message: 'User not found' });
+        }
+
+        if (user.isTokenIssuedBeforePasswordChange(payload.iat)) {
+            await revokeAllRefreshTokens(user._id);
+            clearRefreshCookie(res);
+            return res.status(401).json({ message: 'Password recently changed. Please log in again.' });
+        }
+
+        await revokeRefreshToken(token);
+        const newAccessToken  = generateAccessToken(user);
+        const newRefreshToken = await generateRefreshToken(user._id);
+        setRefreshCookie(res, newRefreshToken);
+
+        audit(req, 'AUTH_TOKEN_REFRESHED', { actorId: user._id, actorRole: user.role });
+
+        return res.status(200).json({ accessToken: newAccessToken });
+    } catch (err) {
+        // Token invalid/expired/revoked — clear cookie, let client redirect to login
+        clearRefreshCookie(res);
+        return res.status(401).json({ message: 'Session expired. Please log in again.' });
+    }
+};
+
+// ─── POST /api/auth/logout ────────────────────────────────────────────────────
+const logoutUser = async (req, res) => {
+    try {
+        const token = getRefreshCookie(req);
+        if (token) await revokeRefreshToken(token);
+        clearRefreshCookie(res);
+        audit(req, 'AUTH_LOGOUT', {
+            actorId:   req.user?._id ?? null,
+            actorRole: req.user?.role ?? 'anonymous',
+        });
+        return res.status(200).json({ message: 'Logged out successfully' });
+    } catch {
+        clearRefreshCookie(res);
+        return res.status(200).json({ message: 'Logged out' });
+    }
+};
+
+// ─── POST /api/auth/logout-all ────────────────────────────────────────────────
+const logoutAllDevices = async (req, res) => {
+    try {
+        await revokeAllRefreshTokens(req.user._id);
+        clearRefreshCookie(res);
+        audit(req, 'AUTH_LOGOUT', {
+            actorId: req.user._id, actorRole: req.user.role,
+            meta:    { allDevices: true },
+        });
+        return res.status(200).json({ message: 'Logged out from all devices' });
+    } catch (err) {
+        console.error('[Auth] logoutAllDevices:', err.message);
+        return res.status(500).json({ message: 'Failed to logout from all devices' });
+    }
+};
+
+// ─── PUT /api/auth/change-password ────────────────────────────────────────────
+const changePassword = async (req, res) => {
+    try {
+        const { currentPassword, newPassword } = req.body;
+        const user = await User.findById(req.user._id).select('+password').skipTenantFilter();
+        if (!user) return res.status(404).json({ message: 'User not found' });
+
+        const isMatch = await user.matchPassword(currentPassword);
+        if (!isMatch) return res.status(401).json({ message: 'Current password is incorrect' });
+
+        user.password = newPassword;
+        await user.save();
+
+        await revokeAllRefreshTokens(user._id);
+        clearRefreshCookie(res);
+
+        audit(req, 'AUTH_PASSWORD_CHANGED', { actorId: user._id, actorRole: user.role });
+        return res.status(200).json({ message: 'Password changed. Please log in again.' });
+    } catch (err) {
+        console.error('[Auth] changePassword:', err.message);
+        return res.status(500).json({ message: 'Failed to change password.' });
+    }
+};
+
+// ─── GET /api/auth/me ─────────────────────────────────────────────────────────
+const getMe = async (req, res) => {
+    try {
+        const user = await User.findById(req.user._id).skipTenantFilter();
+        if (!user || user.deletedAt) return res.status(404).json({ message: 'User not found' });
+
+        const org = user.organisationId
+            ? await Organisation.findById(user.organisationId)
+            : null;
+
+        return res.status(200).json({ user: safeUser(user, org) });
+    } catch (err) {
+        console.error('[Auth] getMe:', err.message);
+        return res.status(500).json({ message: 'Failed to fetch user' });
+    }
+};
+
+export {
+    registerUser, loginUser, refreshAccessToken,
+    logoutUser, logoutAllDevices, changePassword, getMe,
+};
