@@ -1,34 +1,36 @@
-import User         from '../models/User.js';
-import Appointment  from '../models/Appointment.js';
+import User           from '../models/User.js';
+import Appointment    from '../models/Appointment.js';
 import PackageBooking from '../models/PackageBooking.js';
-import audit        from '../utils/audit.js';
+import HealthPackage  from '../models/HealthPackage.js';
+import audit          from '../utils/audit.js';
+import { validateBookingSlot } from '../utils/bookingValidation.js';
 
 // ─── POST /api/receptionist/register-patient ─────────────────────────────────
+// M5 FIX: restoring a soft-deleted user now forces role back to 'patient',
+// preventing accidental privilege escalation.
 const registerPatient = async (req, res) => {
     try {
         const { name, email, password } = req.body;
 
-        const existingUser = await User.findOne({ email });
+        const existingUser = await User.findOne({ email }).skipTenantFilter();
 
-    if (existingUser && existingUser.deletedAt) {
-        existingUser.name = name;
-        existingUser.password = password;
-        existingUser.role = 'patient';
-        existingUser.deletedAt = undefined;
+        if (existingUser && existingUser.deletedAt) {
+            // M5 FIX: always restore as patient regardless of prior role
+            existingUser.name      = name;
+            existingUser.password  = password;
+            existingUser.role      = 'patient';
+            existingUser.deletedAt = undefined;
+            await existingUser.save();
 
-        await existingUser.save();
+            return res.status(200).json({
+                message: 'Patient restored successfully',
+                patient: { _id: existingUser._id, name: existingUser.name, email: existingUser.email },
+            });
+        }
 
-        return res.status(200).json({
-            message: 'Patient restored successfully',
-            patient: existingUser,
-        });
-    }
-
-    if (existingUser) {
-        return res.status(409).json({
-            message: 'A patient with this email already exists',
-        });
-    }
+        if (existingUser) {
+            return res.status(409).json({ message: 'A patient with this email already exists' });
+        }
 
         const patient = await User.create({ name, email, password, role: 'patient' });
 
@@ -37,14 +39,10 @@ const registerPatient = async (req, res) => {
             actorRole:    req.user.role,
             resourceType: 'User',
             resourceId:   patient._id,
-            meta:         { createdRole: 'patient' },
+            meta:         { createdRole: 'patient', orgId: req.orgId },
         });
 
-        res.status(201).json({
-            _id:   patient._id,
-            name:  patient.name,
-            email: patient.email,
-        });
+        res.status(201).json({ _id: patient._id, name: patient.name, email: patient.email });
     } catch (err) {
         console.error('[Receptionist] registerPatient:', err.message);
         res.status(500).json({ message: 'Failed to register patient' });
@@ -52,6 +50,8 @@ const registerPatient = async (req, res) => {
 };
 
 // ─── POST /api/receptionist/book-appointment ─────────────────────────────────
+// C3 + C4 FIX: full server-side availability and deleted-doctor validation
+// via the shared validateBookingSlot helper.
 const bookOfflineAppointment = async (req, res) => {
     try {
         const { patientId, doctorId, appointmentDate, appointmentTime } = req.body;
@@ -61,10 +61,16 @@ const bookOfflineAppointment = async (req, res) => {
             return res.status(404).json({ message: 'Patient not found' });
         }
 
+        // C3 + C4 FIX: validate slot is valid and doctor is not deleted
+        const validation = await validateBookingSlot(doctorId, appointmentDate, appointmentTime);
+        if (!validation.valid) {
+            return res.status(validation.status).json({ message: validation.message });
+        }
+
         const appointment = await Appointment.create({
             doctor:          doctorId,
             patient:         patientId,
-            appointmentDate: new Date(appointmentDate),
+            appointmentDate: new Date(`${appointmentDate}T00:00:00Z`),
             appointmentTime,
             type:            'Offline',
             status:          'Scheduled',
@@ -75,7 +81,7 @@ const bookOfflineAppointment = async (req, res) => {
             actorRole:    req.user.role,
             resourceType: 'Appointment',
             resourceId:   appointment._id,
-            meta:         { bookedFor: patientId, type: 'Offline' },
+            meta:         { bookedFor: patientId, type: 'Offline', orgId: req.orgId },
         });
 
         res.status(201).json(appointment);
@@ -91,8 +97,6 @@ const bookOfflineAppointment = async (req, res) => {
 };
 
 // ─── GET /api/receptionist/search-patients?q= ────────────────────────────────
-// The query string `q` arrives here already regex-escaped by the Zod validator.
-// We use it directly — no additional escaping needed.
 const searchPatients = async (req, res) => {
     try {
         const { q } = req.query; // pre-sanitised by receptionistValidators.js
@@ -121,14 +125,12 @@ const getAppointmentsByDate = async (req, res) => {
     try {
         const { date } = req.query;
 
-        const startOfDay = new Date(date);
-        startOfDay.setUTCHours(0, 0, 0, 0);
-        const endOfDay = new Date(date);
-        endOfDay.setUTCHours(23, 59, 59, 999);
+        const startOfDay = new Date(`${date}T00:00:00Z`);
+        const endOfDay   = new Date(`${date}T23:59:59Z`);
 
         const appointments = await Appointment.find({
             appointmentDate: { $gte: startOfDay, $lte: endOfDay },
-            status: { $ne: 'Cancelled' }
+            status:          { $ne: 'Cancelled' },
         })
             .populate('patient', 'name')
             .populate({
@@ -138,11 +140,9 @@ const getAppointmentsByDate = async (req, res) => {
             })
             .sort({ appointmentTime: 1 })
             .lean();
-            const activeAppointments = appointments.filter(
-            appointment =>
-                appointment.patient &&
-                appointment.doctor &&
-                appointment.doctor.user
+
+        const activeAppointments = appointments.filter(
+            (a) => a.patient && a.doctor && a.doctor.user
         );
 
         res.json(activeAppointments);
@@ -153,6 +153,7 @@ const getAppointmentsByDate = async (req, res) => {
 };
 
 // ─── POST /api/receptionist/book-package ─────────────────────────────────────
+// C6 FIX: verify the package exists and is not soft-deleted before booking.
 const bookHealthPackageForPatient = async (req, res) => {
     try {
         const { patientId, packageId } = req.body;
@@ -160,6 +161,12 @@ const bookHealthPackageForPatient = async (req, res) => {
         const patient = await User.findOne({ _id: patientId, role: 'patient', deletedAt: null }).lean();
         if (!patient) {
             return res.status(404).json({ message: 'Patient not found' });
+        }
+
+        // C6 FIX: validate package exists and is active
+        const pkg = await HealthPackage.findOne({ _id: packageId, deletedAt: null }).lean();
+        if (!pkg) {
+            return res.status(404).json({ message: 'Health package not found or no longer available.' });
         }
 
         const booking = await PackageBooking.create({
@@ -173,7 +180,7 @@ const bookHealthPackageForPatient = async (req, res) => {
             actorRole:    req.user.role,
             resourceType: 'PackageBooking',
             resourceId:   booking._id,
-            meta:         { bookedFor: patientId },
+            meta:         { bookedFor: patientId, orgId: req.orgId },
         });
 
         res.status(201).json(booking);

@@ -1,31 +1,24 @@
 import Appointment    from '../models/Appointment.js';
 import PackageBooking from '../models/PackageBooking.js';
-import Doctor         from '../models/Doctor.js';
+import HealthPackage  from '../models/HealthPackage.js';
 import audit          from '../utils/audit.js';
+import { validateBookingSlot } from '../utils/bookingValidation.js';
 
 // ─── POST /api/patient/book-appointment ──────────────────────────────────────
-// ─── RACE CONDITION FIX ───────────────────────────────────────────────────────
-// The old implementation: findOne (check slot free) → save (create appointment).
-// Two concurrent requests could both pass the findOne check and both save,
-// creating a double-booking.
-//
-// Fix: use a unique compound index on (doctor + appointmentDate + appointmentTime)
-// so MongoDB itself rejects the second insert with a duplicate key error (E11000).
-// We catch that specific error and return a 409 instead of a 500.
 const bookMyAppointment = async (req, res) => {
     try {
         const { doctorId, appointmentDate, appointmentTime, type } = req.body;
 
-        // Verify the doctor exists
-        const doctor = await Doctor.findById(doctorId).lean();
-        if (!doctor) {
-            return res.status(404).json({ message: 'Doctor not found' });
+        // C3 + C4 FIX: full server-side validation
+        const validation = await validateBookingSlot(doctorId, appointmentDate, appointmentTime);
+        if (!validation.valid) {
+            return res.status(validation.status).json({ message: validation.message });
         }
 
         const appointment = await Appointment.create({
             doctor:          doctorId,
             patient:         req.user._id,
-            appointmentDate: new Date(appointmentDate),
+            appointmentDate: new Date(`${appointmentDate}T00:00:00Z`),
             appointmentTime,
             type,
         });
@@ -39,7 +32,6 @@ const bookMyAppointment = async (req, res) => {
 
         res.status(201).json(appointment);
     } catch (err) {
-        // MongoDB duplicate key — slot was taken between validation and insert
         if (err.code === 11000) {
             return res.status(409).json({
                 message: 'This slot was just booked by someone else. Please choose another time.',
@@ -54,6 +46,12 @@ const bookMyAppointment = async (req, res) => {
 const bookMyHealthPackage = async (req, res) => {
     try {
         const { packageId } = req.body;
+
+        // C6 FIX: verify package exists and is not soft-deleted
+        const pkg = await HealthPackage.findOne({ _id: packageId, deletedAt: null }).lean();
+        if (!pkg) {
+            return res.status(404).json({ message: 'Health package not found or no longer available.' });
+        }
 
         const booking = await PackageBooking.create({
             healthPackage: packageId,

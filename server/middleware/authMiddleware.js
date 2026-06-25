@@ -2,10 +2,6 @@ import User from '../models/User.js';
 import { verifyAccessToken } from '../utils/tokens.js';
 
 // ─── protect ──────────────────────────────────────────────────────────────────
-// Validates the short-lived access token sent in the Authorization header.
-// The client holds the access token in memory (not localStorage/cookie).
-// Cookie is only used for the refresh token on /api/auth/* routes.
-
 const protect = async (req, res, next) => {
     let token;
 
@@ -23,16 +19,15 @@ const protect = async (req, res, next) => {
     try {
         const decoded = verifyAccessToken(token);
 
-        // Fetch user — include passwordChangedAt to detect post-password-change tokens
         const user = await User
             .findById(decoded.id)
-            .select('+passwordChangedAt');
+            .select('+passwordChangedAt')
+            .skipTenantFilter();
 
         if (!user || user.deletedAt) {
             return res.status(401).json({ message: 'User no longer exists' });
         }
 
-        // Reject tokens issued before a password change
         if (user.isTokenIssuedBeforePasswordChange(decoded.iat)) {
             return res.status(401).json({
                 message: 'Password recently changed. Please log in again.',
@@ -42,7 +37,6 @@ const protect = async (req, res, next) => {
         req.user = user;
         next();
     } catch (err) {
-        // jwt.verify throws TokenExpiredError, JsonWebTokenError, etc.
         if (err.name === 'TokenExpiredError') {
             return res.status(401).json({ message: 'Session expired. Please refresh your token.' });
         }
@@ -51,8 +45,6 @@ const protect = async (req, res, next) => {
 };
 
 // ─── Role guards ──────────────────────────────────────────────────────────────
-// Used as route-level middleware after protect().
-
 const requireRole = (...roles) => (req, res, next) => {
     if (!req.user) {
         return res.status(401).json({ message: 'Not authorised' });
@@ -65,10 +57,11 @@ const requireRole = (...roles) => (req, res, next) => {
     next();
 };
 
-// Convenience exports matching existing route usage
-const admin                = requireRole('admin');
-const doctor               = requireRole('doctor');
-const isPatient            = requireRole('patient');
-const isReceptionistOrAdmin = requireRole('receptionist', 'admin');
+// C2 FIX: admin guard now includes super_admin so super-admins can access
+// all admin routes and the frontend /admin dashboard.
+const admin                 = requireRole('admin', 'super_admin');
+const doctor                = requireRole('doctor');
+const isPatient             = requireRole('patient');
+const isReceptionistOrAdmin = requireRole('receptionist', 'admin', 'super_admin');
 
 export { protect, admin, doctor, isPatient, isReceptionistOrAdmin, requireRole };

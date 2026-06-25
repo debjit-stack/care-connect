@@ -26,29 +26,25 @@ const safeUser = (user, org) => ({
 });
 
 // ─── Resolve org from request ─────────────────────────────────────────────────
-// Auth routes bypass tenantMiddleware (PUBLIC_PATHS), so we resolve org here.
-//
+// Auth routes bypass tenantMiddleware so we resolve org independently here.
 // Resolution order:
 //   1. X-Organisation-Slug header
 //   2. X-Organisation-ID header
-//   3. Subdomain  (hospital-abc.careconnect.in)
-//   4. Auto-fallback: 1 org in DB  → use it  (single-tenant / dev / post-migration)
-//                     0 orgs in DB → return null (pre-migration, legacy data)
-//                     2+ orgs      → return null (header required)
+//   3. Subdomain
+//   4. Auto-fallback: exactly 1 active org → use it (single-tenant / dev)
+//                     0 orgs → null (pre-migration)
+//                     2+ orgs → null (header required)
 const resolveOrgFromRequest = async (req) => {
-    // 1. Slug header
     const slug = req.headers['x-organisation-slug'];
     if (slug) {
         return Organisation.findOne({ slug: slug.toLowerCase().trim(), deletedAt: null });
     }
 
-    // 2. ID header
     const id = req.headers['x-organisation-id'];
     if (id) {
         return Organisation.findOne({ _id: id, deletedAt: null });
     }
 
-    // 3. Subdomain
     const host  = req.headers.host || '';
     const parts = host.split('.');
     if (
@@ -58,16 +54,11 @@ const resolveOrgFromRequest = async (req) => {
         return Organisation.findOne({ slug: parts[0], deletedAt: null });
     }
 
-    // 4. Auto-fallback
     const count = await Organisation.countDocuments({ deletedAt: null, isActive: true });
-
     if (count === 1) {
-        // Exactly one org — use it automatically.
-        // Covers: after migration 003 runs on a single-hospital deployment.
         return Organisation.findOne({ deletedAt: null, isActive: true });
     }
 
-    // 0 orgs (pre-migration) or 2+ orgs without header → return null
     return null;
 };
 
@@ -88,7 +79,6 @@ const registerUser = async (req, res) => {
             }
         }
 
-        // Check email uniqueness — scoped to org if one exists
         const existsFilter = orgId
             ? { email, organisationId: orgId, deletedAt: null }
             : { email, deletedAt: null };
@@ -104,7 +94,6 @@ const registerUser = async (req, res) => {
                 user = await User.create({ name, email, password, role: 'patient' });
             });
         } else {
-            // Pre-migration — create without org scope
             user = await User.create({ name, email, password, role: 'patient' });
         }
 
@@ -112,10 +101,11 @@ const registerUser = async (req, res) => {
         const refreshToken = await generateRefreshToken(user._id);
         setRefreshCookie(res, refreshToken);
 
+        // M7 FIX: include orgId in audit meta so auth events are traceable per org
         audit(req, 'AUTH_LOGIN_SUCCESS', {
-            actorId:   user._id,
-            actorRole: user.role,
-            meta:      { event: 'registration', orgId },
+            actorId:      user._id,
+            actorRole:    user.role,
+            meta:         { event: 'registration', orgId: orgId?.toString() ?? null },
         });
 
         return res.status(201).json({ user: safeUser(user, org), accessToken });
@@ -127,14 +117,12 @@ const registerUser = async (req, res) => {
 
 // ─── POST /api/auth/login ─────────────────────────────────────────────────────
 const loginUser = async (req, res) => {
-    //console.log("LOGIN USER REACHED");
     try {
         const { email, password } = req.body;
 
         const org   = await resolveOrgFromRequest(req);
         const orgId = org?._id ?? null;
 
-        // Only block if multiple orgs exist and none was identified
         if (!org) {
             const count = await Organisation.countDocuments({ deletedAt: null, isActive: true });
             if (count > 1) {
@@ -142,15 +130,12 @@ const loginUser = async (req, res) => {
                     message: 'Organisation not specified. Include X-Organisation-Slug header.',
                 });
             }
-            // count === 0 (pre-migration) or count === 1 (already handled above)
-            // → allow login without org scoping
         }
 
         if (org && !org.isAccessible) {
             return res.status(403).json({ message: 'Organisation account is not active.' });
         }
 
-        // Build user lookup — scope to org when one is resolved
         const userFilter = orgId
             ? { email, organisationId: orgId, deletedAt: null }
             : { email, deletedAt: null };
@@ -161,9 +146,10 @@ const loginUser = async (req, res) => {
             .skipTenantFilter();
 
         if (!user) {
+            // M7 FIX: include orgId in failed login audit
             audit(req, 'AUTH_LOGIN_FAILED', {
                 success: false,
-                meta:    { reason: 'user_not_found', email, orgId },
+                meta:    { reason: 'user_not_found', email, orgId: orgId?.toString() ?? null },
             });
             return res.status(401).json({ message: 'Invalid email or password' });
         }
@@ -172,7 +158,7 @@ const loginUser = async (req, res) => {
             const m = Math.ceil((user.lockUntil - Date.now()) / 60000);
             audit(req, 'AUTH_LOGIN_FAILED', {
                 actorId: user._id, actorRole: user.role, success: false,
-                meta:    { reason: 'account_locked' },
+                meta:    { reason: 'account_locked', orgId: orgId?.toString() ?? null },
             });
             return res.status(423).json({
                 message: `Account locked. Try again in ${m} minute${m === 1 ? '' : 's'}.`,
@@ -186,10 +172,14 @@ const loginUser = async (req, res) => {
             const remaining = 5 - after;
             audit(req, 'AUTH_LOGIN_FAILED', {
                 actorId: user._id, actorRole: user.role, success: false,
-                meta:    { reason: 'wrong_password', after },
+                meta:    { reason: 'wrong_password', after, orgId: orgId?.toString() ?? null },
             });
             if (after >= 5) {
-                audit(req, 'AUTH_ACCOUNT_LOCKED', { actorId: user._id, actorRole: user.role });
+                audit(req, 'AUTH_ACCOUNT_LOCKED', {
+                    actorId:  user._id,
+                    actorRole: user.role,
+                    meta:     { orgId: orgId?.toString() ?? null },
+                });
                 return res.status(423).json({ message: 'Account locked. Try again in 15 minutes.' });
             }
             return res.status(401).json({
@@ -203,9 +193,11 @@ const loginUser = async (req, res) => {
         const refreshToken = await generateRefreshToken(user._id);
         setRefreshCookie(res, refreshToken);
 
+        // M7 FIX: orgId in successful login audit
         audit(req, 'AUTH_LOGIN_SUCCESS', {
-            actorId: user._id, actorRole: user.role,
-            meta:    { orgId },
+            actorId:  user._id,
+            actorRole: user.role,
+            meta:     { orgId: orgId?.toString() ?? null },
         });
 
         return res.status(200).json({ user: safeUser(user, org), accessToken });
@@ -220,7 +212,6 @@ const refreshAccessToken = async (req, res) => {
     try {
         const token = getRefreshCookie(req);
         if (!token) {
-            // No cookie yet — not an error, just not logged in
             return res.status(401).json({ message: 'No refresh token' });
         }
 
@@ -251,7 +242,6 @@ const refreshAccessToken = async (req, res) => {
 
         return res.status(200).json({ accessToken: newAccessToken });
     } catch (err) {
-        // Token invalid/expired/revoked — clear cookie, let client redirect to login
         clearRefreshCookie(res);
         return res.status(401).json({ message: 'Session expired. Please log in again.' });
     }
@@ -280,8 +270,9 @@ const logoutAllDevices = async (req, res) => {
         await revokeAllRefreshTokens(req.user._id);
         clearRefreshCookie(res);
         audit(req, 'AUTH_LOGOUT', {
-            actorId: req.user._id, actorRole: req.user.role,
-            meta:    { allDevices: true },
+            actorId:  req.user._id,
+            actorRole: req.user.role,
+            meta:     { allDevices: true },
         });
         return res.status(200).json({ message: 'Logged out from all devices' });
     } catch (err) {

@@ -4,46 +4,44 @@ import API from '../../api/index.js';
 
 const daysOfWeek = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
 
+const emptySchedule = () =>
+    daysOfWeek.map((day) => ({ day, startTime: '', endTime: '' }));
+
 const ScheduleManager = () => {
-    const [availability, setAvailability] = useState(
-        daysOfWeek.map((day) => ({ day, startTime: '', endTime: '' }))
-    );
-    const [message, setMessage] = useState('');
-    const [loading, setLoading] = useState(true);
+    const [availability, setAvailability] = useState(emptySchedule());
+    const [message,  setMessage]  = useState('');
+    const [loading,  setLoading]  = useState(true);
 
     useEffect(() => {
         const fetchMyProfile = async () => {
             try {
-                // Reuse the doctor appointments endpoint to get doctor profile
-                // Actually we need a /api/doctors/my-profile — use my-appointments
-                // to get the doctor's profile id, then fetch availability from it
-                // Best approach: add GET /api/doctors/my-profile on backend
-                // For now, call the my-appointments endpoint and pull the doctor id,
-                // then fetch the doctor by id to get availability
-                const apptRes = await API.get('/doctors/my-appointments');
-                if (apptRes.data && apptRes.data.length > 0) {
-                    const doctorId = apptRes.data[0].doctor;
-                    const profileRes = await API.get(`/doctors/${doctorId}`);
-                    const existingAvailability = profileRes.data.availability || [];
-                    setAvailability(
-                        daysOfWeek.map((day) => {
-                            const existing = existingAvailability.find(
-                                (a) => a.day.toLowerCase() === day.toLowerCase()
-                            );
-                            return { day, startTime: existing?.startTime || '', endTime: existing?.endTime || '' };
-                        })
-                    );
-                } else {
-                    // No appointments yet — try fetching profile via my-availability endpoint
-                    // We'll just show empty schedule which is fine for new doctors
-                    setAvailability(daysOfWeek.map((day) => ({ day, startTime: '', endTime: '' })));
-                }
+                // M8 FIX: call /api/doctors/my-profile directly — do not rely on
+                // the first appointment to find the doctor's own profile ID.
+                // This works for brand-new doctors with zero appointments.
+                const { data } = await API.get('/doctors/my-profile');
+                const existingAvailability = data.availability || [];
+
+                setAvailability(
+                    daysOfWeek.map((day) => {
+                        const existing = existingAvailability.find(
+                            (a) => a.day.toLowerCase() === day.toLowerCase()
+                        );
+                        return {
+                            day,
+                            startTime: existing?.startTime || '',
+                            endTime:   existing?.endTime   || '',
+                        };
+                    })
+                );
             } catch (err) {
                 console.error('Could not load current schedule:', err);
+                // Show empty schedule — doctor can still save new availability
+                setAvailability(emptySchedule());
             } finally {
                 setLoading(false);
             }
         };
+
         fetchMyProfile();
     }, []);
 
@@ -58,8 +56,18 @@ const ScheduleManager = () => {
     const handleSubmit = async (e) => {
         e.preventDefault();
         setMessage('');
-        // Only send days that have both start and end time set
+
+        // Only submit days that have BOTH start and end time set
         const toSave = availability.filter((d) => d.startTime && d.endTime);
+
+        // Validate start < end for each filled day
+        for (const entry of toSave) {
+            if (entry.startTime >= entry.endTime) {
+                setMessage(`Start time must be before end time for ${entry.day}.`);
+                return;
+            }
+        }
+
         try {
             await updateMyAvailability(toSave);
             setMessage('Availability updated successfully!');
@@ -77,15 +85,13 @@ const ScheduleManager = () => {
             <p className="text-sm text-gray-500 mb-4">
                 Leave start/end time blank for days you are not available.
             </p>
+
             {message && (
-                <p
-                    className={`mb-4 font-semibold ${
-                        message.includes('Failed') ? 'text-red-600' : 'text-green-600'
-                    }`}
-                >
+                <p className={`mb-4 font-semibold ${message.includes('Failed') || message.includes('must be') ? 'text-red-600' : 'text-green-600'}`}>
                     {message}
                 </p>
             )}
+
             <form onSubmit={handleSubmit}>
                 <div className="space-y-4">
                     {availability.map(({ day, startTime, endTime }) => (

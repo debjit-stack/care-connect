@@ -6,16 +6,14 @@ import PackageBooking from '../models/PackageBooking.js';
 // GET /api/dashboard/stats  (admin only, scoped to their org)
 const getDashboardStats = async (req, res) => {
     try {
-        const orgId = req.orgId; // set by tenantMiddleware
+        const orgId = req.orgId;
 
-        // ── KPI counts ────────────────────────────────────────────────────────
         const [totalPatients, totalDoctors, totalAppointments] = await Promise.all([
             User.countDocuments({ organisationId: orgId, role: 'patient',  deletedAt: null }).skipTenantFilter(),
             User.countDocuments({ organisationId: orgId, role: 'doctor',   deletedAt: null }).skipTenantFilter(),
             Appointment.countDocuments({ organisationId: orgId }).skipTenantFilter(),
         ]);
 
-        // ── Revenue from package bookings ─────────────────────────────────────
         const revenueData = await PackageBooking.aggregate([
             { $match: { organisationId: orgId } },
             {
@@ -27,11 +25,12 @@ const getDashboardStats = async (req, res) => {
                 },
             },
             { $unwind: '$packageDetails' },
+            // C5 FIX: only count non-deleted packages in revenue
+            { $match: { 'packageDetails.deletedAt': null } },
             { $group: { _id: null, totalRevenue: { $sum: '$packageDetails.price' } } },
         ]);
         const totalRevenue = revenueData[0]?.totalRevenue ?? 0;
 
-        // ── New patients in last 30 days ───────────────────────────────────────
         const thirtyDaysAgo = new Date();
         thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
 
@@ -42,16 +41,18 @@ const getDashboardStats = async (req, res) => {
             createdAt:      { $gte: thirtyDaysAgo },
         }).skipTenantFilter();
 
-        // ── Recent appointments ────────────────────────────────────────────────
-        const recentAppointments = await Appointment.find({ organisationId: orgId })
+        // L2 FIX: .skipTenantFilter() must come before .lean() — it sets a query
+        // option and lean() terminates the chain. Correct order: find → skipTenantFilter
+        // → populate → sort → limit → lean
+        const recentAppointments = await Appointment
+            .find({ organisationId: orgId })
+            .skipTenantFilter()
             .populate('patient', 'name')
             .populate({ path: 'doctor', populate: { path: 'user', select: 'name' } })
             .sort({ createdAt: -1 })
             .limit(5)
-            .lean()
-            .skipTenantFilter();
+            .lean();
 
-        // ── Appointments by month ──────────────────────────────────────────────
         const appointmentsByMonth = await Appointment.aggregate([
             { $match: { organisationId: orgId } },
             {
@@ -65,9 +66,9 @@ const getDashboardStats = async (req, res) => {
         ]);
 
         res.json({
-            kpi: { totalPatients, totalDoctors, totalAppointments, totalRevenue },
+            kpi:            { totalPatients, totalDoctors, totalAppointments, totalRevenue },
             recentActivity: { newPatientsLast30Days, recentAppointments },
-            charts: { appointmentsByMonth },
+            charts:         { appointmentsByMonth },
         });
     } catch (err) {
         console.error('[Dashboard] getDashboardStats:', err.message);

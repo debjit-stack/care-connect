@@ -1,32 +1,33 @@
 import React from 'react';
 import { Routes, Route } from 'react-router-dom';
-import HomePage from './pages/HomePage';
-import LoginPage from './pages/LoginPage';
-import DoctorsPage from './pages/DoctorsPage';
-import DoctorDetailPage from './pages/DoctorDetailPage';
-import ProtectedRoute from './components/auth/ProtectedRoute';
-import PackagesPage from './pages/PackagesPage'; // <-- NEW IMPORT
+import HomePage          from './pages/HomePage';
+import LoginPage         from './pages/LoginPage';
+import RegisterPage      from './pages/RegisterPage';
+import DoctorsPage       from './pages/DoctorsPage';
+import DoctorDetailPage  from './pages/DoctorDetailPage';
+import ProtectedRoute    from './components/auth/ProtectedRoute';
+import PackagesPage      from './pages/PackagesPage';
 
-// Import Dashboards
-import AdminDashboard from './pages/AdminDashboard';
-import DoctorDashboard from './pages/DoctorDashboard';
+import AdminDashboard        from './pages/AdminDashboard';
+import DoctorDashboard       from './pages/DoctorDashboard';
 import ReceptionistDashboard from './pages/ReceptionistDashboard';
-import PatientDashboard from './pages/PatientDashboard';
-
+import PatientDashboard      from './pages/PatientDashboard';
 
 const AppRoutes = () => {
   return (
     <Routes>
       {/* Public Routes */}
-      <Route path="/" element={<HomePage />} />
-      <Route path="/login" element={<LoginPage />} />
-      <Route path="/doctors" element={<DoctorsPage />} />
+      <Route path="/"            element={<HomePage />} />
+      <Route path="/login"       element={<LoginPage />} />
+      <Route path="/register"    element={<RegisterPage />} />   {/* M2 FIX */}
+      <Route path="/doctors"     element={<DoctorsPage />} />
       <Route path="/doctors/:id" element={<DoctorDetailPage />} />
-      <Route path="/packages" element={<PackagesPage />} /> {/* <-- NEW ROUTE */}
+      <Route path="/packages"    element={<PackagesPage />} />
 
       {/* Protected Routes */}
+      {/* C2 FIX: super_admin can access /admin dashboard */}
       <Route path="/admin" element={
-        <ProtectedRoute allowedRoles={['admin']}>
+        <ProtectedRoute allowedRoles={['admin', 'super_admin']}>
           <AdminDashboard />
         </ProtectedRoute>
       } />
@@ -36,7 +37,7 @@ const AppRoutes = () => {
         </ProtectedRoute>
       } />
       <Route path="/receptionist" element={
-        <ProtectedRoute allowedRoles={['receptionist', 'admin']}>
+        <ProtectedRoute allowedRoles={['receptionist', 'admin', 'super_admin']}>
           <ReceptionistDashboard />
         </ProtectedRoute>
       } />

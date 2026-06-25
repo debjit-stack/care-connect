@@ -16,6 +16,8 @@ import patientRoutes       from './routes/patientRoutes.js';
 import healthPackageRoutes from './routes/healthPackageRoutes.js';
 import dashboardRoutes     from './routes/dashboardRoutes.js';
 import organisationRoutes  from './routes/organisationRoutes.js';
+// L3 FIX: appointmentRoutes removed — legacy file with no validation/RBAC,
+// superseded by patientRoutes and receptionistRoutes.
 
 dotenv.config();
 connectDB();
@@ -27,17 +29,21 @@ app.use(helmet({
     crossOriginResourcePolicy: { policy: 'cross-origin' },
     contentSecurityPolicy: {
         directives: {
-            defaultSrc: ["'self'"], scriptSrc: ["'self'"],
+            defaultSrc: ["'self'"],
+            scriptSrc:  ["'self'"],
             styleSrc:   ["'self'", "'unsafe-inline'"],
             imgSrc:     ["'self'", 'data:', 'https:'],
-            connectSrc: ["'self'"], frameSrc: ["'none'"],
-            objectSrc:  ["'none'"], upgradeInsecureRequests: [],
+            connectSrc: ["'self'"],
+            frameSrc:   ["'none'"],
+            objectSrc:  ["'none'"],
+            upgradeInsecureRequests: [],
         },
     },
 }));
 
 const allowedOrigins = (process.env.CLIENT_ORIGIN || 'http://localhost:3000')
-    .split(',').map((o) => o.trim());
+    .split(',')
+    .map((o) => o.trim());
 
 app.use(cors({
     origin(origin, cb) {
@@ -45,7 +51,7 @@ app.use(cors({
         if (allowedOrigins.includes(origin)) return cb(null, true);
         cb(new Error(`CORS: origin ${origin} not allowed`));
     },
-    credentials: true,
+    credentials:          true,
     optionsSuccessStatus: 200,
 }));
 
@@ -58,8 +64,10 @@ app.set('trust proxy', 1);
 app.use('/api', apiRateLimiter);
 
 // Tenant resolution — runs before all route handlers.
-// Auth routes bypass via PUBLIC_PATHS list in tenantMiddleware.
-// Organisation routes use .skipTenantFilter() in controllers.
+// Auth routes bypass via PUBLIC_PATHS in tenantMiddleware.
+// C1 FIX: resolveTenant no longer relies on req.user — it does its own
+// org auto-detection, so the ordering of protect vs resolveTenant is not
+// a problem. protect() runs later at the individual route level.
 app.use('/api', resolveTenant);
 
 // Routes

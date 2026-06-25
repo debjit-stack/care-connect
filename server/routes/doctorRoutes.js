@@ -4,6 +4,7 @@ import {
     getDoctorById,
     getDoctorAvailability,
     getMyAssignedAppointments,
+    getMyProfile,
     getPatientHistory,
     updateAppointment,
     updateMyAvailability,
@@ -24,6 +25,12 @@ const router = express.Router();
 router.get('/my-appointments',
     protect, doctor,
     getMyAssignedAppointments
+);
+
+// M8 FIX: new endpoint so ScheduleManager can load profile without appointments
+router.get('/my-profile',
+    protect, doctor,
+    getMyProfile
 );
 
 router.get('/patient-history/:patientId',

@@ -16,7 +16,6 @@ const getHealthPackages = async (req, res) => {
 const createHealthPackage = async (req, res) => {
     try {
         const { name, price, details } = req.body;
-
         const pkg = await HealthPackage.create({ name, price, details });
 
         audit(req, 'DATA_CREATE', {
@@ -38,7 +37,8 @@ const updateHealthPackage = async (req, res) => {
     try {
         const { name, price, details } = req.body;
 
-        const pkg = await HealthPackage.findById(req.params.id);
+        // Only update non-deleted packages
+        const pkg = await HealthPackage.findOne({ _id: req.params.id, deletedAt: null });
         if (!pkg) return res.status(404).json({ message: 'Package not found' });
 
         if (name    !== undefined) pkg.name    = name;
@@ -62,12 +62,15 @@ const updateHealthPackage = async (req, res) => {
 };
 
 // DELETE /api/packages/:id
+// C5 FIX: use soft delete (set deletedAt) instead of physical deleteOne().
+// This preserves historical PackageBooking references and revenue calculations.
 const deleteHealthPackage = async (req, res) => {
     try {
-        const pkg = await HealthPackage.findById(req.params.id);
+        const pkg = await HealthPackage.findOne({ _id: req.params.id, deletedAt: null });
         if (!pkg) return res.status(404).json({ message: 'Package not found' });
 
-        await pkg.deleteOne();
+        pkg.deletedAt = new Date();
+        await pkg.save();
 
         audit(req, 'DATA_DELETE', {
             actorId:      req.user._id,
