@@ -3,19 +3,16 @@ import { v4 as uuidv4 } from 'uuid';
 import getRedisClient from '../config/redis.js';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
-
-const ACCESS_TOKEN_EXPIRES  = process.env.JWT_ACCESS_EXPIRES  || '15m';
-const REFRESH_TOKEN_EXPIRES = process.env.JWT_REFRESH_EXPIRES || '7d';
-const REFRESH_TOKEN_TTL_SEC = 7 * 24 * 60 * 60; // 7 days in seconds
+const ACCESS_TOKEN_EXPIRES    = process.env.JWT_ACCESS_EXPIRES    || '15m';
+const REFRESH_TOKEN_EXPIRES   = process.env.JWT_REFRESH_EXPIRES   || '7d';
+const REFRESH_TOKEN_TTL_SEC   = 7 * 24 * 60 * 60;
+// MFA-pending token is very short-lived — user has 5 minutes to enter their TOTP
+const MFA_PENDING_EXPIRES     = process.env.JWT_MFA_PENDING_EXPIRES || '5m';
 
 // ─── Access token ─────────────────────────────────────────────────────────────
-
 export const generateAccessToken = (user) => {
     return jwt.sign(
-        {
-            id:   user._id,
-            role: user.role,
-        },
+        { id: user._id, role: user.role },
         process.env.JWT_SECRET,
         { expiresIn: ACCESS_TOKEN_EXPIRES }
     );
@@ -25,20 +22,36 @@ export const verifyAccessToken = (token) => {
     return jwt.verify(token, process.env.JWT_SECRET);
 };
 
-// ─── Refresh token ────────────────────────────────────────────────────────────
-// Refresh tokens are opaque UUIDs stored in Redis.
-// Redis key: refresh:{userId}:{tokenId}  →  value: "valid"
-// This lets us revoke ALL sessions for a user or a single session.
+// ─── MFA-pending token ────────────────────────────────────────────────────────
+// Issued after password is correct but before TOTP is verified.
+// This is a DIFFERENT secret from JWT_SECRET — it signs only the pending state.
+// The client sends this back to /api/auth/mfa/validate with their TOTP token.
+// It contains no role or session claims — it only identifies the user for MFA.
+export const generateMfaPendingToken = (userId) => {
+    return jwt.sign(
+        { id: userId, mfaPending: true },
+        process.env.JWT_MFA_PENDING_SECRET || process.env.JWT_SECRET + '_mfa',
+        { expiresIn: MFA_PENDING_EXPIRES }
+    );
+};
 
+export const verifyMfaPendingToken = (token) => {
+    const payload = jwt.verify(
+        token,
+        process.env.JWT_MFA_PENDING_SECRET || process.env.JWT_SECRET + '_mfa'
+    );
+    if (!payload.mfaPending) {
+        throw new Error('Not an MFA pending token');
+    }
+    return payload;
+};
+
+// ─── Refresh token ────────────────────────────────────────────────────────────
 export const generateRefreshToken = async (userId) => {
     const redis   = getRedisClient();
     const tokenId = uuidv4();
     const key     = `refresh:${userId}:${tokenId}`;
-
     await redis.set(key, 'valid', 'EX', REFRESH_TOKEN_TTL_SEC);
-
-    // The token sent to the client encodes both userId and tokenId so the
-    // server can look up the exact Redis key on verification.
     return jwt.sign(
         { id: userId, jti: tokenId },
         process.env.JWT_REFRESH_SECRET,
@@ -47,18 +60,11 @@ export const generateRefreshToken = async (userId) => {
 };
 
 export const verifyRefreshToken = async (token) => {
-    // Step 1 — verify JWT signature and expiry
     const payload = jwt.verify(token, process.env.JWT_REFRESH_SECRET);
-
-    // Step 2 — verify the token still exists in Redis (not revoked)
-    const redis = getRedisClient();
-    const key   = `refresh:${payload.id}:${payload.jti}`;
-    const value = await redis.get(key);
-
-    if (!value) {
-        throw new Error('Refresh token revoked or expired');
-    }
-
+    const redis   = getRedisClient();
+    const key     = `refresh:${payload.id}:${payload.jti}`;
+    const value   = await redis.get(key);
+    if (!value) throw new Error('Refresh token revoked or expired');
     return payload;
 };
 
@@ -66,16 +72,14 @@ export const revokeRefreshToken = async (token) => {
     try {
         const payload = jwt.verify(token, process.env.JWT_REFRESH_SECRET);
         const redis   = getRedisClient();
-        const key     = `refresh:${payload.id}:${payload.jti}`;
-        await redis.del(key);
+        await redis.del(`refresh:${payload.id}:${payload.jti}`);
     } catch {
-        // Token already invalid — nothing to revoke
+        // already invalid
     }
 };
 
 export const revokeAllRefreshTokens = async (userId) => {
     const redis   = getRedisClient();
-    // Scan for all refresh tokens belonging to this user
     const pattern = `refresh:${userId}:*`;
     let cursor    = '0';
     do {
@@ -86,16 +90,15 @@ export const revokeAllRefreshTokens = async (userId) => {
 };
 
 // ─── Cookie helpers ───────────────────────────────────────────────────────────
-
 const COOKIE_NAME = 'careconnect_refresh';
 
 export const setRefreshCookie = (res, token) => {
     res.cookie(COOKIE_NAME, token, {
-        httpOnly:  true,                                     // not readable by JS
-        secure:    process.env.NODE_ENV === 'production',    // HTTPS only in prod
-        sameSite:  'strict',                                 // CSRF protection
-        maxAge:    REFRESH_TOKEN_TTL_SEC * 1000,             // milliseconds
-        path:      '/api/auth',                              // only sent to auth routes
+        httpOnly: true,
+        secure:   process.env.NODE_ENV === 'production',
+        sameSite: 'strict',
+        maxAge:   REFRESH_TOKEN_TTL_SEC * 1000,
+        path:     '/api/auth',
     });
 };
 

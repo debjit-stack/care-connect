@@ -2,8 +2,6 @@ import Organisation from '../models/Organisation.js';
 import { runWithTenant } from '../plugins/tenantPlugin.js';
 
 // ── Paths that bypass tenant resolution completely ────────────────────────────
-// M1 FIX: Added /api/doctors and /api/packages so public browsing works
-// without an org header. Auth routes resolve their own org in authController.
 const PUBLIC_PATHS = [
     '/api/auth/login',
     '/api/auth/register',
@@ -11,6 +9,9 @@ const PUBLIC_PATHS = [
     '/api/auth/logout',
     '/api/auth/logout-all',
     '/api/health',
+    // WS1 MFA: /validate uses mfaPending JWT in request body, not access token
+    // It resolves its own user context from the pending token
+    '/api/auth/mfa/validate',
     // Public browsing — no org context needed for anonymous visitors
     '/api/doctors',
     '/api/packages',
@@ -18,15 +19,12 @@ const PUBLIC_PATHS = [
 
 // ── Resolve org slug/id from request ─────────────────────────────────────────
 const resolveSlug = (req) => {
-    // 1. Header slug (dev / API clients / mobile apps)
     const headerSlug = req.headers['x-organisation-slug'];
     if (headerSlug) return { type: 'slug', value: headerSlug.toLowerCase().trim() };
 
-    // 2. Header ID (internal service-to-service)
     const headerId = req.headers['x-organisation-id'];
     if (headerId) return { type: 'id', value: headerId.trim() };
 
-    // 3. Subdomain (production: hospital-abc.careconnect.in)
     const host  = req.headers.host || '';
     const parts = host.split('.');
     if (
@@ -41,18 +39,16 @@ const resolveSlug = (req) => {
 
 // ── Main middleware ────────────────────────────────────────────────────────────
 export const resolveTenant = async (req, res, next) => {
-    // Skip all public paths (exact match or prefix)
     const isPublic = PUBLIC_PATHS.some(
-        (p) => req.originalUrl === p || req.originalUrl.startsWith(p + '/') || req.originalUrl.startsWith(p + '?')
+        (p) => req.originalUrl === p ||
+               req.originalUrl.startsWith(p + '/') ||
+               req.originalUrl.startsWith(p + '?')
     );
     if (isPublic) return next();
 
     const resolved = resolveSlug(req);
 
     if (!resolved) {
-        // No explicit org signal — try auto-fallback for single-org deployments.
-        // C1 FIX: We do NOT check req.user here because protect() hasn't run yet.
-        // Instead we check the DB directly for single-org auto-resolution.
         try {
             const count = await Organisation.countDocuments({ deletedAt: null, isActive: true });
 
@@ -66,12 +62,9 @@ export const resolveTenant = async (req, res, next) => {
             }
 
             if (count === 0) {
-                // Pre-migration state — no orgs exist yet, allow requests through
-                // without tenant scoping so the app still functions.
                 return next();
             }
 
-            // 2+ orgs and no slug provided — block
             return res.status(400).json({
                 message: 'Organisation not specified. Include X-Organisation-Slug header or use your subdomain.',
             });
@@ -99,10 +92,6 @@ export const resolveTenant = async (req, res, next) => {
         req.org   = org;
         req.orgId = org._id;
 
-        // C1 FIX: super_admin bypass happens AFTER org is resolved and set on req,
-        // not before. This way super_admin still gets req.orgId if present but
-        // is not blocked if the org lookup differs from their own org.
-        // The actual cross-tenant access control is handled in individual controllers.
         runWithTenant(org._id, () => next());
     } catch (err) {
         console.error('[Tenant] resolution error:', err.message);
@@ -113,7 +102,7 @@ export const resolveTenant = async (req, res, next) => {
 // ── Feature flag guard ────────────────────────────────────────────────────────
 export const requireFeature = (featureKey) => (req, res, next) => {
     const org = req.org;
-    if (!org) return next(); // no org context (public route or pre-migration)
+    if (!org) return next();
     if (!org.features?.[featureKey]) {
         return res.status(403).json({
             message: `This feature (${featureKey}) is not enabled for your organisation.`,

@@ -13,7 +13,7 @@ export const AuthProvider = ({ children }) => {
     const [loading, setLoading] = useState(true);
     const refreshAttempted = useRef(false);
 
-    // ── Restore session on mount via httpOnly cookie ──────────────────────────
+    // ── Restore session on mount ──────────────────────────────────────────────
     useEffect(() => {
         if (refreshAttempted.current) return;
         refreshAttempted.current = true;
@@ -41,7 +41,7 @@ export const AuthProvider = ({ children }) => {
         restoreSession();
     }, []);
 
-    // ── Session-expired event from Axios interceptor ──────────────────────────
+    // ── Session-expired event ─────────────────────────────────────────────────
     useEffect(() => {
         const handler = () => {
             clearAccessToken();
@@ -54,8 +54,22 @@ export const AuthProvider = ({ children }) => {
     }, []);
 
     // ── login ─────────────────────────────────────────────────────────────────
+    // If the server returns mfaRequired: true (status 200), we throw a
+    // synthetic error so LoginPage can detect it and render MFAVerifyStep.
+    // This keeps the MFA flow outside AuthContext — AuthContext only manages
+    // fully-authenticated sessions.
     const login = useCallback(async (email, password) => {
         const { data } = await loginApi({ email, password });
+
+        // MFA gate — not a real login yet
+        if (data.mfaRequired) {
+            // Throw so LoginPage's catch block handles the MFA step
+            const mfaError = new Error('MFA required');
+            mfaError.response = { status: 200, data };
+            throw mfaError;
+        }
+
+        // Full login success
         setAccessToken(data.accessToken);
         setUser(data.user);
         setOrg(data.user.organisation ?? null);
@@ -87,7 +101,7 @@ export const AuthProvider = ({ children }) => {
         }
     }, []);
 
-    // ── updateUser ────────────────────────────────────────────────────────────
+    // ── updateUser — used after MFA verify or profile changes ─────────────────
     const updateUser = useCallback((updates) => {
         setUser((prev) => prev ? { ...prev, ...updates } : prev);
     }, []);

@@ -3,6 +3,7 @@ import { Routes, Route } from 'react-router-dom';
 import HomePage          from './pages/HomePage';
 import LoginPage         from './pages/LoginPage';
 import RegisterPage      from './pages/RegisterPage';
+import MFASetupPage      from './pages/MFASetupPage';
 import DoctorsPage       from './pages/DoctorsPage';
 import DoctorDetailPage  from './pages/DoctorDetailPage';
 import ProtectedRoute    from './components/auth/ProtectedRoute';
@@ -19,13 +20,13 @@ const AppRoutes = () => {
       {/* Public Routes */}
       <Route path="/"            element={<HomePage />} />
       <Route path="/login"       element={<LoginPage />} />
-      <Route path="/register"    element={<RegisterPage />} />   {/* M2 FIX */}
+      <Route path="/register"    element={<RegisterPage />} />
+      <Route path="/mfa-setup"   element={<MFASetupPage />} />
       <Route path="/doctors"     element={<DoctorsPage />} />
       <Route path="/doctors/:id" element={<DoctorDetailPage />} />
       <Route path="/packages"    element={<PackagesPage />} />
 
       {/* Protected Routes */}
-      {/* C2 FIX: super_admin can access /admin dashboard */}
       <Route path="/admin" element={
         <ProtectedRoute allowedRoles={['admin', 'super_admin']}>
           <AdminDashboard />

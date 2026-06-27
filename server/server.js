@@ -9,6 +9,7 @@ import { apiRateLimiter } from './middleware/rateLimiter.js';
 import { resolveTenant }  from './middleware/tenantMiddleware.js';
 
 import authRoutes          from './routes/authRoutes.js';
+import mfaRoutes           from './routes/mfaRoutes.js';
 import doctorRoutes        from './routes/doctorRoutes.js';
 import adminRoutes         from './routes/adminRoutes.js';
 import receptionistRoutes  from './routes/receptionistRoutes.js';
@@ -16,8 +17,6 @@ import patientRoutes       from './routes/patientRoutes.js';
 import healthPackageRoutes from './routes/healthPackageRoutes.js';
 import dashboardRoutes     from './routes/dashboardRoutes.js';
 import organisationRoutes  from './routes/organisationRoutes.js';
-// L3 FIX: appointmentRoutes removed — legacy file with no validation/RBAC,
-// superseded by patientRoutes and receptionistRoutes.
 
 dotenv.config();
 connectDB();
@@ -60,18 +59,14 @@ app.use(express.urlencoded({ extended: false, limit: '10kb' }));
 app.use(cookieParser());
 app.set('trust proxy', 1);
 
-// Global rate limiter
 app.use('/api', apiRateLimiter);
-
-// Tenant resolution — runs before all route handlers.
-// Auth routes bypass via PUBLIC_PATHS in tenantMiddleware.
-// C1 FIX: resolveTenant no longer relies on req.user — it does its own
-// org auto-detection, so the ordering of protect vs resolveTenant is not
-// a problem. protect() runs later at the individual route level.
 app.use('/api', resolveTenant);
 
 // Routes
+// NOTE: /api/auth/mfa/validate is in tenantMiddleware PUBLIC_PATHS
+// because it uses a mfaPending JWT body param, not an access token.
 app.use('/api/auth',          authRoutes);
+app.use('/api/auth/mfa',      mfaRoutes);
 app.use('/api/organisations', organisationRoutes);
 app.use('/api/doctors',       doctorRoutes);
 app.use('/api/admin',         adminRoutes);

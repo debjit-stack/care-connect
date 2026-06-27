@@ -4,35 +4,37 @@
 
 **Project:** CareConnect Healthcare SaaS
 
-**Current Database Schema Version:** 004
+**Repository Database Baseline:** Schema Version 004
 
-**Current Development Phase:** Phase 1 Complete
+**Application Phase:** Phase 1 Complete
 
 ---
 
-# IMPORTANT
+# READ THIS FIRST
 
-This document describes the actual database migration history.
+This document describes the **actual migration history** of the project.
 
-The migration files are **not** a chronological representation of the final database state.
+The migration file numbers **do not represent the final execution order**.
 
-Future contributors (human or AI) **must read this document before creating any new database migration.**
+Future developers and AI agents (Codex, Claude, ChatGPT, etc.) should read this document before creating new migrations or modifying the database.
+
+**The current database baseline for all future development is Schema Version 004.**
 
 ---
 
 # Original Migration Plan
 
-Phase 1 originally planned only three migrations.
+Phase 1 originally planned three database migrations.
 
-```
+```text
 001-auth-overhaul.js
 002-appointment-uniqueness.js
 003-multi-tenancy.js
 ```
 
-The intended execution order was
+The intended execution order was:
 
-```
+```text
 001
  ↓
 002
@@ -44,20 +46,37 @@ The intended execution order was
 
 # What Actually Happened
 
-During development, Migration **001** and **002** were attempted but were **not successfully completed**.
+During development, Migration **001** and **002** were attempted but **were not successfully completed**.
 
-Rather than blocking development, implementation continued.
+Instead of blocking development, the application continued to evolve.
 
-Many database changes were introduced directly while building application features.
+As new features were implemented, parts of the database schema were introduced directly through application development.
 
-Later, Migration **003** became the architectural priority because the application was upgraded from a single-hospital system to a multi-tenant SaaS platform.
+Later, multi-tenancy became the highest architectural priority.
 
-Therefore the project history became:
+Therefore the project executed Migration **003** first.
 
-```
-001 ❌ Not successfully applied
+After Migration 003 completed, the database was reviewed.
 
-002 ❌ Not successfully applied
+Rather than rerunning outdated migrations, a new migration (**004**) was created to safely complete the remaining authentication schema.
+
+---
+
+# Actual Execution Timeline
+
+```text
+Original Plan
+
+001
+002
+003
+
+
+Actual History
+
+001 ❌ Not successfully completed
+
+002 ❌ Not successfully completed
 
 ↓
 
@@ -69,28 +88,24 @@ Database review
 
 ↓
 
-004 ✅ Created to safely complete remaining authentication schema
+004 ✅ Authentication backfill
 
 ↓
 
-Current database
+Current Database (Schema Version 004)
 ```
 
 ---
 
-# Migration 001
+# Migration Details
 
-File:
-
-```
-server/migrations/001-auth-overhaul.js
-```
+## 001-auth-overhaul.js
 
 Status:
 
-**Not successfully applied**
+❌ Not successfully completed.
 
-Originally intended to add:
+Originally intended to introduce:
 
 * loginAttempts
 * lockUntil
@@ -98,59 +113,47 @@ Originally intended to add:
 * deletedAt
 * mfaEnabled
 * mfaSecret
-* AuditLog support
+* authentication schema improvements
 
-Some of these fields were later introduced naturally during development.
+Some of these fields appeared later during application development.
 
-Others remained missing for legacy users.
+The remaining missing fields were completed by Migration 004.
 
 ---
 
-# Migration 002
-
-File:
-
-```
-server/migrations/002-appointment-uniqueness.js
-```
+## 002-appointment-uniqueness.js
 
 Status:
 
-**Not successfully applied**
+❌ Not successfully completed.
 
 Originally intended to:
 
-* create appointment uniqueness indexes
+* update appointment uniqueness
 * update HealthPackage schema
-* prepare soft delete support
+* prepare soft-delete support
 
-Later development and Migration 003 replaced most of this work.
+Later development and Migration 003 superseded most of this work.
 
 ---
 
-# Migration 003
-
-File:
-
-```
-server/migrations/003-multi-tenancy.js
-```
+## 003-multi-tenancy.js
 
 Status:
 
-**Successfully applied**
+✅ Successfully applied.
 
-This is the first successful migration that defines the current architecture.
+This migration became the architectural foundation of the application.
 
 Completed:
 
 * created default organisation
+* added organisationId to existing collections
 * migrated existing data
-* added organisationId
-* rebuilt unique indexes
-* updated tenant-aware collections
+* rebuilt indexes
+* updated audit log support
 
-Collections migrated:
+Collections updated:
 
 * users
 * doctors
@@ -159,43 +162,23 @@ Collections migrated:
 * packagebookings
 * auditlogs
 
-Migration 003 is considered the foundation of the current database.
+Migration 003 defines the current multi-tenant architecture.
 
 ---
 
-# Why Migration 004 Exists
-
-After Migration 003 completed, the database was reviewed.
-
-The review showed:
-
-* Migration 001 had not completed successfully.
-* Migration 002 had not completed successfully.
-* The application itself already contained most of the intended functionality.
-
-Re-running old migrations would have been risky because the schema had evolved significantly.
-
-Instead, a new migration was created.
-
----
-
-# Migration 004
-
-File:
-
-```
-server/migrations/004-backfill-auth-fields.js
-```
+## 004-backfill-auth-fields.js
 
 Status:
 
-**Successfully applied**
+✅ Successfully applied.
 
-Purpose:
+Reason for creation:
 
-Safely backfill only missing authentication fields.
+Migration 001 could not be safely rerun after the schema evolved.
 
-Added when missing:
+Migration 004 was created to safely complete the authentication schema without modifying existing production data.
+
+Backfilled only missing fields:
 
 * lockUntil
 * deletedAt
@@ -203,21 +186,22 @@ Added when missing:
 * mfaEnabled
 * mfaSecret
 
-Characteristics:
+Properties:
 
 * idempotent
-* non-destructive
 * production safe
-* does not recreate indexes
-* does not overwrite existing values
+* non-destructive
+* preserves existing values
 
 Migration 004 completed the authentication schema.
 
 ---
 
-# Current Database State
+# Current Database Baseline
 
-All User documents now contain:
+The repository now assumes **Schema Version 004**.
+
+Every User document contains:
 
 * loginAttempts
 * lockUntil
@@ -244,42 +228,66 @@ AuditLog documents contain:
 
 * organisationId
 
-Organisation collection exists.
-
-The database schema is considered complete for Phase 1.
+Organisation collection exists and is the foundation of multi-tenancy.
 
 ---
 
-# Guidance For Future Developers / AI Agents
+# Phase 2 Prerequisite
 
-If you are reviewing this repository:
+**Do NOT follow the original Phase 2 instruction that says:**
 
-1. **Do NOT attempt to rerun Migration 001.**
-2. **Do NOT attempt to rerun Migration 002.**
-3. Assume Migration 003 is the architectural baseline.
-4. Assume Migration 004 completed the authentication schema.
-5. All future migrations must start from **Schema Version 004**.
+```text
+Run 001
+Run 002
+Run 003
+```
 
-If new database changes are required:
+That instruction is obsolete for this repository.
 
-* Create a new migration.
-* Never edit old migration files.
-* Never renumber migrations.
-* Never assume legacy migrations were executed.
-* Always preserve existing production data.
+The current repository already uses **Schema Version 004**.
 
 ---
 
-# Phase 2 Starting Point
+# Instructions for Future Developers / AI Agents
 
-When beginning Phase 2, assume the following:
+If you are starting Phase 2 or later:
 
-* Authentication schema is complete.
-* Multi-tenancy is enabled.
-* RBAC is implemented.
-* Audit logging is available.
-* Soft delete is implemented.
-* Appointment lifecycle is implemented.
-* Health package management is implemented.
+1. Assume the database is already on **Schema Version 004**.
+2. Do **NOT** rerun Migration 001.
+3. Do **NOT** rerun Migration 002.
+4. Do **NOT** rerun Migration 003 on an existing database.
+5. Start all new database work from Schema Version 004.
+6. Create new migrations beginning with the next available version number.
+7. Never modify historical migration files.
+8. Preserve backward compatibility with existing production data.
 
-Phase 2 migrations should focus only on new functionality (billing, analytics, notifications, reporting, etc.) and **must not recreate or modify the Phase 1 migrations.**
+---
+
+# Phase 2 Compatibility
+
+The following Phase 1 foundations are already available:
+
+* JWT Authentication
+* Refresh Tokens
+* Redis Session Management
+* RBAC
+* Multi-Tenancy
+* Organisation Model
+* Feature Flags
+* Audit Logging
+* Soft Delete
+* Appointment Lifecycle
+* Health Packages
+* Doctor Availability
+* Patient History
+* Authentication Schema (completed by Migration 004)
+
+Phase 2 work (MFA, Notifications, Analytics, Onboarding, Patient Profile, etc.) should build on this baseline without attempting to recreate or reapply earlier migrations.
+
+---
+
+# Current Schema Version
+
+**Schema Version:** 004
+
+**This is the only supported starting point for Phase 2 development.**

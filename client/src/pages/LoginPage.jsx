@@ -1,27 +1,35 @@
 import React, { useState } from 'react';
 import { useNavigate, Navigate, Link } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
+import { setAccessToken, setOrgSlug } from '../api/index.js';
+import MFAVerifyStep from '../components/auth/MFAVerifyStep.jsx';
 
 const DASHBOARD_ROUTES = {
     admin:        '/admin',
     doctor:       '/doctor',
     receptionist: '/receptionist',
     patient:      '/patient',
+    super_admin:  '/admin',
 };
 
 const LoginPage = () => {
-    const [email,    setEmail]    = useState('');
-    const [password, setPassword] = useState('');
-    const [error,    setError]    = useState('');
-    const [loading,  setLoading]  = useState(false);
+    const [email,      setEmail]      = useState('');
+    const [password,   setPassword]   = useState('');
+    const [error,      setError]      = useState('');
+    const [loading,    setLoading]    = useState(false);
 
-    const { login, isAuthenticated, user } = useAuth();
+    // MFA state
+    const [mfaStep,    setMfaStep]    = useState(null);  // null | 'verify' | 'setup'
+    const [mfaPending, setMfaPending] = useState('');
+
+    const { login, isAuthenticated, user, updateUser } = useAuth();
     const navigate = useNavigate();
 
     if (isAuthenticated && user) {
         return <Navigate to={DASHBOARD_ROUTES[user.role] ?? '/'} replace />;
     }
 
+    // ── Normal login submit ────────────────────────────────────────────────────
     const handleSubmit = async (e) => {
         e.preventDefault();
         setError('');
@@ -29,25 +37,67 @@ const LoginPage = () => {
 
         try {
             const loggedInUser = await login(email, password);
+
+            // login() in AuthContext handles the normal success case
+            // (sets accessToken in memory, sets user state).
+            // If we get here without an MFA step, navigate to dashboard.
             navigate(DASHBOARD_ROUTES[loggedInUser.role] ?? '/', { replace: true });
         } catch (err) {
             const status  = err?.response?.status;
-            const message = err?.response?.data?.message;
+            const data    = err?.response?.data;
 
-            if (status === 423) {
-                // Account locked
-                setError(message || 'Account locked. Please try again later.');
+            if (status === 200 && data?.mfaRequired) {
+                // Server returned 200 but requires MFA — not a real error
+                setMfaPending(data.mfaPending);
+                if (data.mfaSetupRequired) {
+                    setMfaStep('setup');
+                } else {
+                    setMfaStep('verify');
+                }
+            } else if (status === 423) {
+                setError(data?.message || 'Account locked. Please try again later.');
             } else if (status === 429) {
-                // Rate limited
                 setError('Too many login attempts. Please wait 15 minutes before trying again.');
             } else {
-                setError(message || 'Failed to log in. Please check your credentials.');
+                setError(data?.message || 'Failed to log in. Please check your credentials.');
             }
         } finally {
             setLoading(false);
         }
     };
 
+    // ── MFA verify success ─────────────────────────────────────────────────────
+    const handleMfaSuccess = ({ accessToken, user: mfaUser }) => {
+        setAccessToken(accessToken);
+        if (mfaUser.organisation?.slug) setOrgSlug(mfaUser.organisation.slug);
+        updateUser(mfaUser);
+        navigate(DASHBOARD_ROUTES[mfaUser.role] ?? '/', { replace: true });
+    };
+
+    const handleMfaCancel = () => {
+        setMfaStep(null);
+        setMfaPending('');
+        setError('');
+    };
+
+    // ── MFA forced setup — redirect to setup page with pending token ───────────
+    if (mfaStep === 'setup') {
+        navigate(`/mfa-setup?required=true&mfaPending=${encodeURIComponent(mfaPending)}`, { replace: true });
+        return null;
+    }
+
+    // ── MFA verify step ────────────────────────────────────────────────────────
+    if (mfaStep === 'verify') {
+        return (
+            <MFAVerifyStep
+                mfaPending={mfaPending}
+                onSuccess={handleMfaSuccess}
+                onCancel={handleMfaCancel}
+            />
+        );
+    }
+
+    // ── Normal login form ──────────────────────────────────────────────────────
     return (
         <div className="max-w-md mx-auto mt-10">
             <form onSubmit={handleSubmit} className="bg-white p-8 rounded-lg shadow-md">
