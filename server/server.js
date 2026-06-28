@@ -1,26 +1,49 @@
-import express       from 'express';
-import dotenv        from 'dotenv';
-import cors          from 'cors';
-import helmet        from 'helmet';
-import cookieParser  from 'cookie-parser';
-import connectDB     from './config/db.js';
-import getRedisClient from './config/redis.js';
-import { apiRateLimiter } from './middleware/rateLimiter.js';
-import { resolveTenant }  from './middleware/tenantMiddleware.js';
+import express from "express";
+import dotenv from "dotenv";
+import cors from "cors";
+import helmet from "helmet";
+import cookieParser from "cookie-parser";
 
-import authRoutes          from './routes/authRoutes.js';
-import mfaRoutes           from './routes/mfaRoutes.js';
-import doctorRoutes        from './routes/doctorRoutes.js';
-import adminRoutes         from './routes/adminRoutes.js';
-import receptionistRoutes  from './routes/receptionistRoutes.js';
-import patientRoutes       from './routes/patientRoutes.js';
-import healthPackageRoutes from './routes/healthPackageRoutes.js';
-import dashboardRoutes     from './routes/dashboardRoutes.js';
-import organisationRoutes  from './routes/organisationRoutes.js';
+import connectDB from "./config/db.js";
+import getRedisClient from "./config/redis.js";
+
+import { apiRateLimiter } from "./middleware/rateLimiter.js";
+import { resolveTenant } from "./middleware/tenantMiddleware.js";
+
+import authRoutes from "./routes/authRoutes.js";
+import mfaRoutes from "./routes/mfaRoutes.js";
+import doctorRoutes from "./routes/doctorRoutes.js";
+import adminRoutes from "./routes/adminRoutes.js";
+import receptionistRoutes from "./routes/receptionistRoutes.js";
+import patientRoutes from "./routes/patientRoutes.js";
+import healthPackageRoutes from "./routes/healthPackageRoutes.js";
+import dashboardRoutes from "./routes/dashboardRoutes.js";
+import organisationRoutes from "./routes/organisationRoutes.js";
 
 dotenv.config();
-connectDB();
-getRedisClient();
+
+// Initialize database
+await connectDB();
+
+// Initialize Redis
+const redis = getRedisClient();
+
+try {
+    await redis.connect();
+    redis.on("connect", () => {
+        console.log("[Redis] connected");
+    });
+
+    redis.on("ready", () => {
+        console.log("[Redis] ready");
+    });
+
+} catch (err) {
+    redis.on("error", (err) => {
+        console.error("[Redis]", err.message);
+    });
+    process.exit(1);
+}
 
 const app = express();
 
