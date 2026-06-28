@@ -1,5 +1,5 @@
 import React from 'react';
-import { Link, useNavigate } from 'react-router-dom';
+import { NavLink, useNavigate } from 'react-router-dom';
 import { useAuth } from '../../context/AuthContext';
 
 const DASHBOARD_ROUTES = {
@@ -9,34 +9,44 @@ const DASHBOARD_ROUTES = {
     patient:      '/patient',
 };
 
+/**
+ * FIX #16: Replaced plain <Link> with <NavLink> so active routes receive
+ * visual highlighting.  NavLink automatically adds `aria-current="page"` and
+ * allows a className function that receives `isActive`.
+ */
+const navLinkClass = ({ isActive }) =>
+    isActive
+        ? 'text-blue-600 font-semibold border-b-2 border-blue-600 pb-0.5'
+        : 'text-gray-600 hover:text-blue-600 transition-colors';
+
 const Header = () => {
     const { user, logout } = useAuth();
     const navigate         = useNavigate();
 
     const handleLogout = async () => {
-        await logout(); // revokes refresh token server-side before clearing local state
+        await logout();
         navigate('/login');
     };
 
     return (
         <header className="bg-white shadow-md">
             <nav className="container mx-auto px-6 py-4 flex justify-between items-center">
-                <Link to="/" className="text-2xl font-bold text-blue-600">
+                <NavLink to="/" className="text-2xl font-bold text-blue-600">
                     CareConnect
-                </Link>
+                </NavLink>
 
-                <div className="flex items-center space-x-4">
-                    <Link to="/doctors"  className="text-gray-600 hover:text-blue-600">Find a Doctor</Link>
-                    <Link to="/packages" className="text-gray-600 hover:text-blue-600">Packages</Link>
+                <div className="flex items-center space-x-5">
+                    <NavLink to="/doctors"  className={navLinkClass}>Find a Doctor</NavLink>
+                    <NavLink to="/packages" className={navLinkClass}>Packages</NavLink>
 
                     {user ? (
                         <>
-                            <Link
+                            <NavLink
                                 to={DASHBOARD_ROUTES[user.role] ?? '/'}
-                                className="text-gray-600 hover:text-blue-600"
+                                className={navLinkClass}
                             >
                                 My Dashboard
-                            </Link>
+                            </NavLink>
                             <button
                                 onClick={handleLogout}
                                 className="bg-red-500 hover:bg-red-700 text-white font-bold py-2 px-4 rounded transition-colors"
@@ -45,12 +55,12 @@ const Header = () => {
                             </button>
                         </>
                     ) : (
-                        <Link
+                        <NavLink
                             to="/login"
                             className="bg-blue-500 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded transition-colors"
                         >
                             Login
-                        </Link>
+                        </NavLink>
                     )}
                 </div>
             </nav>

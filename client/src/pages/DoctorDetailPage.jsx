@@ -4,16 +4,31 @@ import { fetchDoctorById, fetchDoctorAvailability } from '../api/doctors';
 import { bookAppointment } from '../api/patient';
 import { useAuth } from '../context/AuthContext';
 
+// FIX: distinguish between success and error booking statuses for correct
+// colour feedback.  Previously ALL statuses were rendered with text-green-600.
+const STATUS_STYLES = {
+    success: 'text-green-600',
+    error:   'text-red-600',
+    info:    'text-yellow-600',
+};
+
+const BookingStatusMessage = ({ status, message }) => {
+    if (!message) return null;
+    const cls = STATUS_STYLES[status] ?? STATUS_STYLES.info;
+    return <p className={`mt-4 font-semibold ${cls}`}>{message}</p>;
+};
+
 const DoctorDetailPage = () => {
-    const { id } = useParams();
-    const navigate = useNavigate();
+    const { id }     = useParams();
+    const navigate   = useNavigate();
     const { user, isAuthenticated } = useAuth();
 
-    const [doctor, setDoctor] = useState(null);
+    const [doctor,       setDoctor]       = useState(null);
     const [availability, setAvailability] = useState([]);
     const [selectedDate, setSelectedDate] = useState(new Date().toISOString().split('T')[0]);
-    const [loading, setLoading] = useState(true);
-    const [bookingStatus, setBookingStatus] = useState(''); // To show booking success/error messages
+    const [loading,      setLoading]      = useState(true);
+    // FIX: track both a message string and a severity so colour is correct
+    const [bookingStatus, setBookingStatus] = useState({ message: '', severity: 'info' });
 
     useEffect(() => {
         const getDoctorDetails = async () => {
@@ -22,7 +37,7 @@ const DoctorDetailPage = () => {
                 const { data } = await fetchDoctorById(id);
                 setDoctor(data);
             } catch (error) {
-                console.error("Failed to fetch doctor details:", error);
+                console.error('Failed to fetch doctor details:', error);
             } finally {
                 setLoading(false);
             }
@@ -32,15 +47,14 @@ const DoctorDetailPage = () => {
 
     useEffect(() => {
         const getAvailability = async () => {
-            if (doctor) {
-                try {
-                    setBookingStatus(''); // Clear status on date change
-                    const { data } = await fetchDoctorAvailability(id, selectedDate);
-                    setAvailability(data);
-                } catch (error) {
-                    console.error("Failed to fetch availability:", error);
-                    setAvailability([]);
-                }
+            if (!doctor) return;
+            try {
+                setBookingStatus({ message: '', severity: 'info' }); // Clear on date change
+                const { data } = await fetchDoctorAvailability(id, selectedDate);
+                setAvailability(data);
+            } catch (error) {
+                console.error('Failed to fetch availability:', error);
+                setAvailability([]);
             }
         };
         getAvailability();
@@ -52,31 +66,40 @@ const DoctorDetailPage = () => {
             return;
         }
 
+        // FIX: error message now rendered in red via severity: 'error'
         if (user.role !== 'patient') {
-            setBookingStatus('Only patients can book appointments.');
+            setBookingStatus({
+                message:  'Only patients can book appointments.',
+                severity: 'error',
+            });
             return;
         }
 
         try {
             const appointmentData = {
-                doctorId: doctor._id,
+                doctorId:        doctor._id,
                 appointmentDate: selectedDate,
                 appointmentTime: slot,
-                type: 'Online'
+                type:            'Online',
             };
             await bookAppointment(appointmentData);
-            setBookingStatus(`Appointment successfully booked for ${slot}!`);
+            setBookingStatus({
+                message:  `Appointment successfully booked for ${slot}!`,
+                severity: 'success',
+            });
             // Refresh availability after booking
             const { data } = await fetchDoctorAvailability(id, selectedDate);
             setAvailability(data);
         } catch (error) {
-            console.error("Booking failed:", error);
-            setBookingStatus('Failed to book appointment. The slot may have just been taken.');
+            const msg =
+                error?.response?.data?.message ||
+                'Failed to book appointment. The slot may have just been taken.';
+            setBookingStatus({ message: msg, severity: 'error' });
         }
     };
 
-    if (loading) return <p>Loading profile...</p>;
-    if (!doctor) return <p>Doctor not found.</p>;
+    if (loading)   return <p>Loading profile...</p>;
+    if (!doctor)   return <p>Doctor not found.</p>;
 
     return (
         <div className="max-w-4xl mx-auto">
@@ -88,7 +111,7 @@ const DoctorDetailPage = () => {
 
                 <div className="mt-8">
                     <h2 className="text-2xl font-bold mb-4">Book an Appointment</h2>
-                    <input 
+                    <input
                         type="date"
                         value={selectedDate}
                         onChange={(e) => setSelectedDate(e.target.value)}
@@ -96,13 +119,16 @@ const DoctorDetailPage = () => {
                         className="p-2 border rounded"
                     />
 
-                    {bookingStatus && <p className="mt-4 text-green-600 font-semibold">{bookingStatus}</p>}
+                    <BookingStatusMessage
+                        status={bookingStatus.severity}
+                        message={bookingStatus.message}
+                    />
 
                     <div className="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-5 gap-4 mt-4">
                         {availability.length > 0 ? (
-                            availability.map(slot => (
-                                <button 
-                                    key={slot} 
+                            availability.map((slot) => (
+                                <button
+                                    key={slot}
                                     onClick={() => handleBooking(slot)}
                                     className="bg-blue-500 text-white p-2 rounded hover:bg-blue-700 transition-colors"
                                 >
@@ -110,7 +136,9 @@ const DoctorDetailPage = () => {
                                 </button>
                             ))
                         ) : (
-                            <p className="col-span-full text-gray-500 mt-4">No available slots for this date.</p>
+                            <p className="col-span-full text-gray-500 mt-4">
+                                No available slots for this date.
+                            </p>
                         )}
                     </div>
                 </div>

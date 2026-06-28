@@ -1,9 +1,7 @@
-
 import React, { useState, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { setupMfa, verifyMfaSetup } from '../api/mfa.js';
 import { useAuth } from '../context/AuthContext.jsx';
-    
 
 /**
  * MFASetupPage
@@ -13,78 +11,75 @@ import { useAuth } from '../context/AuthContext.jsx';
  *   1. User voluntarily enables MFA from their settings
  *   2. Org-level mfaRequired=true forces user to set up before accessing dashboard
  *
- * Query param: ?required=true — hides the "Skip" option when org enforces MFA
+ * Query param: ?required=true  — hides the "Skip" option when org enforces MFA
  * Query param: ?mfaPending=<token> — mfaPending JWT passed from forced-setup login flow
+ *
+ * FIX: removed `localStorage.setItem("accessToken", ...)` — access tokens are
+ * kept in memory only (via setAccessToken in the API layer / completeLogin in
+ * AuthContext).  Using localStorage defeats the XSS-resistant token strategy.
+ *
+ * FIX: `setupId` is now initialised as `null` rather than `''` so that an
+ * accidental submit before the setup session loads is detectable.
  */
 const MFASetupPage = () => {
-    const [step,      setStep]      = useState('loading'); // loading | scan | verify | done
-    const [qrDataUri, setQrDataUri] = useState('');
-    const [setupId, setSetupId] = useState('');
-    const [secret,    setSecret]    = useState('');
-    const [otpUrl,    setOtpUrl]    = useState('');
-    const [digits,    setDigits]    = useState(['', '', '', '', '', '']);
-    const [error,     setError]     = useState('');
-    const [loading,   setLoading]   = useState(false);
+    const [step,       setStep]       = useState('loading'); // loading | scan | verify | done
+    const [qrDataUri,  setQrDataUri]  = useState('');
+    const [setupId,    setSetupId]    = useState(null);   // FIX: null, not ''
+    const [secret,     setSecret]     = useState('');
+    const [otpUrl,     setOtpUrl]     = useState('');
+    const [digits,     setDigits]     = useState(['', '', '', '', '', '']);
+    const [error,      setError]      = useState('');
+    const [loading,    setLoading]    = useState(false);
     const [showSecret, setShowSecret] = useState(false);
     const inputRefs = useRef([]);
     const navigate  = useNavigate();
-    const { updateUser, completeLogin } = useAuth();
+    const { completeLogin } = useAuth();
 
-    const params = new URLSearchParams(window.location.search);
-    const isRequired = params.get("required") === "true";
-    const mfaPending = params.get("mfaPending");
+    const params     = new URLSearchParams(window.location.search);
+    const isRequired = params.get('required') === 'true';
+    const mfaPending = params.get('mfaPending');
 
     useEffect(() => {
         const fetchSetup = async () => {
             try {
-                console.log("Loading MFA setup...");
-                console.log("mfaPending:", mfaPending);
-
                 const { data } = await setupMfa(mfaPending);
 
-                console.log("Setup response:", data);
-
                 setQrDataUri(data.qrDataUri);
-                setSecret(data.secret || "");
-                setOtpUrl(data.otpauthUrl || "");
-                setSetupId(data.setupId);
+                setSecret(data.secret || '');
+                setOtpUrl(data.otpauthUrl || '');
+                setSetupId(data.setupId);   // FIX: stored as received (string UUID)
 
-                setStep("scan");
+                setStep('scan');
             } catch (err) {
-                console.error("Setup Error:", err);
-                console.error("Response:", err.response);
-
                 const msg =
                     err.response?.data?.message ||
                     err.message ||
-                    "Failed to load MFA setup. Please try again.";
+                    'Failed to load MFA setup. Please try again.';
 
-                if (msg.includes("already enabled")) {
-                    setStep("done");
+                if (msg.includes('already enabled')) {
+                    setStep('done');
                 } else {
                     setError(msg);
-                    setStep("scan");
+                    setStep('scan');
                 }
             }
         };
 
         fetchSetup();
-    }, []);
+    }, []);   // eslint-disable-line react-hooks/exhaustive-deps
 
     const handleDigitChange = (index, value) => {
         if (value.length > 1) {
-            const cleaned = value.replace(/\D/g, "").slice(0, 6);
-
+            const cleaned = value.replace(/\D/g, '').slice(0, 6);
             if (cleaned.length === 6) {
-                setDigits(cleaned.split(""));
+                setDigits(cleaned.split(''));
                 inputRefs.current[5]?.focus();
                 return;
             }
         }
 
-        const digit = value.replace(/\D/g, "").slice(-1);
-
-        const next = [...digits];
+        const digit = value.replace(/\D/g, '').slice(-1);
+        const next  = [...digits];
         next[index] = digit;
         setDigits(next);
 
@@ -94,53 +89,45 @@ const MFASetupPage = () => {
     };
 
     const handleKeyDown = (index, e) => {
-        if (e.key === "Backspace" && !digits[index] && index > 0) {
+        if (e.key === 'Backspace' && !digits[index] && index > 0) {
             inputRefs.current[index - 1]?.focus();
         }
     };
 
     const handleVerify = async (e) => {
         e.preventDefault();
+        setError('');
 
-        setError("");
-
-        const token = digits.join("");
-
+        const token = digits.join('');
         if (token.length !== 6) {
-            setError("Please enter all 6 digits.");
+            setError('Please enter all 6 digits.');
+            return;
+        }
+
+        // FIX: guard against a missing setupId (session not yet loaded)
+        if (!setupId) {
+            setError('Setup session not ready. Please wait a moment and try again.');
             return;
         }
 
         setLoading(true);
-
         try {
-            const { data } = await verifyMfaSetup(
-                {
-                    token,
-                    setupId,
-                },
-                mfaPending
-            );
+            const { data } = await verifyMfaSetup({ token, setupId }, mfaPending);
 
-            localStorage.setItem("accessToken", data.accessToken);
-
+            // FIX: use completeLogin() which calls setAccessToken() internally —
+            // the access token is stored in memory only, never in localStorage.
             completeLogin(data);
 
-            navigate("/");
+            navigate('/');
         } catch (err) {
-            console.error(err.response?.data);
-
-            setError(
-                err.response?.data?.message ||
-                "Verification failed."
-            );
-
-            setDigits(["", "", "", "", "", ""]);
+            setError(err.response?.data?.message || 'Verification failed. Please try again.');
+            setDigits(['', '', '', '', '', '']);
             inputRefs.current[0]?.focus();
         } finally {
             setLoading(false);
         }
     };
+
     const handleDone = () => navigate('/');
 
     if (step === 'loading') {
@@ -205,8 +192,8 @@ const MFASetupPage = () => {
                     {['Scan QR', 'Verify'].map((label, i) => (
                         <div key={label} className="flex items-center gap-2">
                             <div className={`w-7 h-7 rounded-full flex items-center justify-center text-sm font-bold
-                                ${step === 'scan' && i === 0 ? 'bg-blue-500 text-white' :
-                                  step === 'verify' && i === 1 ? 'bg-blue-500 text-white' :
+                                ${step === 'scan'   && i === 0 ? 'bg-blue-500 text-white'  :
+                                  step === 'verify' && i === 1 ? 'bg-blue-500 text-white'  :
                                   step === 'verify' && i === 0 ? 'bg-green-500 text-white' :
                                   'bg-gray-200 text-gray-500'}`}>
                                 {step === 'verify' && i === 0 ? '✓' : i + 1}
@@ -233,7 +220,7 @@ const MFASetupPage = () => {
                             Scan this QR code with your authenticator app (Google Authenticator, Authy, or any TOTP app).
                         </p>
 
-                        {qrDataUri && (
+                        {qrDataUri ? (
                             <div className="flex justify-center mb-4">
                                 <img
                                     src={qrDataUri}
@@ -241,30 +228,49 @@ const MFASetupPage = () => {
                                     className="w-48 h-48 border-2 border-gray-200 rounded-lg"
                                 />
                             </div>
+                        ) : (
+                            <div className="flex justify-center mb-4">
+                                <div className="w-48 h-48 border-2 border-gray-200 rounded-lg flex items-center justify-center bg-gray-50">
+                                    <p className="text-sm text-gray-400 text-center px-4">
+                                        {error ? 'Failed to load QR code' : 'Loading QR code…'}
+                                    </p>
+                                </div>
+                            </div>
                         )}
 
                         {/* Manual entry fallback */}
-                        <div className="mb-4">
-                            <button
-                                type="button"
-                                onClick={() => setShowSecret(!showSecret)}
-                                className="text-sm text-blue-500 hover:underline w-full text-center"
-                            >
-                                {showSecret ? 'Hide' : "Can't scan? Enter code manually"}
-                            </button>
-                            {showSecret && (
-                                <div className="mt-2 bg-gray-50 border rounded p-3">
-                                    <p className="text-xs text-gray-500 mb-1">Manual entry key:</p>
-                                    <p className="font-mono text-sm text-gray-800 break-all select-all">{secret}</p>
-                                </div>
-                            )}
-                        </div>
+                        {secret && (
+                            <div className="mb-4">
+                                <button
+                                    type="button"
+                                    onClick={() => setShowSecret(!showSecret)}
+                                    className="text-sm text-blue-500 hover:underline w-full text-center"
+                                >
+                                    {showSecret ? 'Hide' : "Can't scan? Enter code manually"}
+                                </button>
+                                {showSecret && (
+                                    <div className="mt-2 bg-gray-50 border rounded p-3">
+                                        <p className="text-xs text-gray-500 mb-1">Manual entry key:</p>
+                                        <p className="font-mono text-sm text-gray-800 break-all select-all">{secret}</p>
+                                    </div>
+                                )}
+                            </div>
+                        )}
 
                         <button
-                            onClick={() => { setStep('verify'); setError(''); setTimeout(() => inputRefs.current[0]?.focus(), 100); }}
-                            className="w-full bg-blue-500 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded transition-colors"
+                            onClick={() => {
+                                if (!setupId) {
+                                    setError('Setup session not ready. Please wait a moment.');
+                                    return;
+                                }
+                                setStep('verify');
+                                setError('');
+                                setTimeout(() => inputRefs.current[0]?.focus(), 100);
+                            }}
+                            disabled={!setupId}
+                            className="w-full bg-blue-500 hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed text-white font-bold py-2 px-4 rounded transition-colors"
                         >
-                            I've scanned it →
+                            {setupId ? "I've scanned it →" : 'Loading…'}
                         </button>
 
                         {!isRequired && (
@@ -302,6 +308,7 @@ const MFASetupPage = () => {
                                         w-11 h-14 text-center text-xl font-bold border-2 rounded-lg
                                         focus:outline-none focus:border-blue-500 transition-colors
                                         ${digit ? 'border-blue-400 bg-blue-50' : 'border-gray-300'}
+                                        ${loading ? 'opacity-50' : ''}
                                     `}
                                 />
                             ))}
@@ -317,7 +324,11 @@ const MFASetupPage = () => {
 
                         <button
                             type="button"
-                            onClick={() => { setStep('scan'); setDigits(['', '', '', '', '', '']); setError(''); }}
+                            onClick={() => {
+                                setStep('scan');
+                                setDigits(['', '', '', '', '', '']);
+                                setError('');
+                            }}
                             className="w-full text-gray-400 hover:text-gray-600 text-sm py-1 transition-colors"
                         >
                             ← Back to QR code

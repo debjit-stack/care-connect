@@ -39,10 +39,6 @@ import {
 } from '../utils/mfaSetupStore.js';
 
 // ─── GET /api/auth/mfa/setup ──────────────────────────────────────────────────
-// Generates a new TOTP secret and QR code for the authenticated user.
-// The secret is returned in plain text ONCE here — it is NOT saved to DB yet.
-// It is only saved after the user confirms their authenticator works via verify-setup.
-// ─── GET /api/auth/mfa/setup ──────────────────────────────────────────────────
 // Generates a temporary MFA setup session.
 // The secret is stored in Redis for 5 minutes and is NOT persisted to MongoDB
 // until verify-setup succeeds.
@@ -51,59 +47,41 @@ export const setupMfa = async (req, res) => {
         const user = await User.findById(req.mfaUserId).skipTenantFilter();
 
         if (!user) {
-            return res.status(404).json({
-                message: 'User not found',
-            });
+            return res.status(404).json({ message: 'User not found' });
         }
 
         if (user.mfaEnabled) {
-            return res.status(400).json({
-                message: 'MFA is already enabled.'
-            });
+            return res.status(400).json({ message: 'MFA is already enabled.' });
         }
 
         // Generate new TOTP secret
-        const {
-            secret,
-            otpauthUrl,
-            qrDataUri,
-        } = await generateSecret(user.email);
+        const { secret, otpauthUrl, qrDataUri } = await generateSecret(user.email);
 
-        // Store temporary secret in Redis
-        const {
-            setupId,
-            expiresIn,
-        } = await createMfaSetupSession(
-            user._id,
-            secret
-        );
+        // Store temporary secret in Redis (expires in 5 minutes)
+        const { setupId, expiresIn } = await createMfaSetupSession(user._id, secret);
 
         audit(req, 'AUTH_MFA_SETUP_STARTED', {
-            actorId: user._id,
-            actorRole: user.role,
+            actorId:      user._id,
+            actorRole:    user.role,
             resourceType: 'User',
-            resourceId: user._id,
+            resourceId:   user._id,
         });
 
-        return res.json({
-            setupId,
-            qrDataUri,
-            otpauthUrl,
-            expiresIn,
-        });
-
+        return res.json({ setupId, qrDataUri, otpauthUrl, expiresIn });
     } catch (err) {
         console.error('[MFA] setupMfa:', err);
-
-        return res.status(500).json({
-            message: 'Failed to generate MFA setup.',
-        });
+        return res.status(500).json({ message: 'Failed to generate MFA setup.' });
     }
 };
 
 // ─── POST /api/auth/mfa/verify-setup ─────────────────────────────────────────
 // Confirms the user's authenticator app is configured correctly.
-// Encrypts and saves the secret, sets mfaEnabled = true.
+// Encrypts and saves the secret, sets mfaEnabled = true, and issues a full
+// authenticated session so the user lands directly on their dashboard.
+//
+// FIX: removed the dead `res.json(...)` call that appeared after a completed
+// `return res.json(...)` inside the try block — it was unreachable and caused
+// confusion about the actual response path.
 export const verifySetup = async (req, res) => {
     try {
         const { token, setupId } = req.body;
@@ -112,98 +90,74 @@ export const verifySetup = async (req, res) => {
         if (!user) return res.status(404).json({ message: 'User not found' });
 
         if (user.mfaEnabled) {
-            if (setupId) {
-                await deleteMfaSetupSession(setupId);
-            }
-
-            return res.status(400).json({
-                message: 'MFA is already enabled.'
-            });
+            // Clean up any stale setup session
+            if (setupId) await deleteMfaSetupSession(setupId).catch(() => {});
+            return res.status(400).json({ message: 'MFA is already enabled.' });
         }
 
         // Retrieve the temporary secret from Redis
         const setupSession = await getMfaSetupSession(setupId);
-        console.log("========== VERIFY SETUP ==========");
-        console.log("setupId:", setupId);
-        console.log("setupSession:", setupSession);
 
-            if (!setupSession) {
-                return res.status(400).json({
-                    message: 'MFA setup session expired. Please scan the QR code again.',
-                });
-            }
-
-            if (setupSession.userId !== user._id.toString()) {
-                return res.status(403).json({
-                    message: 'Invalid MFA setup session.',
-                });
-            }
-
-        // Verify the token against the provided secret
-
-            console.log("Secret:", setupSession.secret);
-            console.log("Token:", token);
-
-            const isValid = verifyToken(setupSession.secret, token);
-
-            console.log("TOTP Valid:", isValid);
-            // Persist MFA configuration
-            user.mfaSecret = encryptSecret(setupSession.secret);
-            user.mfaEnabled = true;
-
-            console.log("About to save user...");
-
-            await user.save();
-
-            console.log("User saved successfully.");
-
-            await deleteMfaSetupSession(setupId);
-
-            console.log("Redis setup session deleted.");
-
-            // Audit
-            audit(req, 'AUTH_MFA_SETUP_COMPLETED', {
-                actorId: user._id,
-                actorRole: user.role,
-                resourceType: 'User',
-                resourceId: user._id,
+        if (!setupSession) {
+            return res.status(400).json({
+                message: 'MFA setup session expired. Please scan the QR code again.',
             });
+        }
 
-            // Create authenticated session
-            const accessToken = generateAccessToken(user);
+        if (setupSession.userId !== user._id.toString()) {
+            return res.status(403).json({ message: 'Invalid MFA setup session.' });
+        }
 
-            const refreshToken = await generateRefreshToken(user._id);
+        // Verify the TOTP token against the temporary secret
+        const isValid = verifyToken(setupSession.secret, token);
 
-            setRefreshCookie(res, refreshToken);
-
-            // Login audit
-            audit(req, 'AUTH_LOGIN_SUCCESS', {
-                actorId: user._id,
-                actorRole: user.role,
-                meta: {
-                    method: 'mfa_setup',
-                },
+        if (!isValid) {
+            return res.status(401).json({
+                message: 'Invalid code. Please check your authenticator app and try again.',
             });
+        }
 
-            return res.json({
-                message: 'MFA enabled successfully.',
+        // Persist MFA configuration — encrypt secret before saving
+        user.mfaSecret  = encryptSecret(setupSession.secret);
+        user.mfaEnabled = true;
+        await user.save();
 
-                accessToken,
+        // Clean up Redis setup session
+        await deleteMfaSetupSession(setupId).catch(() => {});
 
-                user: {
-                    _id: user._id,
-                    name: user.name,
-                    email: user.email,
-                    role: user.role,
-                    mfaEnabled: user.mfaEnabled,
-                    forceMfa: user.forceMfa ?? false,
-                },
-            });
+        audit(req, 'AUTH_MFA_SETUP_COMPLETED', {
+            actorId:      user._id,
+            actorRole:    user.role,
+            resourceType: 'User',
+            resourceId:   user._id,
+        });
 
-        res.json({ message: 'MFA enabled successfully. Your account is now more secure.' });
+        // Issue a full authenticated session so the user lands on the dashboard
+        const accessToken  = generateAccessToken(user);
+        const refreshToken = await generateRefreshToken(user._id);
+        setRefreshCookie(res, refreshToken);
+
+        audit(req, 'AUTH_LOGIN_SUCCESS', {
+            actorId:   user._id,
+            actorRole: user.role,
+            meta:      { method: 'mfa_setup' },
+        });
+
+        return res.json({
+            message: 'MFA enabled successfully.',
+            accessToken,
+            user: {
+                _id:        user._id,
+                name:       user.name,
+                email:      user.email,
+                role:       user.role,
+                mfaEnabled: user.mfaEnabled,
+                forceMfa:   user.forceMfa ?? false,
+            },
+        });
     } catch (err) {
         console.error('[MFA] verifySetup:', err.message);
-        res.status(500).json({ message: 'Failed to enable MFA. Please try again.' });
+        return res.status(500).json({ message: 'Failed to enable MFA. Please try again.' });
     }
 };
 
@@ -243,10 +197,10 @@ export const validateMfa = async (req, res) => {
 
         if (!isValid) {
             audit(req, 'AUTH_LOGIN_FAILED', {
-                actorId:  user._id,
+                actorId:   user._id,
                 actorRole: user.role,
-                success:  false,
-                meta:     { reason: 'invalid_totp' },
+                success:   false,
+                meta:      { reason: 'invalid_totp' },
             });
             return res.status(401).json({
                 message: 'Invalid TOTP token. Please try again.',
@@ -259,12 +213,12 @@ export const validateMfa = async (req, res) => {
         setRefreshCookie(res, refreshToken);
 
         audit(req, 'AUTH_LOGIN_SUCCESS', {
-            actorId:  user._id,
+            actorId:   user._id,
             actorRole: user.role,
-            meta:     { method: 'mfa_totp' },
+            meta:      { method: 'mfa_totp' },
         });
 
-        res.json({
+        return res.json({
             accessToken,
             user: {
                 _id:        user._id,
@@ -276,7 +230,7 @@ export const validateMfa = async (req, res) => {
         });
     } catch (err) {
         console.error('[MFA] validateMfa:', err.message);
-        res.status(500).json({ message: 'MFA validation failed. Please try again.' });
+        return res.status(500).json({ message: 'MFA validation failed. Please try again.' });
     }
 };
 
@@ -315,7 +269,7 @@ export const disableMfa = async (req, res) => {
         user.mfaSecret  = undefined;
         await user.save();
 
-        audit(req, 'DATA_UPDATE', {
+        audit(req, 'AUTH_MFA_DISABLED', {
             actorId:      req.user._id,
             actorRole:    req.user.role,
             resourceType: 'User',
@@ -323,10 +277,10 @@ export const disableMfa = async (req, res) => {
             meta:         { action: 'mfa_disabled' },
         });
 
-        res.json({ message: 'MFA disabled successfully.' });
+        return res.json({ message: 'MFA disabled successfully.' });
     } catch (err) {
         console.error('[MFA] disableMfa:', err.message);
-        res.status(500).json({ message: 'Failed to disable MFA. Please try again.' });
+        return res.status(500).json({ message: 'Failed to disable MFA. Please try again.' });
     }
 };
 
@@ -337,12 +291,12 @@ export const getMfaStatus = async (req, res) => {
         const user = await User.findById(req.user._id).skipTenantFilter();
         if (!user) return res.status(404).json({ message: 'User not found' });
 
-        res.json({
+        return res.json({
             mfaEnabled:  user.mfaEnabled,
             mfaRequired: req.org?.features?.mfaRequired ?? false,
         });
     } catch (err) {
         console.error('[MFA] getMfaStatus:', err.message);
-        res.status(500).json({ message: 'Failed to fetch MFA status.' });
+        return res.status(500).json({ message: 'Failed to fetch MFA status.' });
     }
 };

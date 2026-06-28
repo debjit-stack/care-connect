@@ -61,8 +61,9 @@ export const idParam = z.object({
     params: z.object({ id: mongoId }),
 });
 
-// ─── validate() middleware factory (identical to authValidators.js) ───────────
-// Duplicated here so each domain file can import from one place.
+// ─── validate() middleware factory ────────────────────────────────────────────
+// FIX: removed the unreachable duplicate `next()` call that existed after
+// the `return next()` statement at the end of the function.
 
 export const validate = (schema) => (req, res, next) => {
     const result = schema.safeParse({
@@ -72,7 +73,7 @@ export const validate = (schema) => (req, res, next) => {
     });
 
     if (!result.success) {
-        const errors = result.error.issues.map((e) => ({      //fix errors Zod v4, validation issues | const errors = result.error.errors.map((e) => ({
+        const errors = result.error.issues.map((e) => ({
             field:   e.path.slice(1).join('.'),
             message: e.message,
         }));
@@ -92,6 +93,4 @@ export const validate = (schema) => (req, res, next) => {
     }
 
     return next();
-
-    next();
 };

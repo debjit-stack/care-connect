@@ -1,5 +1,23 @@
 import React, { useState } from 'react';
 
+/**
+ * Format a UTC date string (YYYY-MM-DDT00:00:00Z) as a human-readable date
+ * without timezone shifting.
+ *
+ * FIX: `new Date(isoString).toLocaleDateString()` interprets UTC midnight as
+ * the *previous* day in timezones behind UTC (e.g. US Eastern = UTC-5).
+ * We force UTC interpretation with `timeZone: 'UTC'` to always display the
+ * calendar date that was actually stored.
+ */
+const formatDate = (isoString) => {
+    return new Date(isoString).toLocaleDateString('en-IN', {
+        year:     'numeric',
+        month:    'short',
+        day:      'numeric',
+        timeZone: 'UTC',
+    });
+};
+
 const AppointmentHistory = ({ appointments }) => {
     const [expandedId, setExpandedId] = useState(null);
 
@@ -11,11 +29,12 @@ const AppointmentHistory = ({ appointments }) => {
         <div className="bg-white p-6 rounded-lg shadow-md">
             <h2 className="text-2xl font-semibold mb-4">My Appointment History</h2>
             <div className="space-y-4">
-                {appointments.length > 0 ? appointments.map(app => (
+                {appointments.length > 0 ? appointments.map((app) => (
                     <div key={app._id} className="border rounded-lg p-4">
                         <div className="grid grid-cols-2 md:grid-cols-4 gap-4 items-center">
                             <div>
-                                <p className="font-semibold">{new Date(app.appointmentDate).toLocaleDateString()}</p>
+                                {/* FIX: UTC-safe date formatting */}
+                                <p className="font-semibold">{formatDate(app.appointmentDate)}</p>
                                 <p className="text-sm text-gray-500">{app.appointmentTime}</p>
                             </div>
                             <div>
@@ -23,13 +42,20 @@ const AppointmentHistory = ({ appointments }) => {
                                 <p className="text-sm text-gray-500">{app.doctor.specialty || 'General'}</p>
                             </div>
                             <div>
-                                <span className={`px-2 inline-flex text-xs leading-5 font-semibold rounded-full ${app.status === 'Scheduled' ? 'bg-yellow-100 text-yellow-800' : 'bg-green-100 text-green-800'}`}>
+                                <span className={`px-2 inline-flex text-xs leading-5 font-semibold rounded-full ${
+                                    app.status === 'Scheduled'
+                                        ? 'bg-yellow-100 text-yellow-800'
+                                        : 'bg-green-100 text-green-800'
+                                }`}>
                                     {app.status}
                                 </span>
                             </div>
                             <div>
                                 {app.status === 'Completed' && (
-                                    <button onClick={() => toggleExpand(app._id)} className="text-blue-500 hover:underline">
+                                    <button
+                                        onClick={() => toggleExpand(app._id)}
+                                        className="text-blue-500 hover:underline"
+                                    >
                                         {expandedId === app._id ? 'Hide Details' : 'View Details'}
                                     </button>
                                 )}

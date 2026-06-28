@@ -2,20 +2,56 @@ import Organisation from '../models/Organisation.js';
 import { runWithTenant } from '../plugins/tenantPlugin.js';
 
 // ── Paths that bypass tenant resolution completely ────────────────────────────
-const PUBLIC_PATHS = [
+// IMPORTANT: each entry here must be an EXACT path or a prefix that is safe
+// to expose without an organisation context.
+//
+// FIX: '/api/doctors' was previously matching '/api/doctors/my-appointments'
+// and other protected sub-paths via startsWith(), bypassing tenant resolution
+// for authenticated doctor routes.  We now list only the two truly-public
+// doctor endpoints so sub-routes remain tenant-scoped.
+const PUBLIC_EXACT = new Set([
     '/api/auth/login',
     '/api/auth/register',
     '/api/auth/refresh',
     '/api/auth/logout',
     '/api/auth/logout-all',
     '/api/health',
-    // WS1 MFA: /validate uses mfaPending JWT in request body, not access token
-    // It resolves its own user context from the pending token
+    // /validate uses mfaPending JWT in the request body, not an access token.
+    // It resolves its own user context from the pending token.
     '/api/auth/mfa/validate',
-    // Public browsing — no org context needed for anonymous visitors
-    '/api/doctors',
-    '/api/packages',
+]);
+
+// Prefixes where ALL sub-paths are public (anonymous browsing).
+// Keep this list minimal — only paths where NO sub-route requires auth.
+const PUBLIC_PREFIXES = [
+    '/api/packages',      // GET /api/packages  (list only, no sub-routes need auth)
 ];
+
+// Individual public doctor paths — using exact matches to avoid catching
+// /api/doctors/my-appointments, /api/doctors/my-profile, etc.
+const PUBLIC_DOCTOR_PATHS = new Set([
+    '/api/doctors',       // GET /api/doctors  (list)
+]);
+// /api/doctors/:id and /api/doctors/:id/availability are also public but
+// matched via the regex below to avoid false-positives.
+const PUBLIC_DOCTOR_DETAIL = /^\/api\/doctors\/[a-f\d]{24}(\/availability)?$/i;
+
+const isPublicPath = (url) => {
+    // Strip query string for matching
+    const path = url.split('?')[0];
+
+    if (PUBLIC_EXACT.has(path)) return true;
+    if (PUBLIC_DOCTOR_PATHS.has(path)) return true;
+    if (PUBLIC_DOCTOR_DETAIL.test(path)) return true;
+
+    for (const prefix of PUBLIC_PREFIXES) {
+        if (path === prefix || path.startsWith(prefix + '/') || path.startsWith(prefix + '?')) {
+            return true;
+        }
+    }
+
+    return false;
+};
 
 // ── Resolve org slug/id from request ─────────────────────────────────────────
 const resolveSlug = (req) => {
@@ -39,12 +75,7 @@ const resolveSlug = (req) => {
 
 // ── Main middleware ────────────────────────────────────────────────────────────
 export const resolveTenant = async (req, res, next) => {
-    const isPublic = PUBLIC_PATHS.some(
-        (p) => req.originalUrl === p ||
-               req.originalUrl.startsWith(p + '/') ||
-               req.originalUrl.startsWith(p + '?')
-    );
-    if (isPublic) return next();
+    if (isPublicPath(req.originalUrl)) return next();
 
     const resolved = resolveSlug(req);
 
