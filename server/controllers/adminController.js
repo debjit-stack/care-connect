@@ -1,10 +1,12 @@
-import mongoose from 'mongoose';
-import User         from '../models/User.js';
-import Doctor       from '../models/Doctor.js';
-import Appointment  from '../models/Appointment.js';
+import mongoose      from 'mongoose';
+import User          from '../models/User.js';
+import Doctor        from '../models/Doctor.js';
+import Appointment   from '../models/Appointment.js';
 import HealthPackage from '../models/HealthPackage.js';
+import Notification  from '../models/Notification.js';
 import audit         from '../utils/audit.js';
 import { revokeAllRefreshTokens } from '../utils/tokens.js';
+import { sendMail, templates }    from '../utils/mailer.js';
 
 // ─── GET /api/admin/users ─────────────────────────────────────────────────────
 const getUsers = async (req, res) => {
@@ -60,8 +62,6 @@ const updateUser = async (req, res) => {
 };
 
 // ─── DELETE /api/admin/users/:id  (soft delete) ───────────────────────────────
-// C7 FIX: wrap appointment cancellation + user soft-delete in a Mongoose session
-// so partial failure cannot leave inconsistent state.
 const deleteUser = async (req, res) => {
     if (req.params.id === req.user._id.toString()) {
         return res.status(400).json({ message: 'You cannot delete your own account' });
@@ -87,7 +87,6 @@ const deleteUser = async (req, res) => {
         }
 
         if (user.role === 'doctor') {
-            // C4 FIX: also soft-delete the Doctor document
             const doctorProfile = await Doctor.findOne({ user: user._id }).session(session);
             if (doctorProfile) {
                 await Appointment.updateMany(
@@ -106,7 +105,6 @@ const deleteUser = async (req, res) => {
         await session.commitTransaction();
         session.endSession();
 
-        // Revoke all active sessions for the deleted user (outside transaction — Redis)
         await revokeAllRefreshTokens(user._id);
 
         audit(req, 'DATA_DELETE', {
@@ -127,8 +125,6 @@ const deleteUser = async (req, res) => {
 };
 
 // ─── POST /api/admin/doctors ──────────────────────────────────────────────────
-// M6 FIX: use a session so User + Doctor creation is atomic.
-// If Doctor.create fails, the User record is also rolled back.
 const createDoctor = async (req, res) => {
     const session = await mongoose.startSession();
     session.startTransaction();
@@ -143,7 +139,7 @@ const createDoctor = async (req, res) => {
             return res.status(409).json({ message: 'A user with this email already exists' });
         }
 
-        const [user] = await User.create([{ name, email, password, role: 'doctor' }], { session });
+        const [user]   = await User.create([{ name, email, password, role: 'doctor' }], { session });
         const [doctor] = await Doctor.create(
             [{ user: user._id, specialty, qualifications, experienceYears }],
             { session }
@@ -199,8 +195,6 @@ const updateDoctorProfile = async (req, res) => {
 };
 
 // ─── POST /api/admin/staff ────────────────────────────────────────────────────
-// M5 FIX: when restoring a soft-deleted user, validate that the requested role
-// matches their original role (or reject if it would silently change it).
 const createStaff = async (req, res) => {
     try {
         const { name, email, password, role } = req.body;
@@ -208,10 +202,7 @@ const createStaff = async (req, res) => {
         const existingUser = await User.findOne({ email }).skipTenantFilter();
 
         if (existingUser && existingUser.deletedAt) {
-            // M5 FIX: only restore if the original role matches, or the role is
-            // being explicitly changed by an admin with a clear intent.
-            // We restore with the requested role but flag if it changed.
-            const roleChanged = existingUser.role !== role;
+            const roleChanged      = existingUser.role !== role;
             existingUser.name      = name;
             existingUser.password  = password;
             existingUser.role      = role;
@@ -227,10 +218,8 @@ const createStaff = async (req, res) => {
             });
 
             return res.status(200).json({
-                message: roleChanged
-                    ? `Staff restored with role changed to ${role}`
-                    : 'Staff restored successfully',
-                user: { _id: existingUser._id, name: existingUser.name, email: existingUser.email, role: existingUser.role },
+                message: roleChanged ? `Staff restored with role changed to ${role}` : 'Staff restored successfully',
+                user:    { _id: existingUser._id, name: existingUser.name, email: existingUser.email, role: existingUser.role },
             });
         }
 
@@ -265,7 +254,6 @@ const resetPassword = async (req, res) => {
         user.password = newPassword;
         await user.save();
 
-        // Revoke all Redis-stored refresh tokens immediately
         await revokeAllRefreshTokens(user._id);
 
         audit(req, 'AUTH_PASSWORD_CHANGED', {
@@ -274,6 +262,23 @@ const resetPassword = async (req, res) => {
             resourceType: 'User',
             resourceId:   user._id,
             meta:         { resetBy: 'admin', orgId: req.orgId },
+        });
+
+        // ── WS2: Notify the affected user ─────────────────────────────────────
+        const org = req.org ?? null;
+
+        Notification.create({
+            user:    user._id,
+            type:    'password_reset',
+            title:   'Password Reset',
+            message: 'Your account password has been reset by an administrator. Please log in with your new password.',
+            link:    '/login',
+        }).catch((e) => console.error('[Notification] create failed:', e.message));
+
+        sendMail({
+            to:  user.email,
+            org,
+            ...templates.passwordResetByAdmin({ userName: user.name, org }),
         });
 
         res.json({ message: 'Password reset successfully. User must log in again.' });
@@ -286,7 +291,6 @@ const resetPassword = async (req, res) => {
 // ─── GET /api/admin/doctors-full ─────────────────────────────────────────────
 const getDoctorsWithProfiles = async (req, res) => {
     try {
-        // Only return non-deleted doctor profiles
         const doctors = await Doctor.find({ deletedAt: null })
             .populate('user', 'name email')
             .lean();

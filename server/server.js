@@ -1,47 +1,35 @@
-import express from "express";
-import dotenv from "dotenv";
-import cors from "cors";
-import helmet from "helmet";
-import cookieParser from "cookie-parser";
+import express       from 'express';
+import dotenv        from 'dotenv';
+import cors          from 'cors';
+import helmet        from 'helmet';
+import cookieParser  from 'cookie-parser';
+import connectDB     from './config/db.js';
+import getRedisClient from './config/redis.js';
+import { apiRateLimiter }  from './middleware/rateLimiter.js';
+import { resolveTenant }   from './middleware/tenantMiddleware.js';
 
-import connectDB from "./config/db.js";
-import getRedisClient from "./config/redis.js";
-
-import { apiRateLimiter } from "./middleware/rateLimiter.js";
-import { resolveTenant } from "./middleware/tenantMiddleware.js";
-
-import authRoutes from "./routes/authRoutes.js";
-import mfaRoutes from "./routes/mfaRoutes.js";
-import doctorRoutes from "./routes/doctorRoutes.js";
-import adminRoutes from "./routes/adminRoutes.js";
-import receptionistRoutes from "./routes/receptionistRoutes.js";
-import patientRoutes from "./routes/patientRoutes.js";
-import healthPackageRoutes from "./routes/healthPackageRoutes.js";
-import dashboardRoutes from "./routes/dashboardRoutes.js";
-import organisationRoutes from "./routes/organisationRoutes.js";
+import authRoutes          from './routes/authRoutes.js';
+import mfaRoutes           from './routes/mfaRoutes.js';
+import doctorRoutes        from './routes/doctorRoutes.js';
+import adminRoutes         from './routes/adminRoutes.js';
+import receptionistRoutes  from './routes/receptionistRoutes.js';
+import patientRoutes       from './routes/patientRoutes.js';
+import healthPackageRoutes from './routes/healthPackageRoutes.js';
+import dashboardRoutes     from './routes/dashboardRoutes.js';
+import organisationRoutes  from './routes/organisationRoutes.js';
+import notificationRoutes  from './routes/notificationRoutes.js';
 
 dotenv.config();
 
-// Initialize database
 await connectDB();
 
-// Initialize Redis
 const redis = getRedisClient();
-
 try {
     await redis.connect();
-    redis.on("connect", () => {
-        console.log("[Redis] connected");
-    });
-
-    redis.on("ready", () => {
-        console.log("[Redis] ready");
-    });
-
+    redis.on('connect', () => console.log('[Redis] connected'));
+    redis.on('ready',   () => console.log('[Redis] ready'));
 } catch (err) {
-    redis.on("error", (err) => {
-        console.error("[Redis]", err.message);
-    });
+    redis.on('error', (e) => console.error('[Redis]', e.message));
     process.exit(1);
 }
 
@@ -64,8 +52,7 @@ app.use(helmet({
 }));
 
 const allowedOrigins = (process.env.CLIENT_ORIGIN || 'http://localhost:3000')
-    .split(',')
-    .map((o) => o.trim());
+    .split(',').map((o) => o.trim());
 
 app.use(cors({
     origin(origin, cb) {
@@ -85,18 +72,16 @@ app.set('trust proxy', 1);
 app.use('/api', apiRateLimiter);
 app.use('/api', resolveTenant);
 
-// Routes
-// NOTE: /api/auth/mfa/validate is in tenantMiddleware PUBLIC_PATHS
-// because it uses a mfaPending JWT body param, not an access token.
-app.use('/api/auth',          authRoutes);
-app.use('/api/auth/mfa',      mfaRoutes);
-app.use('/api/organisations', organisationRoutes);
-app.use('/api/doctors',       doctorRoutes);
-app.use('/api/admin',         adminRoutes);
-app.use('/api/receptionist',  receptionistRoutes);
-app.use('/api/patient',       patientRoutes);
-app.use('/api/packages',      healthPackageRoutes);
-app.use('/api/dashboard',     dashboardRoutes);
+app.use('/api/auth',           authRoutes);
+app.use('/api/auth/mfa',       mfaRoutes);
+app.use('/api/organisations',  organisationRoutes);
+app.use('/api/doctors',        doctorRoutes);
+app.use('/api/admin',          adminRoutes);
+app.use('/api/receptionist',   receptionistRoutes);
+app.use('/api/patient',        patientRoutes);
+app.use('/api/packages',       healthPackageRoutes);
+app.use('/api/dashboard',      dashboardRoutes);
+app.use('/api/notifications',  notificationRoutes);   // WS2
 
 app.get('/health', (_req, res) => res.json({ status: 'ok', ts: Date.now() }));
 

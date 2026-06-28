@@ -1,19 +1,16 @@
 import React from 'react';
 import { NavLink, useNavigate } from 'react-router-dom';
 import { useAuth } from '../../context/AuthContext';
+import NotificationBell from './NotificationBell.jsx';
 
 const DASHBOARD_ROUTES = {
     admin:        '/admin',
     doctor:       '/doctor',
     receptionist: '/receptionist',
     patient:      '/patient',
+    super_admin:  '/admin',
 };
 
-/**
- * FIX #16: Replaced plain <Link> with <NavLink> so active routes receive
- * visual highlighting.  NavLink automatically adds `aria-current="page"` and
- * allows a className function that receives `isActive`.
- */
 const navLinkClass = ({ isActive }) =>
     isActive
         ? 'text-blue-600 font-semibold border-b-2 border-blue-600 pb-0.5'
@@ -47,6 +44,10 @@ const Header = () => {
                             >
                                 My Dashboard
                             </NavLink>
+
+                            {/* WS2: Notification bell — shown for all authenticated users */}
+                            <NotificationBell />
+
                             <button
                                 onClick={handleLogout}
                                 className="bg-red-500 hover:bg-red-700 text-white font-bold py-2 px-4 rounded transition-colors"
