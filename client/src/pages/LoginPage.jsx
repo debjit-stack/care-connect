@@ -22,7 +22,7 @@ const LoginPage = () => {
     const [mfaStep,    setMfaStep]    = useState(null);  // null | 'verify' | 'setup'
     const [mfaPending, setMfaPending] = useState('');
 
-    const { login, isAuthenticated, user, updateUser } = useAuth();
+    const { login, isAuthenticated, user, completeLogin } = useAuth();
     const navigate = useNavigate();
 
     if (isAuthenticated && user) {
@@ -68,10 +68,14 @@ const LoginPage = () => {
 
     // ── MFA verify success ─────────────────────────────────────────────────────
     const handleMfaSuccess = ({ accessToken, user: mfaUser }) => {
-        setAccessToken(accessToken);
-        if (mfaUser.organisation?.slug) setOrgSlug(mfaUser.organisation.slug);
-        updateUser(mfaUser);
-        navigate(DASHBOARD_ROUTES[mfaUser.role] ?? '/', { replace: true });
+        completeLogin({
+            accessToken,
+            user: mfaUser,
+        });
+
+        navigate(DASHBOARD_ROUTES[mfaUser.role] ?? "/", {
+            replace: true,
+        });
     };
 
     const handleMfaCancel = () => {

@@ -16,16 +16,17 @@ import { runWithTenant } from '../plugins/tenantPlugin.js';
 
 // ─── Safe user payload ────────────────────────────────────────────────────────
 const safeUser = (user, org) => ({
-    _id:            user._id,
-    name:           user.name,
-    email:          user.email,
-    role:           user.role,
-    mfaEnabled:     user.mfaEnabled,
+    _id: user._id,
+    name: user.name,
+    email: user.email,
+    role: user.role,
+    mfaEnabled: user.mfaEnabled,
+    forceMfa: user.forceMfa ?? false,
     organisationId: user.organisationId ?? null,
     organisation: org ? {
-        _id:      org._id,
-        name:     org.name,
-        slug:     org.slug,
+        _id: org._id,
+        name: org.name,
+        slug: org.slug,
         settings: org.settings,
         features: org.features,
     } : null,
@@ -96,6 +97,23 @@ const registerUser = async (req, res) => {
     }
 };
 
+const sendMfaChallenge = (
+    res,
+    userId,
+    setupRequired,
+    message
+) => {
+    const mfaPending = generateMfaPendingToken(userId);
+
+    return res.status(200).json({
+        mfaRequired: true,
+        mfaSetupRequired: setupRequired,
+        mfaPending,
+        message,
+    });
+};
+
+
 // ─── POST /api/auth/login ─────────────────────────────────────────────────────
 // MFA flow:
 //   - Password correct + mfaEnabled = true
@@ -125,7 +143,7 @@ const loginUser = async (req, res) => {
 
         const user = await User
             .findOne(userFilter)
-            .select('+password +loginAttempts +lockUntil +passwordChangedAt')
+            .select('+password +loginAttempts +lockUntil +passwordChangedAt +forceMfa')
             .skipTenantFilter();
 
         if (!user) {
@@ -154,28 +172,72 @@ const loginUser = async (req, res) => {
 
         await user.resetLoginAttempts();
 
-        const orgMfaRequired = org?.features?.mfaRequired ?? false;
+// ─────────────────────────────────────────────────────────────────────
+// Enterprise MFA Decision Tree
+// Priority:
+// 1. Organisation Policy
+// 2. User Force MFA
+// 3. User Voluntary MFA
+// ─────────────────────────────────────────────────────────────────────
 
-        // ── MFA gate ──────────────────────────────────────────────────────────
-        if (user.mfaEnabled) {
-            // User has MFA set up — require TOTP before issuing full session
-            const mfaPending = generateMfaPendingToken(user._id);
-            return res.status(200).json({
-                mfaRequired:  true,
-                mfaPending,
-                message:      'Please enter your authenticator code to continue.',
-            });
+        const orgMfaRequired = org?.features?.mfaRequired ?? false;
+        const forceMfa = Boolean(user.forceMfa);
+
+        // ----------------------------------------------------
+        // CASE 1
+        // Organisation requires MFA
+        // ----------------------------------------------------
+        if (orgMfaRequired) {
+            if (user.mfaEnabled) {
+                return sendMfaChallenge(
+                    res,
+                    user._id,
+                    false,
+                    "Please enter your authenticator code."
+                );
+            }
+
+            return sendMfaChallenge(
+                res,
+                user._id,
+                true,
+                "Your organisation requires MFA."
+            );
         }
 
-        if (orgMfaRequired && !user.mfaEnabled) {
-            // Org requires MFA but user hasn't set it up yet — force setup
-            const mfaPending = generateMfaPendingToken(user._id);
-            return res.status(200).json({
-                mfaRequired:      true,
-                mfaSetupRequired: true,
-                mfaPending,
-                message:          'Your organisation requires MFA. Please set up an authenticator app.',
-            });
+        // ----------------------------------------------------
+        // CASE 2
+        // Admin forced MFA for this user
+        // ----------------------------------------------------
+        if (forceMfa) {
+            if (user.mfaEnabled) {
+                return sendMfaChallenge(
+                    res,
+                    user._id,
+                    false,
+                    "Please enter your authenticator code."
+                );
+            }
+
+            return sendMfaChallenge(
+                res,
+                user._id,
+                true,
+                "Your organisation requires MFA."
+            );
+        }
+
+        // ----------------------------------------------------
+        // CASE 3
+        // User voluntarily enabled MFA
+        // ----------------------------------------------------
+        if (user.mfaEnabled) {
+            return sendMfaChallenge(
+                res,
+                user._id,
+                false,
+                "Please enter your authenticator code."
+            );
         }
 
         // ── Normal login (no MFA) ─────────────────────────────────────────────

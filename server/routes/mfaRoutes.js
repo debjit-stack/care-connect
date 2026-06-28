@@ -1,13 +1,19 @@
 /**
  * server/routes/mfaRoutes.js
  * ───────────────────────────
- * All MFA routes require authentication (protect middleware).
- * The /validate endpoint is the exception — it uses a short-lived
- * mfa-pending token in the request body instead of a full access token,
- * so protect() is NOT applied there.
+ * MFA Routes
+ *
+ * Authentication modes:
+ *
+ * 1. mfaPending token
+ *    Used during first-time MFA enrollment after password verification.
+ *
+ * 2. protect()
+ *    Used after the user has a normal authenticated session.
  */
 
 import express from 'express';
+
 import {
     setupMfa,
     verifySetup,
@@ -15,7 +21,10 @@ import {
     disableMfa,
     getMfaStatus,
 } from '../controllers/mfaController.js';
-import { protect }  from '../middleware/authMiddleware.js';
+
+import { protect } from '../middleware/authMiddleware.js';
+import { requireMfaPending } from '../middleware/mfaPendingMiddleware.js';
+
 import {
     validate,
     verifySetupSchema,
@@ -25,14 +34,63 @@ import {
 
 const router = express.Router();
 
-// Public (uses mfaPending token in body, not access token)
-// Must be in PUBLIC_PATHS in tenantMiddleware
-router.post('/validate', validate(validateMfaSchema), validateMfa);
+/**
+ * ---------------------------------------------------------
+ * Login MFA Validation
+ *
+ * User already has MFA enabled.
+ * Password was verified.
+ * Client submits:
+ *
+ * {
+ *    token,
+ *    mfaPending
+ * }
+ * ---------------------------------------------------------
+ */
+router.post(
+    '/validate',
+    validate(validateMfaSchema),
+    validateMfa
+);
 
-// Protected — require full access token
-router.get('/status',        protect, getMfaStatus);
-router.get('/setup',         protect, setupMfa);
-router.post('/verify-setup', protect, validate(verifySetupSchema), verifySetup);
-router.post('/disable',      protect, validate(disableMfaSchema),  disableMfa);
+/**
+ * ---------------------------------------------------------
+ * First-time MFA Setup
+ *
+ * Uses the short-lived mfaPending JWT.
+ * No normal access token exists yet.
+ * ---------------------------------------------------------
+ */
+router.get(
+    '/setup',
+    requireMfaPending,
+    setupMfa
+);
+
+router.post(
+    '/verify-setup',
+    requireMfaPending,
+    validate(verifySetupSchema),
+    verifySetup
+);
+
+/**
+ * ---------------------------------------------------------
+ * Normal authenticated user routes
+ * ---------------------------------------------------------
+ */
+router.get(
+    '/status',
+    protect,
+    getMfaStatus
+);
+
+router.post(
+    '/disable',
+    protect,
+    validate(disableMfaSchema),
+    disableMfa
+);
 
 export default router;

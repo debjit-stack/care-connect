@@ -31,9 +31,27 @@ const userSchema = mongoose.Schema(
         lockUntil:         { type: Date,    default: null,  select: false },
         passwordChangedAt: { type: Date,    default: null,  select: false },
         deletedAt:         { type: Date,    default: null },
-        mfaEnabled:        { type: Boolean, default: false },
-        mfaSecret:         { type: String,  select: false },
-    },
+        // MFA
+        mfaEnabled: {
+            type: Boolean,
+            default: false,
+        },
+
+        mfaSecret: {
+            type: String,
+            select: false,
+        },
+
+        forceMfa: {
+            type: Boolean,
+            default: false,
+        },
+
+        lastMfaResetAt: {
+            type: Date,
+            default: null,
+        },
+},
     { timestamps: true }
 );
 

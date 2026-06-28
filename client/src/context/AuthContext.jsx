@@ -1,30 +1,62 @@
 import React, {
-    createContext, useState, useEffect,
-    useContext, useCallback, useRef,
-} from 'react';
-import { login as loginApi, logout as logoutApi, logoutAll as logoutAllApi, refreshToken, getMe } from '../api/auth.js';
-import { setAccessToken, clearAccessToken, setOrgSlug, clearOrgSlug } from '../api/index.js';
+    createContext,
+    useState,
+    useEffect,
+    useContext,
+    useCallback,
+    useRef,
+} from "react";
+
+import {
+    login as loginApi,
+    logout as logoutApi,
+    logoutAll as logoutAllApi,
+    refreshToken,
+    getMe,
+} from "../api/auth.js";
+
+import {
+    setAccessToken,
+    clearAccessToken,
+    setOrgSlug,
+    clearOrgSlug,
+} from "../api/index.js";
 
 const AuthContext = createContext(null);
 
 export const AuthProvider = ({ children }) => {
-    const [user,    setUser]    = useState(null);
-    const [org,     setOrg]     = useState(null);
+    const [user, setUser] = useState(null);
+    const [org, setOrg] = useState(null);
     const [loading, setLoading] = useState(true);
+
     const refreshAttempted = useRef(false);
 
-    // ── Restore session on mount ──────────────────────────────────────────────
+    // Restore session
     useEffect(() => {
+        const params = new URLSearchParams(window.location.search);
+
+        if (
+            window.location.pathname === "/mfa-setup" &&
+            params.has("mfaPending")
+        ) {
+            setLoading(false);
+            return;
+        }
+
         if (refreshAttempted.current) return;
         refreshAttempted.current = true;
 
         const restoreSession = async () => {
             try {
                 const { data: tokenData } = await refreshToken();
+
                 setAccessToken(tokenData.accessToken);
+
                 const { data: meData } = await getMe();
+
                 setUser(meData.user);
                 setOrg(meData.user.organisation ?? null);
+
                 if (meData.user.organisation?.slug) {
                     setOrgSlug(meData.user.organisation.slug);
                 }
@@ -41,7 +73,7 @@ export const AuthProvider = ({ children }) => {
         restoreSession();
     }, []);
 
-    // ── Session-expired event ─────────────────────────────────────────────────
+    // Session expired listener
     useEffect(() => {
         const handler = () => {
             clearAccessToken();
@@ -49,69 +81,123 @@ export const AuthProvider = ({ children }) => {
             setUser(null);
             setOrg(null);
         };
-        window.addEventListener('auth:session-expired', handler);
-        return () => window.removeEventListener('auth:session-expired', handler);
+
+        window.addEventListener("auth:session-expired", handler);
+
+        return () =>
+            window.removeEventListener("auth:session-expired", handler);
     }, []);
 
-    // ── login ─────────────────────────────────────────────────────────────────
-    // If the server returns mfaRequired: true (status 200), we throw a
-    // synthetic error so LoginPage can detect it and render MFAVerifyStep.
-    // This keeps the MFA flow outside AuthContext — AuthContext only manages
-    // fully-authenticated sessions.
-    const login = useCallback(async (email, password) => {
-        const { data } = await loginApi({ email, password });
+    // ============================================================
+    // COMPLETE LOGIN (MUST COME BEFORE login())
+    // ============================================================
 
-        // MFA gate — not a real login yet
-        if (data.mfaRequired) {
-            // Throw so LoginPage's catch block handles the MFA step
-            const mfaError = new Error('MFA required');
-            mfaError.response = { status: 200, data };
-            throw mfaError;
-        }
-
-        // Full login success
+    const completeLogin = useCallback((data) => {
         setAccessToken(data.accessToken);
+
         setUser(data.user);
+
         setOrg(data.user.organisation ?? null);
+
         if (data.user.organisation?.slug) {
             setOrgSlug(data.user.organisation.slug);
         }
-        return data.user;
     }, []);
 
-    // ── logout ────────────────────────────────────────────────────────────────
+    // ============================================================
+    // LOGIN
+    // ============================================================
+
+    const login = useCallback(
+        async (email, password) => {
+            const { data } = await loginApi({
+                email,
+                password,
+            });
+
+            if (data.mfaRequired) {
+                const mfaError = new Error("MFA required");
+
+                mfaError.response = {
+                    status: 200,
+                    data,
+                };
+
+                throw mfaError;
+            }
+
+            completeLogin(data);
+
+            return data.user;
+        },
+        [completeLogin]
+    );
+
+    // ============================================================
+    // LOGOUT
+    // ============================================================
+
     const logout = useCallback(async () => {
-        try { await logoutApi(); } catch {}
-        finally {
+        try {
+            await logoutApi();
+        } finally {
             clearAccessToken();
             clearOrgSlug();
+
             setUser(null);
             setOrg(null);
         }
     }, []);
 
-    // ── logoutAll ─────────────────────────────────────────────────────────────
+    // ============================================================
+    // LOGOUT ALL
+    // ============================================================
+
     const logoutAll = useCallback(async () => {
-        try { await logoutAllApi(); } catch {}
-        finally {
+        try {
+            await logoutAllApi();
+        } finally {
             clearAccessToken();
             clearOrgSlug();
+
             setUser(null);
             setOrg(null);
         }
     }, []);
 
-    // ── updateUser — used after MFA verify or profile changes ─────────────────
+    // ============================================================
+    // UPDATE USER
+    // ============================================================
+
     const updateUser = useCallback((updates) => {
-        setUser((prev) => prev ? { ...prev, ...updates } : prev);
+        setUser((prev) =>
+            prev
+                ? {
+                      ...prev,
+                      ...updates,
+                  }
+                : prev
+        );
     }, []);
 
     return (
-        <AuthContext.Provider value={{
-            user, org, loading,
-            isAuthenticated: !!user,
-            login, logout, logoutAll, updateUser,
-        }}>
+        <AuthContext.Provider
+            value={{
+                user,
+                org,
+                loading,
+
+                isAuthenticated: !!user,
+
+                login,
+                completeLogin,
+
+                logout,
+                logoutAll,
+
+                updateUser,
+            }}
+        >
             {children}
         </AuthContext.Provider>
     );
@@ -119,6 +205,10 @@ export const AuthProvider = ({ children }) => {
 
 export const useAuth = () => {
     const ctx = useContext(AuthContext);
-    if (!ctx) throw new Error('useAuth must be used inside <AuthProvider>');
+
+    if (!ctx) {
+        throw new Error("useAuth must be used inside <AuthProvider>");
+    }
+
     return ctx;
 };

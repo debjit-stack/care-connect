@@ -1,7 +1,9 @@
+
 import React, { useState, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { setupMfa, verifyMfaSetup } from '../api/mfa.js';
 import { useAuth } from '../context/AuthContext.jsx';
+    
 
 /**
  * MFASetupPage
@@ -17,6 +19,7 @@ import { useAuth } from '../context/AuthContext.jsx';
 const MFASetupPage = () => {
     const [step,      setStep]      = useState('loading'); // loading | scan | verify | done
     const [qrDataUri, setQrDataUri] = useState('');
+    const [setupId, setSetupId] = useState('');
     const [secret,    setSecret]    = useState('');
     const [otpUrl,    setOtpUrl]    = useState('');
     const [digits,    setDigits]    = useState(['', '', '', '', '', '']);
@@ -25,77 +28,119 @@ const MFASetupPage = () => {
     const [showSecret, setShowSecret] = useState(false);
     const inputRefs = useRef([]);
     const navigate  = useNavigate();
-    const { updateUser } = useAuth();
+    const { updateUser, completeLogin } = useAuth();
 
-    const params     = new URLSearchParams(window.location.search);
-    const isRequired = params.get('required') === 'true';
+    const params = new URLSearchParams(window.location.search);
+    const isRequired = params.get("required") === "true";
+    const mfaPending = params.get("mfaPending");
 
     useEffect(() => {
         const fetchSetup = async () => {
             try {
-                const { data } = await setupMfa();
+                console.log("Loading MFA setup...");
+                console.log("mfaPending:", mfaPending);
+
+                const { data } = await setupMfa(mfaPending);
+
+                console.log("Setup response:", data);
+
                 setQrDataUri(data.qrDataUri);
-                setSecret(data.secret);
-                setOtpUrl(data.otpauthUrl);
-                setStep('scan');
+                setSecret(data.secret || "");
+                setOtpUrl(data.otpauthUrl || "");
+                setSetupId(data.setupId);
+
+                setStep("scan");
             } catch (err) {
-                const msg = err?.response?.data?.message;
-                if (msg?.includes('already enabled')) {
-                    setStep('done');
+                console.error("Setup Error:", err);
+                console.error("Response:", err.response);
+
+                const msg =
+                    err.response?.data?.message ||
+                    err.message ||
+                    "Failed to load MFA setup. Please try again.";
+
+                if (msg.includes("already enabled")) {
+                    setStep("done");
                 } else {
-                    setError(msg || 'Failed to load MFA setup. Please try again.');
-                    setStep('scan');
+                    setError(msg);
+                    setStep("scan");
                 }
             }
         };
+
         fetchSetup();
     }, []);
 
     const handleDigitChange = (index, value) => {
         if (value.length > 1) {
-            const cleaned = value.replace(/\D/g, '').slice(0, 6);
+            const cleaned = value.replace(/\D/g, "").slice(0, 6);
+
             if (cleaned.length === 6) {
-                setDigits(cleaned.split(''));
+                setDigits(cleaned.split(""));
                 inputRefs.current[5]?.focus();
                 return;
             }
         }
-        const digit = value.replace(/\D/g, '').slice(-1);
-        const next  = [...digits];
+
+        const digit = value.replace(/\D/g, "").slice(-1);
+
+        const next = [...digits];
         next[index] = digit;
         setDigits(next);
-        if (digit && index < 5) inputRefs.current[index + 1]?.focus();
+
+        if (digit && index < 5) {
+            inputRefs.current[index + 1]?.focus();
+        }
     };
 
     const handleKeyDown = (index, e) => {
-        if (e.key === 'Backspace' && !digits[index] && index > 0) {
+        if (e.key === "Backspace" && !digits[index] && index > 0) {
             inputRefs.current[index - 1]?.focus();
         }
     };
 
     const handleVerify = async (e) => {
         e.preventDefault();
-        setError('');
-        const token = digits.join('');
+
+        setError("");
+
+        const token = digits.join("");
+
         if (token.length !== 6) {
-            setError('Please enter all 6 digits.');
+            setError("Please enter all 6 digits.");
             return;
         }
 
         setLoading(true);
+
         try {
-            await verifyMfaSetup({ token, secret });
-            updateUser({ mfaEnabled: true });
-            setStep('done');
+            const { data } = await verifyMfaSetup(
+                {
+                    token,
+                    setupId,
+                },
+                mfaPending
+            );
+
+            localStorage.setItem("accessToken", data.accessToken);
+
+            completeLogin(data);
+
+            navigate("/");
         } catch (err) {
-            setError(err?.response?.data?.message || 'Invalid code. Please try again.');
-            setDigits(['', '', '', '', '', '']);
+            console.error(err.response?.data);
+
+            setError(
+                err.response?.data?.message ||
+                "Verification failed."
+            );
+
+            setDigits(["", "", "", "", "", ""]);
             inputRefs.current[0]?.focus();
         } finally {
             setLoading(false);
         }
     };
-
     const handleDone = () => navigate('/');
 
     if (step === 'loading') {

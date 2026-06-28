@@ -18,10 +18,10 @@ const totpToken = z
 export const verifySetupSchema = z.object({
     body: z.object({
         token:  totpToken,
-        secret: z
-            .string({ required_error: 'Secret is required' })
+        setupId: z
+            .string({ required_error: 'Setup ID is required' })
             .trim()
-            .min(16, 'Invalid secret'),
+            .min(16, 'Invalid setup ID'),
     }),
 });
 

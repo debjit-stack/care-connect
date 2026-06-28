@@ -17,10 +17,25 @@ const auditLogSchema = mongoose.Schema(
             type:     String,
             required: true,
             enum: [
-                'AUTH_LOGIN_SUCCESS', 'AUTH_LOGIN_FAILED', 'AUTH_LOGOUT',
-                'AUTH_TOKEN_REFRESHED', 'AUTH_PASSWORD_CHANGED', 'AUTH_ACCOUNT_LOCKED',
-                'DATA_READ', 'DATA_CREATE', 'DATA_UPDATE', 'DATA_DELETE',
-            ],
+            'AUTH_LOGIN_SUCCESS',
+            'AUTH_LOGIN_FAILED',
+            'AUTH_LOGOUT',
+            'AUTH_TOKEN_REFRESHED',
+            'AUTH_PASSWORD_CHANGED',
+            'AUTH_ACCOUNT_LOCKED',
+
+            // MFA
+            'AUTH_MFA_SETUP_STARTED',
+            'AUTH_MFA_SETUP_COMPLETED',
+            'AUTH_MFA_VERIFIED',
+            'AUTH_MFA_DISABLED',
+
+            // Data
+            'DATA_READ',
+            'DATA_CREATE',
+            'DATA_UPDATE',
+            'DATA_DELETE',
+        ],
         },
         resourceType: { type: String,  default: null },
         resourceId:   { type: String,  default: null },

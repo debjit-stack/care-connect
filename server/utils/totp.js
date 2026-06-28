@@ -15,22 +15,35 @@
 import speakeasy  from 'speakeasy';
 import QRCode     from 'qrcode';
 import crypto     from 'crypto';
+import env        from '../config/env.js';
 
-const APP_NAME          = process.env.APP_NAME          || 'CareConnect';
-const MFA_ENC_KEY_HEX   = process.env.MFA_ENCRYPTION_KEY || null;
+const APP_NAME          = env.APP_NAME;
 const ALGORITHM         = 'aes-256-gcm';
 const IV_LENGTH         = 12; // 96-bit IV for GCM
 const TAG_LENGTH        = 16;
 
 // ── Validate encryption key at startup ───────────────────────────────────────
 const getEncKey = () => {
-    if (!MFA_ENC_KEY_HEX || MFA_ENC_KEY_HEX.length !== 64) {
+    const keyHex = env.MFA_ENCRYPTION_KEY;
+
+    console.log("[getEncKey] key =", keyHex);
+    console.log("[getEncKey] length =", keyHex?.length);
+
+    if (!keyHex) {
+        throw new Error("MFA_ENCRYPTION_KEY is missing");
+    }
+
+    if (keyHex.length !== 64) {
         throw new Error(
-            'MFA_ENCRYPTION_KEY must be a 64-char hex string (32 bytes). ' +
-            'Generate with: openssl rand -hex 32'
+            `MFA_ENCRYPTION_KEY must be exactly 64 hex characters. Current length: ${keyHex.length}`
         );
     }
-    return Buffer.from(MFA_ENC_KEY_HEX, 'hex');
+
+    if (!/^[0-9a-fA-F]{64}$/.test(keyHex)) {
+        throw new Error("Invalid hex key");
+    }
+
+    return Buffer.from(keyHex, "hex");
 };
 
 // ── Generate a new TOTP secret for a user ────────────────────────────────────
