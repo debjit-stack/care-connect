@@ -26,9 +26,6 @@ const TAG_LENGTH        = 16;
 const getEncKey = () => {
     const keyHex = env.MFA_ENCRYPTION_KEY;
 
-    console.log("[getEncKey] key =", keyHex);
-    console.log("[getEncKey] length =", keyHex?.length);
-
     if (!keyHex) {
         throw new Error("MFA_ENCRYPTION_KEY is missing");
     }
