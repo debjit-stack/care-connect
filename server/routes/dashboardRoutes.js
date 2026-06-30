@@ -1,11 +1,12 @@
 import express from 'express';
-const router = express.Router();
-import { getDashboardStats } from '../controllers/dashboardController.js';
+import { getDashboardStats, exportAppointments } from '../controllers/dashboardController.js';
 import { protect, admin } from '../middleware/authMiddleware.js';
 
-// All routes in this file are protected and for admins only
+const router = express.Router();
+
 router.use(protect, admin);
 
-router.route('/stats').get(getDashboardStats);
+router.get('/stats',  getDashboardStats);
+router.get('/export', exportAppointments);   // WS3: CSV download
 
 export default router;
