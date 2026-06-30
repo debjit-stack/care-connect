@@ -8,6 +8,7 @@ import DoctorsPage       from './pages/DoctorsPage';
 import DoctorDetailPage  from './pages/DoctorDetailPage';
 import ProtectedRoute    from './components/auth/ProtectedRoute';
 import PackagesPage      from './pages/PackagesPage';
+import PatientProfilePage from './pages/PatientProfilePage';
 
 import AdminDashboard        from './pages/AdminDashboard';
 import DoctorDashboard       from './pages/DoctorDashboard';
@@ -45,6 +46,12 @@ const AppRoutes = () => {
       <Route path="/patient" element={
         <ProtectedRoute allowedRoles={['patient']}>
           <PatientDashboard />
+        </ProtectedRoute>
+      } />
+      {/* WS4: Patient profile management */}
+      <Route path="/patient/profile" element={
+        <ProtectedRoute allowedRoles={['patient']}>
+          <PatientProfilePage />
         </ProtectedRoute>
       } />
     </Routes>

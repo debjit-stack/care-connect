@@ -131,6 +131,9 @@ const getMyProfile = async (req, res) => {
 };
 
 // GET /api/doctors/patient-history/:patientId
+// WS4: Now also returns patient demographics (blood group, allergies, DOB)
+// alongside the appointment history, so ConsultationModal can show a
+// clinical summary header without a second API call.
 const getPatientHistory = async (req, res) => {
     try {
         const { patientId } = req.params;
@@ -152,17 +155,33 @@ const getPatientHistory = async (req, res) => {
             return res.status(403).json({ message: 'Access denied. You can only view history for your own patients.' });
         }
 
-        const history = await Appointment.find({ patient: patientId, status: 'Completed' })
-            .populate({ path: 'doctor', populate: { path: 'user', select: 'name' } })
-            .sort({ appointmentDate: -1 })
-            .lean();
+        const [history, patient] = await Promise.all([
+            Appointment.find({ patient: patientId, status: 'Completed' })
+                .populate({ path: 'doctor', populate: { path: 'user', select: 'name' } })
+                .sort({ appointmentDate: -1 })
+                .lean(),
+
+            // WS4: demographics for the consultation header
+            User.findById(patientId)
+                .select('name email phone dateOfBirth bloodGroup allergies')
+                .lean(),
+        ]);
 
         audit(req, 'DATA_READ', {
             actorId: req.user._id, actorRole: req.user.role,
             resourceType: 'PatientHistory', resourceId: patientId,
         });
 
-        res.json(history);
+        res.json({
+            history,
+            patient: patient ? {
+                name:        patient.name,
+                phone:       patient.phone,
+                dateOfBirth: patient.dateOfBirth,
+                bloodGroup:  patient.bloodGroup,
+                allergies:   patient.allergies,
+            } : null,
+        });
     } catch (err) {
         console.error('[Doctor] getPatientHistory:', err.message);
         res.status(500).json({ message: 'Failed to fetch patient history' });
@@ -197,7 +216,6 @@ const updateAppointment = async (req, res) => {
             resourceType: 'Appointment', resourceId: updated._id,
         });
 
-        // ── WS2: Consultation summary when appointment completed ───────────────
         if (wasCompleted && appointment.patient) {
             const org        = req.org ?? null;
             const doctorUser = await User.findById(req.user._id).select('name').lean();

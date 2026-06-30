@@ -31,27 +31,48 @@ const userSchema = mongoose.Schema(
         lockUntil:         { type: Date,    default: null,  select: false },
         passwordChangedAt: { type: Date,    default: null,  select: false },
         deletedAt:         { type: Date,    default: null },
+
         // MFA
         mfaEnabled: {
             type: Boolean,
             default: false,
         },
-
         mfaSecret: {
             type: String,
             select: false,
         },
-
         forceMfa: {
             type: Boolean,
             default: false,
         },
-
         lastMfaResetAt: {
             type: Date,
             default: null,
         },
-},
+
+        // WS4: Patient profile fields (Migration 005)
+        // Optional on all roles, but populated UI only shown for patients.
+        phone: {
+            type:    String,
+            default: null,
+            trim:    true,
+        },
+        dateOfBirth: {
+            type:    Date,
+            default: null,
+        },
+        bloodGroup: {
+            type:    String,
+            default: null,
+            enum:    [null, 'A+', 'A-', 'B+', 'B-', 'AB+', 'AB-', 'O+', 'O-'],
+        },
+        allergies: {
+            type:      String,
+            default:   '',
+            trim:      true,
+            maxlength: [500, 'Allergies field cannot exceed 500 characters'],
+        },
+    },
     { timestamps: true }
 );
 
@@ -59,7 +80,6 @@ const userSchema = mongoose.Schema(
 userSchema.plugin(tenantPlugin);
 
 // Unique email is scoped per-organisation (not global)
-// A patient can have accounts at multiple hospitals with the same email
 userSchema.index({ email: 1, organisationId: 1 }, { unique: true });
 userSchema.index({ role: 1,  organisationId: 1 });
 userSchema.index({ deletedAt: 1 });

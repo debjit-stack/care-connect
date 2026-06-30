@@ -1,8 +1,11 @@
 import express from 'express';
 import {
     bookMyAppointment,
+    cancelMyAppointment,
     bookMyHealthPackage,
     getMyHistory,
+    getMyProfile,
+    updateMyProfile,
 } from '../controllers/patientController.js';
 import { protect, isPatient } from '../middleware/authMiddleware.js';
 import { requireFeature }     from '../middleware/tenantMiddleware.js';
@@ -10,13 +13,14 @@ import {
     validate,
     bookAppointmentSchema,
     bookPackageSchema,
+    updateProfileSchema,
+    cancelAppointmentSchema,
 } from '../validators/patientValidators.js';
 
 const router = express.Router();
 
 router.use(protect, isPatient);
 
-// M3 FIX: enforce feature flags so disabled orgs cannot book
 router.post('/book-appointment',
     requireFeature('onlineBooking'),
     validate(bookAppointmentSchema),
@@ -30,5 +34,12 @@ router.post('/book-package',
 );
 
 router.get('/my-history', getMyHistory);
+
+// WS4: Profile management
+router.get('/profile', getMyProfile);
+router.put('/profile', validate(updateProfileSchema), updateMyProfile);
+
+// WS4: Self-cancellation with 24hr cutoff
+router.delete('/appointments/:id', validate(cancelAppointmentSchema), cancelMyAppointment);
 
 export default router;
