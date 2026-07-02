@@ -1,96 +1,44 @@
 /**
  * server/routes/mfaRoutes.js
- * ───────────────────────────
- * MFA Routes
- *
- * Authentication modes:
- *
- * 1. mfaPending token
- *    Used during first-time MFA enrollment after password verification.
- *
- * 2. protect()
- *    Used after the user has a normal authenticated session.
+ * P3C: Added POST /recover and POST /regenerate-codes routes.
+ * All existing routes preserved exactly.
  */
 
 import express from 'express';
-
 import {
     setupMfa,
     verifySetup,
     validateMfa,
     disableMfa,
     getMfaStatus,
+    recoverWithCode,
+    regenerateCodes,
 } from '../controllers/mfaController.js';
-
-import { protect } from '../middleware/authMiddleware.js';
-import { requireMfaPending } from '../middleware/mfaPendingMiddleware.js';
-
+import { protect }          from '../middleware/authMiddleware.js';
+import {requireMfaPending}    from '../middleware/mfaPendingMiddleware.js';
 import {
     validate,
     verifySetupSchema,
     validateMfaSchema,
     disableMfaSchema,
+    recoverSchema,
+    regenerateCodesSchema,
 } from '../validators/mfaValidators.js';
 
 const router = express.Router();
 
-/**
- * ---------------------------------------------------------
- * Login MFA Validation
- *
- * User already has MFA enabled.
- * Password was verified.
- * Client submits:
- *
- * {
- *    token,
- *    mfaPending
- * }
- * ---------------------------------------------------------
- */
-router.post(
-    '/validate',
-    validate(validateMfaSchema),
-    validateMfa
-);
+// ── Pending-token routes (use mfaPending JWT, not access token) ───────────────
+// These are in tenantMiddleware PUBLIC_PATHS
+router.post('/validate',      validate(validateMfaSchema),  validateMfa);
+router.post('/verify-setup',  requireMfaPending, validate(verifySetupSchema), verifySetup);
+router.get('/setup',          requireMfaPending, setupMfa);
 
-/**
- * ---------------------------------------------------------
- * First-time MFA Setup
- *
- * Uses the short-lived mfaPending JWT.
- * No normal access token exists yet.
- * ---------------------------------------------------------
- */
-router.get(
-    '/setup',
-    requireMfaPending,
-    setupMfa
-);
+// P3C: Recovery — also uses mfaPending (user has passed password but not TOTP)
+router.post('/recover',       validate(recoverSchema), recoverWithCode);
 
-router.post(
-    '/verify-setup',
-    requireMfaPending,
-    validate(verifySetupSchema),
-    verifySetup
-);
-
-/**
- * ---------------------------------------------------------
- * Normal authenticated user routes
- * ---------------------------------------------------------
- */
-router.get(
-    '/status',
-    protect,
-    getMfaStatus
-);
-
-router.post(
-    '/disable',
-    protect,
-    validate(disableMfaSchema),
-    disableMfa
-);
+// ── Full-session routes (require valid access token) ──────────────────────────
+router.get('/status',                 protect, getMfaStatus);
+router.post('/disable',               protect, validate(disableMfaSchema),        disableMfa);
+router.post('/regenerate-codes',      protect, validate(regenerateCodesSchema),   regenerateCodes);
 
 export default router;

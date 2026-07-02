@@ -1,5 +1,5 @@
-import mongoose from 'mongoose';
-import bcrypt from 'bcryptjs';
+import mongoose    from 'mongoose';
+import bcrypt      from 'bcryptjs';
 import tenantPlugin from '../plugins/tenantPlugin.js';
 
 const userSchema = mongoose.Schema(
@@ -27,40 +27,32 @@ const userSchema = mongoose.Schema(
             enum:     ['patient', 'doctor', 'receptionist', 'admin', 'super_admin'],
             default:  'patient',
         },
-        loginAttempts:     { type: Number,  default: 0,    select: false },
-        lockUntil:         { type: Date,    default: null,  select: false },
-        passwordChangedAt: { type: Date,    default: null,  select: false },
-        deletedAt:         { type: Date,    default: null },
+        loginAttempts:     { type: Number, default: 0,    select: false },
+        lockUntil:         { type: Date,   default: null,  select: false },
+        passwordChangedAt: { type: Date,   default: null,  select: false },
+        deletedAt:         { type: Date,   default: null },
 
-        // MFA
-        mfaEnabled: {
-            type: Boolean,
-            default: false,
-        },
-        mfaSecret: {
-            type: String,
-            select: false,
-        },
-        forceMfa: {
-            type: Boolean,
-            default: false,
-        },
-        lastMfaResetAt: {
-            type: Date,
-            default: null,
+        // MFA — TOTP
+        mfaEnabled:     { type: Boolean, default: false },
+        mfaSecret:      { type: String,  select: false },
+        forceMfa:       { type: Boolean, default: false },
+        lastMfaResetAt: { type: Date,    default: null },
+
+        // P3C: Recovery codes — stored as bcrypt hashes, never plain text.
+        // Generated when MFA is enabled, consumed one-time during recovery.
+        // select: false so they are never returned in normal user queries.
+        recoveryCodes: {
+            type:   [{
+                codeHash: { type: String, required: true },
+                usedAt:   { type: Date,   default: null },
+            }],
+            default: [],
+            select:  false,
         },
 
         // WS4: Patient profile fields (Migration 005)
-        // Optional on all roles, but populated UI only shown for patients.
-        phone: {
-            type:    String,
-            default: null,
-            trim:    true,
-        },
-        dateOfBirth: {
-            type:    Date,
-            default: null,
-        },
+        phone:       { type: String, default: null,  trim: true },
+        dateOfBirth: { type: Date,   default: null },
         bloodGroup: {
             type:    String,
             default: null,
@@ -76,10 +68,8 @@ const userSchema = mongoose.Schema(
     { timestamps: true }
 );
 
-// Apply multi-tenancy plugin BEFORE defining indexes
 userSchema.plugin(tenantPlugin);
 
-// Unique email is scoped per-organisation (not global)
 userSchema.index({ email: 1, organisationId: 1 }, { unique: true });
 userSchema.index({ role: 1,  organisationId: 1 });
 userSchema.index({ deletedAt: 1 });
