@@ -1,4 +1,11 @@
 import { z } from 'zod';
+// M2 FIX: this file used to define its own copy of the validate() middleware
+// factory, duplicating the one in shared.js. Two copies meant a fix applied
+// to one (e.g. the earlier double-next() bug fix) could silently miss the
+// other. There is now exactly one implementation, re-exported from here so
+// existing imports (`import { validate } from './authValidators.js'`)
+// continue to work unchanged.
+import { validate } from './shared.js';
 
 // ─── Reusable field definitions ───────────────────────────────────────────────
 
@@ -50,37 +57,5 @@ export const changePasswordSchema = z.object({
     ),
 });
 
-// ─── Validation middleware factory ────────────────────────────────────────────
-
-export const validate = (schema) => (req, res, next) => {
-    const result = schema.safeParse({ body: req.body, params: req.params, query: req.query });
-
-    if (!result.success) {
-        const errors = result.error.issues.map((e) => ({
-            field:   e.path.slice(1).join('.'),  // strip leading 'body'/'params'/'query'
-            message: e.message,
-        }));
-        return res.status(400).json({
-            message: 'Validation failed',
-            errors,
-        });
-    }
-
-    // Replace req.body with the cleaned/coerced values from Zod
-    // req.body   = result.data.body   ?? req.body;
-    // req.params = result.data.params ?? req.params;
-    // req.query  = result.data.query  ?? req.query;
-    if (result.data.body) {
-    req.body = result.data.body;
-    }
-
-    if (result.data.params) {
-        Object.assign(req.params, result.data.params);
-    }
-
-    if (result.data.query) {
-        Object.assign(req.query, result.data.query);
-    }
-
-    next();
-};
+// ─── Re-export the single validate() implementation ───────────────────────────
+export { validate };

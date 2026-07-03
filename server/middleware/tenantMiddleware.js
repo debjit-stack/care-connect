@@ -5,46 +5,71 @@ import { runWithTenant } from '../plugins/tenantPlugin.js';
 // IMPORTANT: each entry here must be an EXACT path or a prefix that is safe
 // to expose without an organisation context.
 //
-// FIX: '/api/doctors' was previously matching '/api/doctors/my-appointments'
-// and other protected sub-paths via startsWith(), bypassing tenant resolution
-// for authenticated doctor routes.  We now list only the two truly-public
-// doctor endpoints so sub-routes remain tenant-scoped.
-const PUBLIC_EXACT = new Set([
-    '/api/auth/login',
-    '/api/auth/register',
-    '/api/auth/refresh',
-    '/api/auth/logout',
-    '/api/auth/logout-all',
-    '/api/health',
-    // /validate uses mfaPending JWT in the request body, not an access token.
-    // It resolves its own user context from the pending token.
-    '/api/auth/mfa/validate',
-]);
+// C1/M3 FIX: isPublicPath() is now METHOD-AWARE. The previous implementation
+// matched on path only, which meant any prefix marked "public" (e.g.
+// '/api/packages' for anonymous browsing) silently bypassed tenant resolution
+// for EVERY verb under that prefix — including POST/PUT/DELETE routes that are
+// guarded by `protect, admin` at the route level. That let admin package
+// mutations skip runWithTenant() entirely, so new HealthPackage docs were
+// never stamped with organisationId and became visible/writable across every
+// tenant. The same class of bug was previously fixed for '/api/doctors' by
+// switching to exact/regex matches — this fix extends that pattern and makes
+// it structural: every public entry below declares which HTTP method(s) it
+// applies to, so a future mutating route added under a "public" prefix does
+// NOT inherit the bypass by accident.
 
-// Prefixes where ALL sub-paths are public (anonymous browsing).
-// Keep this list minimal — only paths where NO sub-route requires auth.
-const PUBLIC_PREFIXES = [
-    '/api/packages',      // GET /api/packages  (list only, no sub-routes need auth)
+// Exact-match public routes: { method, path }
+const PUBLIC_EXACT = [
+    { method: 'POST', path: '/api/auth/login' },
+    { method: 'POST', path: '/api/auth/register' },
+    { method: 'POST', path: '/api/auth/refresh' },
+    { method: 'POST', path: '/api/auth/logout' },
+    { method: 'POST', path: '/api/auth/logout-all' },
+    { method: 'GET',  path: '/api/health' },
+    // /validate and /recover both use an mfaPending JWT in the request body,
+    // not an access token — they resolve their own user context from the
+    // pending token, so no X-Organisation-Slug is required from the client.
+    // C3 FIX: /recover was missing here, so in any multi-org deployment
+    // without a cached org slug, resolveTenant would 400 before the recovery
+    // controller ever ran — making the "lost your authenticator" recovery
+    // flow unreachable exactly when it's needed most.
+    { method: 'POST', path: '/api/auth/mfa/validate' },
+    { method: 'POST', path: '/api/auth/mfa/recover' },
+];
+
+// Prefixes where a SPECIFIC method is public for all sub-paths.
+// Keep this list minimal, and always pair a prefix with the one verb that's
+// actually safe — never leave it method-agnostic.
+const PUBLIC_METHOD_PREFIXES = [
+    // GET /api/packages — public catalog listing only.
+    // POST/PUT/DELETE under this prefix (create/update/delete package) are
+    // NOT public and must go through tenant resolution + admin auth.
+    { method: 'GET', prefix: '/api/packages' },
 ];
 
 // Individual public doctor paths — using exact matches to avoid catching
 // /api/doctors/my-appointments, /api/doctors/my-profile, etc.
-const PUBLIC_DOCTOR_PATHS = new Set([
+const PUBLIC_DOCTOR_EXACT_GET = new Set([
     '/api/doctors',       // GET /api/doctors  (list)
 ]);
 // /api/doctors/:id and /api/doctors/:id/availability are also public but
-// matched via the regex below to avoid false-positives.
-const PUBLIC_DOCTOR_DETAIL = /^\/api\/doctors\/[a-f\d]{24}(\/availability)?$/i;
+// matched via regex to avoid false-positives against authenticated sub-routes.
+const PUBLIC_DOCTOR_DETAIL_GET = /^\/api\/doctors\/[a-f\d]{24}(\/availability)?$/i;
 
-const isPublicPath = (url) => {
+const isPublicPath = (method, url) => {
     // Strip query string for matching
     const path = url.split('?')[0];
+    const m = (method || 'GET').toUpperCase();
 
-    if (PUBLIC_EXACT.has(path)) return true;
-    if (PUBLIC_DOCTOR_PATHS.has(path)) return true;
-    if (PUBLIC_DOCTOR_DETAIL.test(path)) return true;
+    if (PUBLIC_EXACT.some((e) => e.method === m && e.path === path)) return true;
 
-    for (const prefix of PUBLIC_PREFIXES) {
+    if (m === 'GET') {
+        if (PUBLIC_DOCTOR_EXACT_GET.has(path)) return true;
+        if (PUBLIC_DOCTOR_DETAIL_GET.test(path)) return true;
+    }
+
+    for (const { method: pm, prefix } of PUBLIC_METHOD_PREFIXES) {
+        if (pm !== m) continue;
         if (path === prefix || path.startsWith(prefix + '/') || path.startsWith(prefix + '?')) {
             return true;
         }
@@ -75,7 +100,8 @@ const resolveSlug = (req) => {
 
 // ── Main middleware ────────────────────────────────────────────────────────────
 export const resolveTenant = async (req, res, next) => {
-    if (isPublicPath(req.originalUrl)) return next();
+    // C1/M3 FIX: pass req.method so only the intended verb(s) bypass resolution.
+    if (isPublicPath(req.method, req.originalUrl)) return next();
 
     const resolved = resolveSlug(req);
 

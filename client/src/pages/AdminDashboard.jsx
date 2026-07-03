@@ -283,6 +283,7 @@ const AdminDashboard = () => {
                             <input type="text" placeholder="Search doctors…" value={doctorSearch} onChange={(e) => setDoctorSearch(e.target.value)} className="w-full p-2 border rounded mb-4" />
                             <DoctorList
                                 doctors={filteredDoctors}
+                                loggedInUser={loggedInUser}
                                 onEdit={(u)    => setModal({ type: 'editUser',  data: u })}
                                 onDelete={(id) => handleDelete('user', id)}
                                 onSetAvailability={(u) => {
@@ -304,6 +305,7 @@ const AdminDashboard = () => {
                             <input type="text" placeholder="Search patients…" value={patientSearch} onChange={(e) => setPatientSearch(e.target.value)} className="w-full p-2 border rounded mb-4" />
                             <PatientList
                                 patients={filteredPatients}
+                                loggedInUser={loggedInUser}
                                 onEdit={(u)    => setModal({ type: 'editUser',      data: u })}
                                 onDelete={(id) => handleDelete('user', id)}
                                 onResetPassword={(u) => setModal({ type: 'resetPassword', data: u })}

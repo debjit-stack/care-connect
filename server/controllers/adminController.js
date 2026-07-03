@@ -36,15 +36,43 @@ const getUserById = async (req, res) => {
 };
 
 // ─── PUT /api/admin/users/:id ─────────────────────────────────────────────────
+// M4 FIX: previously relied entirely on the DB's unique (email, organisationId)
+// index to reject a duplicate email, which surfaces as a raw Mongo duplicate-key
+// error caught by the generic try/catch and returned as an unhelpful 500
+// "Failed to update user". This mirrors the same explicit-uniqueness-check
+// pattern already used in registerUser/createStaff, so users now get a clean
+// 409 with a clear message instead of a mysterious server error.
 const updateUser = async (req, res) => {
     try {
         const { name, email } = req.body;
         const user = await User.findOne({ _id: req.params.id, deletedAt: null });
         if (!user) return res.status(404).json({ message: 'User not found' });
 
+        if (email && email.toLowerCase() !== user.email) {
+            const existsFilter = user.organisationId
+                ? { email: email.toLowerCase(), organisationId: user.organisationId, deletedAt: null, _id: { $ne: user._id } }
+                : { email: email.toLowerCase(), deletedAt: null, _id: { $ne: user._id } };
+
+            const duplicate = await User.findOne(existsFilter).skipTenantFilter();
+            if (duplicate) {
+                return res.status(409).json({ message: 'Another account with this email already exists' });
+            }
+        }
+
         if (name)  user.name  = name;
         if (email) user.email = email;
-        const updated = await user.save();
+
+        let updated;
+        try {
+            updated = await user.save();
+        } catch (saveErr) {
+            // Defensive fallback: a race between the precheck above and the
+            // save (two concurrent requests) can still hit the unique index.
+            if (saveErr.code === 11000) {
+                return res.status(409).json({ message: 'Another account with this email already exists' });
+            }
+            throw saveErr;
+        }
 
         audit(req, 'DATA_UPDATE', {
             actorId:      req.user._id,

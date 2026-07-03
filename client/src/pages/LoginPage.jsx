@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useNavigate, Navigate, Link } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 import { setAccessToken, setOrgSlug } from '../api/index.js';
@@ -24,6 +24,20 @@ const LoginPage = () => {
 
     const { login, isAuthenticated, user, completeLogin } = useAuth();
     const navigate = useNavigate();
+
+    // M1 FIX: navigating during render (as this used to do — calling
+    // navigate() directly in the component body when mfaStep === 'setup',
+    // then `return null`) is a React anti-pattern: it triggers a state
+    // update in the router while THIS component is still rendering, which
+    // React 19 / StrictMode can flag ("Cannot update a component while
+    // rendering a different component") and is fragile under double-invoked
+    // renders. The redirect is now a side effect in useEffect, keyed off
+    // mfaStep/mfaPending, so it only fires after render has committed.
+    useEffect(() => {
+        if (mfaStep === 'setup') {
+            navigate(`/mfa-setup?required=true&mfaPending=${encodeURIComponent(mfaPending)}`, { replace: true });
+        }
+    }, [mfaStep, mfaPending, navigate]);
 
     if (isAuthenticated && user) {
         return <Navigate to={DASHBOARD_ROUTES[user.role] ?? '/'} replace />;
@@ -84,9 +98,8 @@ const LoginPage = () => {
         setError('');
     };
 
-    // ── MFA forced setup — redirect to setup page with pending token ───────────
+    // ── MFA forced setup — redirect handled by the useEffect above ─────────────
     if (mfaStep === 'setup') {
-        navigate(`/mfa-setup?required=true&mfaPending=${encodeURIComponent(mfaPending)}`, { replace: true });
         return null;
     }
 

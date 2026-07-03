@@ -190,6 +190,15 @@ const MFASetupPage = () => {
     // P3C: recovery codes returned by verifySetup
     const [recoveryCodes, setRecoveryCodes] = useState([]);
 
+    // C4 FIX: the pending login payload (which contains the access token)
+    // used to be round-tripped through sessionStorage between the "verify"
+    // step and the "codes acknowledged" step. sessionStorage is readable by
+    // any script on the page, so an XSS during the recovery-codes screen
+    // could exfiltrate a live access token — a direct violation of this
+    // project's in-memory-only token strategy. It's now held purely in a
+    // ref, which never leaves JS memory and is cleared once consumed.
+    const pendingLoginDataRef = useRef(null);
+
     const inputRefs = useRef([]);
     const timerRef  = useRef(null);
     const navigate  = useNavigate();
@@ -292,9 +301,9 @@ const MFASetupPage = () => {
             // P3C: If server returned recovery codes, show them before completing login
             if (data.recoveryCodes?.length) {
                 setRecoveryCodes(data.recoveryCodes);
+                // C4 FIX: keep the login payload in memory only (ref), not sessionStorage.
+                pendingLoginDataRef.current = data;
                 setStep('codes');
-                // Store the login data so completeLogin can be called after codes are saved
-                sessionStorage.setItem('_p3c_loginData', JSON.stringify(data));
             } else {
                 // No codes (shouldn't happen in normal flow) — complete login immediately
                 completeLogin(data);
@@ -324,11 +333,11 @@ const MFASetupPage = () => {
 
     // ── P3C: Recovery codes acknowledged — complete login ─────────────────────
     const handleCodesAcknowledged = () => {
-        try {
-            const loginData = JSON.parse(sessionStorage.getItem('_p3c_loginData') || '{}');
-            sessionStorage.removeItem('_p3c_loginData');
-            completeLogin(loginData);
-        } catch { /* ignore */ }
+        // C4 FIX: read from the in-memory ref instead of sessionStorage, then
+        // clear it immediately so the token payload doesn't linger anywhere.
+        const loginData = pendingLoginDataRef.current;
+        pendingLoginDataRef.current = null;
+        if (loginData) completeLogin(loginData);
         navigate('/', { replace: true });
     };
 
