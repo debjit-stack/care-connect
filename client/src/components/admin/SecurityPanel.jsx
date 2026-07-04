@@ -2,7 +2,6 @@ import React, { useState, useEffect, useCallback } from 'react';
 import {
     getSecuritySettings,
     updateSecuritySettings,
-    getAllUsers,
     getUserSecurity,
     updateUserSecurity,
     resetUserMfa,
@@ -174,8 +173,8 @@ const SecurityPanel = ({ users }) => {
             setOrgPolicy({ mfaRequired: data.settings.mfaRequired });
             setPolicySuccess(
                 value
-                    ? 'MFA is now required for all users in this organisation.'
-                    : 'Organisation-wide MFA requirement removed.'
+                    ? 'MFA is now required for all staff accounts in this organisation.'
+                    : 'Organisation-wide staff MFA requirement removed.'
             );
             setTimeout(() => setPolicySuccess(''), 4000);
         } catch (err) {
@@ -185,7 +184,8 @@ const SecurityPanel = ({ users }) => {
         }
     };
 
-    // Only show staff, doctors, admins — not patients (MFA is optional for patients)
+    // Only show staff, doctors, admins — not patients (patients no longer use
+    // MFA at all; see authController.loginUser's centralized patient bypass).
     const staffUsers = users
         .filter((u) => ['admin', 'super_admin', 'doctor', 'receptionist'].includes(u.role))
         .filter((u) => {
@@ -203,11 +203,12 @@ const SecurityPanel = ({ users }) => {
                 <div className="flex items-start justify-between mb-2">
                     <div>
                         <h3 className="text-base font-semibold text-gray-800">
-                            Organisation MFA Policy
+                            Require MFA for Staff
                         </h3>
                         <p className="text-sm text-gray-500 mt-1">
-                            When enabled, all staff must set up MFA before accessing the system.
-                            Patients are not affected by this setting.
+                            When enabled, all admin, doctor, and receptionist accounts must set
+                            up two-factor authentication before accessing the system.
+                            Patients never use MFA — this setting does not affect them.
                         </p>
                     </div>
                     {loadingPolicy ? (
@@ -228,7 +229,8 @@ const SecurityPanel = ({ users }) => {
                                 d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
                         </svg>
                         <p className="text-sm text-amber-700">
-                            MFA is currently required for all staff logins. Users without MFA will be prompted to set it up on next login.
+                            MFA is currently required for all staff logins. Staff members without
+                            MFA will be prompted to set it up on next login. Patients are unaffected.
                         </p>
                     </div>
                 )}
@@ -250,7 +252,9 @@ const SecurityPanel = ({ users }) => {
                     <div>
                         <h3 className="text-base font-semibold text-gray-800">Staff MFA Status</h3>
                         <p className="text-sm text-gray-500">
-                            Manage MFA enforcement per user. "Force MFA" requires a specific user to set up MFA regardless of org policy.
+                            Manage MFA enforcement per staff member. "Force MFA" requires a specific
+                            user to set up MFA regardless of org policy. Patients are not listed here
+                            since they no longer use MFA.
                         </p>
                     </div>
                     <input

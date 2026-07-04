@@ -96,3 +96,34 @@ export const apiRateLimiter = rateLimit({
     legacyHeaders: false,
     store: makeRedisStore('api'),
 });
+
+// ─── OTP FEATURE: Registration OTP rate limiter ───────────────────────────────
+// Coarse IP-based guard on the request-otp/resend-otp endpoints, on top of
+// the fine-grained per-registrationId attempt lockout enforced inside
+// otpAuthController via recordOtpFailure/checkOtpLockout. This stops someone
+// from spinning up unlimited registration sessions from one IP to spam an
+// inbox or hammer the mailer.
+export const registerOtpRateLimiter = rateLimit({
+    validate: false,
+    windowMs: 15 * 60 * 1000,
+    max: 8,
+    message: {
+        message: 'Too many registration attempts from this IP. Please try again in 15 minutes.',
+    },
+    standardHeaders: true,
+    legacyHeaders: false,
+    store: makeRedisStore('register-otp'),
+});
+
+// ─── OTP FEATURE: Forgot-password rate limiter ────────────────────────────────
+export const forgotPasswordRateLimiter = rateLimit({
+    validate: false,
+    windowMs: 15 * 60 * 1000,
+    max: 8,
+    message: {
+        message: 'Too many password reset requests from this IP. Please try again in 15 minutes.',
+    },
+    standardHeaders: true,
+    legacyHeaders: false,
+    store: makeRedisStore('forgot-password'),
+});

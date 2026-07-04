@@ -3,6 +3,8 @@
  * ──────────────────────
  * Nodemailer transport factory.
  * P3D: Added 4 security email templates.
+ * OTP FEATURE: Added registrationOtp, forgotPasswordOtp,
+ * passwordResetConfirmed, welcomePatient templates.
  * All existing templates and sendMail() are preserved unchanged.
  */
 
@@ -60,6 +62,7 @@ const emailWrapper = (orgName, content) => `
     .badge-red { display: inline-block; background: #fee2e2; color: #991b1b; padding: 4px 12px; border-radius: 20px; font-size: 13px; font-weight: 600; }
     .alert { background: #fef3c7; border-left: 4px solid #f59e0b; padding: 12px 16px; border-radius: 4px; margin: 16px 0; }
     .alert-red { background: #fef2f2; border-left: 4px solid #ef4444; padding: 12px 16px; border-radius: 4px; margin: 16px 0; }
+    .otp-box { background: #111827; color: #34d399; font-family: 'Courier New', monospace; font-size: 32px; font-weight: 700; letter-spacing: 8px; text-align: center; padding: 20px; border-radius: 8px; margin: 20px 0; }
     .footer { color: #9ca3af; font-size: 12px; margin-top: 24px; text-align: center; }
   </style>
 </head>
@@ -68,7 +71,7 @@ const emailWrapper = (orgName, content) => `
     <div class="header">${orgName}</div>
     <hr class="divider">
     ${content}
-    <div class="footer">This is an automated security notification from ${orgName}. Please do not reply.</div>
+    <div class="footer">This is an automated notification from ${orgName}. Please do not reply.</div>
   </div>
 </body>
 </html>
@@ -137,9 +140,7 @@ export const templates = {
         `),
     }),
 
-    // ── P3D: Security email templates ──────────────────────────────────────────
-
-    // Sent to user after they successfully enable MFA on their account
+    // ── P3D: Security email templates (staff MFA — unchanged) ───────────────────
     mfaEnabled: ({ userName, org }) => ({
         subject: '✅ Two-Factor Authentication Enabled',
         html: emailWrapper(org?.name || 'CareConnect', `
@@ -166,7 +167,6 @@ export const templates = {
         `),
     }),
 
-    // Sent to user after they disable MFA
     mfaDisabled: ({ userName, org }) => ({
         subject: '⚠️ Two-Factor Authentication Disabled',
         html: emailWrapper(org?.name || 'CareConnect', `
@@ -188,7 +188,6 @@ export const templates = {
         `),
     }),
 
-    // Sent to affected user when admin resets their MFA enrollment
     mfaResetByAdmin: ({ userName, adminName, org }) => ({
         subject: '🔑 Your MFA Has Been Reset by an Administrator',
         html: emailWrapper(org?.name || 'CareConnect', `
@@ -213,7 +212,6 @@ export const templates = {
         `),
     }),
 
-    // Sent to user when admin forces MFA on their account
     adminForcedMfa: ({ userName, adminName, org }) => ({
         subject: '🔒 MFA Now Required for Your Account',
         html: emailWrapper(org?.name || 'CareConnect', `
@@ -233,6 +231,65 @@ export const templates = {
                     before your next login.
                 </p>
             </div>
+        `),
+    }),
+
+    // ── OTP FEATURE: new templates ───────────────────────────────────────────────
+
+    // Sent during patient self-registration, step 1.
+    registrationOtp: ({ name, otp, expiresInMinutes = 10, org }) => ({
+        subject: `Your verification code: ${otp}`,
+        html: emailWrapper(org?.name || 'CareConnect', `
+            <p style="color:#374151;font-size:15px;">Hi <strong>${name}</strong>,</p>
+            <p style="color:#374151;font-size:15px;">Use this code to finish creating your account:</p>
+            <div class="otp-box">${otp}</div>
+            <p style="color:#6b7280;font-size:13px;text-align:center;">This code expires in ${expiresInMinutes} minutes.</p>
+            <hr class="divider">
+            <p style="color:#6b7280;font-size:13px;">If you didn't try to create an account, you can safely ignore this email.</p>
+        `),
+    }),
+
+    // Sent for patient forgot-password flow, step 1.
+    forgotPasswordOtp: ({ name, otp, expiresInMinutes = 10, org }) => ({
+        subject: `Password reset code: ${otp}`,
+        html: emailWrapper(org?.name || 'CareConnect', `
+            <p style="color:#374151;font-size:15px;">Hi <strong>${name}</strong>,</p>
+            <p style="color:#374151;font-size:15px;">Use this code to reset your password:</p>
+            <div class="otp-box">${otp}</div>
+            <p style="color:#6b7280;font-size:13px;text-align:center;">This code expires in ${expiresInMinutes} minutes.</p>
+            <hr class="divider">
+            <p style="color:#dc2626;font-size:13px;">If you didn't request a password reset, you can safely ignore this email — your password will not be changed.</p>
+        `),
+    }),
+
+    // Sent after a patient completes a self-service password reset.
+    passwordResetConfirmed: ({ userName, org }) => ({
+        subject: 'Your Password Was Changed',
+        html: emailWrapper(org?.name || 'CareConnect', `
+            <p style="color:#374151;font-size:15px;">Dear <strong>${userName}</strong>,</p>
+            <p style="color:#374151;font-size:15px;">
+                <span class="badge-green">Password Updated</span>
+            </p>
+            <p style="color:#374151;font-size:15px;">Your account password was just changed. You'll need to sign in again with your new password.</p>
+            <hr class="divider">
+            <p style="color:#dc2626;font-size:13px;">If you didn't make this change, contact your hospital's front desk immediately.</p>
+        `),
+    }),
+
+    // Sent immediately after successful patient registration.
+    welcomePatient: ({ name, org }) => ({
+        subject: `Welcome to ${org?.name || 'CareConnect'}`,
+        html: emailWrapper(org?.name || 'CareConnect', `
+            <p style="color:#374151;font-size:15px;">Welcome, <strong>${name}</strong>!</p>
+            <p style="color:#374151;font-size:15px;">Your account has been created successfully. You can now:</p>
+            <ul style="color:#374151;font-size:14px;line-height:1.8;">
+                <li>Book appointments with our specialists</li>
+                <li>View your prescriptions and consultation history</li>
+                <li>Book health packages</li>
+                <li>Manage your profile</li>
+            </ul>
+            <hr class="divider">
+            <p style="color:#6b7280;font-size:13px;">We're glad to have you with us.</p>
         `),
     }),
 };

@@ -71,6 +71,12 @@ const organisationSchema = mongoose.Schema(
             healthPackages:   { type: Boolean, default: true  },
             patientPortal:    { type: Boolean, default: true  },
             analytics:        { type: Boolean, default: false },
+            // PATIENT MFA REMOVAL: this flag is interpreted as
+            // "require MFA for STAFF logins" (admin/super_admin/doctor/
+            // receptionist). It is never evaluated for patient logins — see
+            // the centralized bypass gate in authController.loginUser. Field
+            // name kept unchanged to avoid a migration; only its meaning and
+            // the admin UI copy (SecurityPanel.jsx) were updated.
             mfaRequired:      { type: Boolean, default: false },
         },
 
@@ -115,7 +121,6 @@ organisationSchema.virtual('isAccessible').get(function () {
 });
 
 // ── Indexes ───────────────────────────────────────────────────────────────────
-//organisationSchema.index({ slug:     1 }, { unique: true });
 organisationSchema.index({ isActive: 1 });
 organisationSchema.index({ deletedAt: 1 });
 

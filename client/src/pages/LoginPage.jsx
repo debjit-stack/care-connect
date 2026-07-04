@@ -25,14 +25,9 @@ const LoginPage = () => {
     const { login, isAuthenticated, user, completeLogin } = useAuth();
     const navigate = useNavigate();
 
-    // M1 FIX: navigating during render (as this used to do — calling
-    // navigate() directly in the component body when mfaStep === 'setup',
-    // then `return null`) is a React anti-pattern: it triggers a state
-    // update in the router while THIS component is still rendering, which
-    // React 19 / StrictMode can flag ("Cannot update a component while
-    // rendering a different component") and is fragile under double-invoked
-    // renders. The redirect is now a side effect in useEffect, keyed off
-    // mfaStep/mfaPending, so it only fires after render has committed.
+    // M1 FIX: the MFA-setup redirect runs in a useEffect (not during render)
+    // so it never triggers a router update while this component is still
+    // rendering.
     useEffect(() => {
         if (mfaStep === 'setup') {
             navigate(`/mfa-setup?required=true&mfaPending=${encodeURIComponent(mfaPending)}`, { replace: true });
@@ -55,6 +50,8 @@ const LoginPage = () => {
             // login() in AuthContext handles the normal success case
             // (sets accessToken in memory, sets user state).
             // If we get here without an MFA step, navigate to dashboard.
+            // NOTE: patients never trigger an MFA step at all — see the
+            // centralized patient bypass in authController.loginUser.
             navigate(DASHBOARD_ROUTES[loggedInUser.role] ?? '/', { replace: true });
         } catch (err) {
             const status  = err?.response?.status;
@@ -62,6 +59,7 @@ const LoginPage = () => {
 
             if (status === 200 && data?.mfaRequired) {
                 // Server returned 200 but requires MFA — not a real error
+                // (staff-only path; patients never hit this branch)
                 setMfaPending(data.mfaPending);
                 if (data.mfaSetupRequired) {
                     setMfaStep('setup');
@@ -142,10 +140,15 @@ const LoginPage = () => {
                     />
                 </div>
 
-                <div className="mb-6">
-                    <label className="block text-gray-700 text-sm font-bold mb-2" htmlFor="password">
-                        Password
-                    </label>
+                <div className="mb-2">
+                    <div className="flex items-center justify-between mb-2">
+                        <label className="block text-gray-700 text-sm font-bold" htmlFor="password">
+                            Password
+                        </label>
+                        <Link to="/forgot-password" className="text-xs text-blue-500 hover:underline">
+                            Forgot password?
+                        </Link>
+                    </div>
                     <input
                         id="password"
                         type="password"
@@ -161,7 +164,7 @@ const LoginPage = () => {
                 <button
                     type="submit"
                     disabled={loading}
-                    className="w-full bg-blue-500 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                    className="w-full mt-4 bg-blue-500 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
                 >
                     {loading ? 'Signing in…' : 'Sign In'}
                 </button>

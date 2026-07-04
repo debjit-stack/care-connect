@@ -8,6 +8,9 @@ const REFRESH_TOKEN_EXPIRES   = process.env.JWT_REFRESH_EXPIRES   || '7d';
 const REFRESH_TOKEN_TTL_SEC   = 7 * 24 * 60 * 60;
 // MFA-pending token is very short-lived — user has 5 minutes to enter their TOTP
 const MFA_PENDING_EXPIRES     = process.env.JWT_MFA_PENDING_EXPIRES || '5m';
+// Reset-pending token — issued after a forgot-password OTP is verified,
+// short-lived, single purpose (only usable against /auth/forgot-password/reset)
+const RESET_PENDING_EXPIRES   = process.env.JWT_RESET_PENDING_EXPIRES || '10m';
 
 // ─── Access token ─────────────────────────────────────────────────────────────
 export const generateAccessToken = (user) => {
@@ -42,6 +45,30 @@ export const verifyMfaPendingToken = (token) => {
     );
     if (!payload.mfaPending) {
         throw new Error('Not an MFA pending token');
+    }
+    return payload;
+};
+
+// ─── Reset-pending token (forgot-password flow) ──────────────────────────────
+// Issued only after the user has proven ownership of their email via OTP.
+// Single purpose: exchanged for a new password at /auth/forgot-password/reset.
+// Distinct secret from both JWT_SECRET and the MFA-pending secret so a leaked
+// reset token can never be replayed as an access or MFA token, and vice versa.
+export const generateResetPendingToken = (userId) => {
+    return jwt.sign(
+        { id: userId, resetPending: true },
+        process.env.JWT_RESET_PENDING_SECRET || process.env.JWT_SECRET + '_reset',
+        { expiresIn: RESET_PENDING_EXPIRES }
+    );
+};
+
+export const verifyResetPendingToken = (token) => {
+    const payload = jwt.verify(
+        token,
+        process.env.JWT_RESET_PENDING_SECRET || process.env.JWT_SECRET + '_reset'
+    );
+    if (!payload.resetPending) {
+        throw new Error('Not a reset pending token');
     }
     return payload;
 };

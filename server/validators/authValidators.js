@@ -1,10 +1,6 @@
 import { z } from 'zod';
-// M2 FIX: this file used to define its own copy of the validate() middleware
-// factory, duplicating the one in shared.js. Two copies meant a fix applied
-// to one (e.g. the earlier double-next() bug fix) could silently miss the
-// other. There is now exactly one implementation, re-exported from here so
-// existing imports (`import { validate } from './authValidators.js'`)
-// continue to work unchanged.
+// M2 FIX (carried over): single validate() implementation, re-exported from
+// shared.js rather than duplicated here.
 import { validate } from './shared.js';
 
 // ─── Reusable field definitions ───────────────────────────────────────────────
@@ -30,7 +26,17 @@ const nameSchema = z
     .max(100, 'Name must be under 100 characters')
     .regex(/^[a-zA-Z\s'-]+$/, 'Name may only contain letters, spaces, hyphens, and apostrophes');
 
-// ─── Route schemas ────────────────────────────────────────────────────────────
+const otpSchema = z
+    .string({ required_error: 'Code is required' })
+    .trim()
+    .regex(/^\d{6}$/, 'Code must be exactly 6 digits');
+
+const registrationIdSchema = z
+    .string({ required_error: 'registrationId is required' })
+    .trim()
+    .uuid('Invalid registrationId format');
+
+// ─── Route schemas — existing auth ────────────────────────────────────────────
 
 export const registerSchema = z.object({
     body: z.object({
@@ -55,6 +61,51 @@ export const changePasswordSchema = z.object({
         (data) => data.currentPassword !== data.newPassword,
         { message: 'New password must be different from current password', path: ['newPassword'] }
     ),
+});
+
+// ─── Route schemas — OTP FEATURE: patient registration ────────────────────────
+
+export const requestRegistrationOtpSchema = z.object({
+    body: z.object({
+        name:     nameSchema,
+        email:    emailSchema,
+        password: passwordSchema,
+    }),
+});
+
+export const verifyRegistrationOtpSchema = z.object({
+    body: z.object({
+        registrationId: registrationIdSchema,
+        otp:            otpSchema,
+    }),
+});
+
+export const resendRegistrationOtpSchema = z.object({
+    body: z.object({
+        registrationId: registrationIdSchema,
+    }),
+});
+
+// ─── Route schemas — OTP FEATURE: forgot password ─────────────────────────────
+
+export const forgotPasswordSchema = z.object({
+    body: z.object({
+        email: emailSchema,
+    }),
+});
+
+export const verifyForgotPasswordOtpSchema = z.object({
+    body: z.object({
+        email: emailSchema,
+        otp:   otpSchema,
+    }),
+});
+
+export const resetPasswordWithTokenSchema = z.object({
+    body: z.object({
+        resetToken:  z.string({ required_error: 'resetToken is required' }).trim().min(1),
+        newPassword: passwordSchema,
+    }),
 });
 
 // ─── Re-export the single validate() implementation ───────────────────────────
