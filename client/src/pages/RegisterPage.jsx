@@ -103,6 +103,13 @@ const RegisterPage = () => {
     };
 
     // ── Step 2: verify OTP → auto-login ─────────────────────────────────────────
+    // NEW-C2 FIX: accepts the digit array directly (passed by OtpInput's
+    // onComplete). Previously the auto-submit path called this with no
+    // argument and relied on `digits` React state that hadn't re-rendered
+    // yet at the moment onComplete fired synchronously — so it silently read
+    // a stale 5-digit value and no-opped on the length check. The manual
+    // "Verify" button still works either way since it reads state at click
+    // time (after render), which is why this bug was easy to miss.
     const handleVerify = useCallback(async (overrideDigits) => {
         const otp = (overrideDigits ?? digits).join('');
         if (otp.length !== 6) return;
@@ -188,7 +195,7 @@ const RegisterPage = () => {
                         <OtpInput
                             value={digits}
                             onChange={setDigits}
-                            onComplete={() => handleVerify()}
+                            onComplete={handleVerify}
                             disabled={otpLoading}
                         />
                     </div>

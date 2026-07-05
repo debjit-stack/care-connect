@@ -1,7 +1,11 @@
 import { z } from 'zod';
-// M2 FIX (carried over): single validate() implementation, re-exported from
-// shared.js rather than duplicated here.
-import { validate } from './shared.js';
+// B3 FIX: previously defined a LOCAL nameSchema here with regex
+// /^[a-zA-Z\s'-]+$/, while shared.js's nameField uses /^[a-zA-Z\s''-]+$/
+// (a different character class — note the curly-apostrophe variant). A name
+// valid at registration could be rejected on profile update, or vice versa.
+// Now importing the single nameField from shared.js so both use cases are
+// governed by the exact same rule.
+import { validate, nameField } from './shared.js';
 
 // ─── Reusable field definitions ───────────────────────────────────────────────
 
@@ -19,13 +23,6 @@ const passwordSchema = z
     .regex(/[0-9]/,        'Password must contain at least one number')
     .regex(/[^A-Za-z0-9]/, 'Password must contain at least one special character');
 
-const nameSchema = z
-    .string({ required_error: 'Name is required' })
-    .trim()
-    .min(2,   'Name must be at least 2 characters')
-    .max(100, 'Name must be under 100 characters')
-    .regex(/^[a-zA-Z\s'-]+$/, 'Name may only contain letters, spaces, hyphens, and apostrophes');
-
 const otpSchema = z
     .string({ required_error: 'Code is required' })
     .trim()
@@ -40,7 +37,7 @@ const registrationIdSchema = z
 
 export const registerSchema = z.object({
     body: z.object({
-        name:     nameSchema,
+        name:     nameField,
         email:    emailSchema,
         password: passwordSchema,
     }),
@@ -67,7 +64,7 @@ export const changePasswordSchema = z.object({
 
 export const requestRegistrationOtpSchema = z.object({
     body: z.object({
-        name:     nameSchema,
+        name:     nameField,
         email:    emailSchema,
         password: passwordSchema,
     }),

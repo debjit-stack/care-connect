@@ -51,8 +51,6 @@ const ForgotPasswordPage = () => {
     }, []);
 
     // ── Step 1: request OTP ─────────────────────────────────────────────────────
-    // The server always returns the same generic message regardless of whether
-    // the email exists (enumeration-safe) — we move to the OTP step either way.
     const handleEmailSubmit = async (e) => {
         e.preventDefault();
         setError('');
@@ -62,8 +60,6 @@ const ForgotPasswordPage = () => {
             setStep('otp');
             startCooldown();
         } catch {
-            // Even on an unexpected error, don't leak anything — just let the
-            // user retry from the same screen.
             setError('Something went wrong. Please try again.');
         } finally {
             setLoading(false);
@@ -71,6 +67,7 @@ const ForgotPasswordPage = () => {
     };
 
     // ── Step 2: verify OTP → get resetToken ─────────────────────────────────────
+    // NEW-C2 FIX: accepts the digit array directly, same fix as RegisterPage.
     const handleVerifyOtp = useCallback(async (overrideDigits) => {
         const otp = (overrideDigits ?? digits).join('');
         if (otp.length !== 6) return;
@@ -253,7 +250,7 @@ const ForgotPasswordPage = () => {
                         <OtpInput
                             value={digits}
                             onChange={setDigits}
-                            onComplete={() => handleVerifyOtp()}
+                            onComplete={handleVerifyOtp}
                             disabled={otpLoading}
                         />
                     </div>

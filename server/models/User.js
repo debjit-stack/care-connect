@@ -39,8 +39,6 @@ const userSchema = mongoose.Schema(
         lastMfaResetAt: { type: Date,    default: null },
 
         // P3C: Recovery codes — stored as bcrypt hashes, never plain text.
-        // Generated when MFA is enabled, consumed one-time during recovery.
-        // select: false so they are never returned in normal user queries.
         recoveryCodes: {
             type:   [{
                 codeHash: { type: String, required: true },
@@ -81,8 +79,24 @@ userSchema.virtual('isLocked').get(function () {
     return !!(this.lockUntil && this.lockUntil > Date.now());
 });
 
+// NEW-M1 FIX: the registration-OTP flow needs to create a User from a
+// password that was ALREADY bcrypt-hashed before being stored (briefly) in
+// the Redis pending-registration session — storing the plaintext password
+// in Redis for the OTP window was the actual bug being fixed. Setting
+// `user._preHashed = true` before `.save()` tells this hook "don't hash
+// again, this is already a bcrypt hash" for that one save call. The flag is
+// transient (not a schema field, never persisted) and is cleared
+// immediately after use so it can never accidentally suppress hashing on a
+// later legitimate password change.
 userSchema.pre('save', async function (next) {
     if (!this.isModified('password')) return next();
+
+    if (this._preHashed) {
+        this._preHashed = undefined;
+        if (!this.isNew) this.passwordChangedAt = new Date(Date.now() - 1000);
+        return next();
+    }
+
     const salt    = await bcrypt.genSalt(12);
     this.password = await bcrypt.hash(this.password, salt);
     if (!this.isNew) this.passwordChangedAt = new Date(Date.now() - 1000);

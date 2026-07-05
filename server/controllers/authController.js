@@ -1,5 +1,6 @@
-import User         from '../models/User.js';
-import Organisation from '../models/Organisation.js';
+import bcrypt        from 'bcryptjs';
+import User          from '../models/User.js';
+import Organisation  from '../models/Organisation.js';
 import {
     generateAccessToken,
     generateRefreshToken,
@@ -35,6 +36,13 @@ const REGISTRATION_RESEND_COOLDOWN_SECONDS = 60;
 const REGISTRATION_MAX_RESENDS = 5;
 const FORGOT_PASSWORD_OTP_TTL_SECONDS = 10 * 60;
 const FORGOT_PASSWORD_RESEND_COOLDOWN_SECONDS = 60;
+
+// NEW-L1: a fixed, precomputed bcrypt hash used ONLY to burn roughly the same
+// amount of CPU time as a real bcrypt.compare() when no session/user exists,
+// so "wrong code" and "no such account" responses take a similar amount of
+// time. This is not a secret and matches no real OTP.
+const DUMMY_BCRYPT_HASH = '$2a$10$CwTycUXWue0Thq9StjUM0uJ8xkO/tCiOSk.tE/1x3AbHqjRw9kAmy';
+const burnTimingBudget = () => bcrypt.compare('0'.repeat(6), DUMMY_BCRYPT_HASH);
 
 // ─── Safe user payload ────────────────────────────────────────────────────────
 const safeUser = (user, org) => ({
@@ -75,10 +83,6 @@ const resolveOrgFromRequest = async (req) => {
 };
 
 // ─── Shared: issue tokens + respond for a fully-authenticated user ───────────
-// PATIENT MFA REMOVAL: this is the single normal-login code path. It's used
-// both by the patient bypass below AND by the tail end of the staff MFA
-// decision tree once no MFA step applies. Extracting it here means "skip MFA"
-// is one function call, not duplicated inline logic.
 const issueLoginResponse = async (res, req, user, org) => {
     const accessToken  = generateAccessToken(user);
     const refreshToken = await generateRefreshToken(user._id);
@@ -93,12 +97,22 @@ const issueLoginResponse = async (res, req, user, org) => {
     return res.status(200).json({ user: safeUser(user, org), accessToken });
 };
 
+// ─── Helper: create a patient User from an already-hashed password ──────────
+// NEW-M1 FIX: used by verifyRegistrationOtp. The pending Redis session now
+// stores a bcrypt hash (never plaintext), so creation here must NOT let the
+// User model's pre-save hook hash it a second time — that would corrupt the
+// password (double-hashed values never match on login). The transient
+// `_preHashed` flag (see User.js) tells the hook to skip hashing exactly once.
+const createPatientFromHashedPassword = async ({ name, email, passwordHash }) => {
+    const user = new User({ name, email, password: passwordHash, role: 'patient' });
+    user._preHashed = true;
+    await user.save();
+    return user;
+};
+
 // ─── POST /api/auth/register ──────────────────────────────────────────────────
-// NOTE: This direct (non-OTP) registration endpoint is left in place for API
-// integrations / backwards compatibility. The web frontend now uses the
-// OTP-based flow below (request-otp → verify-otp) for patient self-service
-// registration. Admin/receptionist patient creation is unaffected — those
-// flows live in receptionistController.js and never touch this endpoint.
+// Direct (non-OTP) registration endpoint, left in place for API integrations.
+// The web frontend uses the OTP-based flow below.
 const registerUser = async (req, res) => {
     try {
         const { name, email, password } = req.body;
@@ -146,8 +160,6 @@ const registerUser = async (req, res) => {
 // ────────────────────────────────────────────────────────────────────────────
 // OTP FEATURE: Patient self-registration (request-otp → verify-otp → resend)
 // ────────────────────────────────────────────────────────────────────────────
-// No User document is created until the OTP is verified — avoids unverified
-// junk accounts in Mongo. Pending state lives in Redis with a 10-minute TTL.
 
 // ─── POST /api/auth/register/request-otp ──────────────────────────────────────
 const requestRegistrationOtp = async (req, res) => {
@@ -167,17 +179,20 @@ const requestRegistrationOtp = async (req, res) => {
         const exists = await User.findOne(existsFilter).skipTenantFilter();
         if (exists) return res.status(409).json({ message: 'An account with this email already exists' });
 
-        const otp        = generateOtp();
-        const otpHash     = await hashOtp(otp);
-        // Password is hashed at User-creation time by the schema's pre-save
-        // hook (bcrypt) — here we only need to carry it through Redis until
-        // verification, so it's stored as-is in the pending session (Redis is
-        // not exposed externally and the session is short-lived + deleted on
-        // use). We do NOT persist the plaintext password anywhere in Mongo.
+        const otp     = generateOtp();
+        const otpHash = await hashOtp(otp);
+
+        // NEW-M1 FIX: hash the password NOW, before it ever touches Redis.
+        // Previously the plaintext password was stored in the pending
+        // session for up to 10 minutes — this hashes it up front using the
+        // same bcrypt cost factor as the User model, and the plaintext is
+        // never persisted anywhere.
+        const passwordHash = await bcrypt.hash(password, 12);
+
         const { id: registrationId, expiresIn } = await createSession('register', {
             name,
             email,
-            password,
+            passwordHash,
             otpHash,
             organisationId: orgId ? orgId.toString() : null,
             attempts:      0,
@@ -227,14 +242,21 @@ const resendRegistrationOtp = async (req, res) => {
         const otp     = generateOtp();
         const otpHash = await hashOtp(otp);
 
+        // NEW-M2 FIX: explicitly restart the full TTL window on resend — a
+        // freshly-sent code should be valid for the full window, not
+        // whatever time happened to be left on the old session.
         await patchSession('register', registrationId, {
             otpHash,
             resendCount: session.resendCount + 1,
             lastSentAt:  Date.now(),
-        });
-        // Reset any prior failed-attempt lockout for this session on resend —
-        // a fresh code deserves a fresh attempt counter.
-        await clearOtpFailures(`register:${registrationId}`);
+        }, { ttlSeconds: REGISTRATION_OTP_TTL_SECONDS });
+
+        // NEW-C1 FIX: do NOT clear the failed-attempt lockout counter here.
+        // The previous behavior let anyone reset their attempt budget to
+        // zero simply by requesting a new code once the 60s cooldown
+        // elapsed — defeating the 5-attempt lockout entirely. A resend now
+        // only refreshes the code and its TTL; the lockout counter is only
+        // ever cleared on a SUCCESSFUL verification.
 
         const org = session.organisationId ? await Organisation.findById(session.organisationId) : null;
         sendMail({
@@ -278,9 +300,6 @@ const verifyRegistrationOtp = async (req, res) => {
 
         await clearOtpFailures(`register:${registrationId}`);
 
-        // Re-check email uniqueness at the last moment (covers the edge case
-        // where someone else registered the same email while this OTP session
-        // was pending).
         const orgId = session.organisationId || null;
         const existsFilter = orgId
             ? { email: session.email, organisationId: orgId, deletedAt: null }
@@ -294,19 +313,17 @@ const verifyRegistrationOtp = async (req, res) => {
         let user;
         if (orgId) {
             await runWithTenant(orgId, async () => {
-                user = await User.create({
-                    name:     session.name,
-                    email:    session.email,
-                    password: session.password,
-                    role:     'patient',
+                user = await createPatientFromHashedPassword({
+                    name:         session.name,
+                    email:        session.email,
+                    passwordHash: session.passwordHash,
                 });
             });
         } else {
-            user = await User.create({
-                name:     session.name,
-                email:    session.email,
-                password: session.password,
-                role:     'patient',
+            user = await createPatientFromHashedPassword({
+                name:         session.name,
+                email:        session.email,
+                passwordHash: session.passwordHash,
             });
         }
 
@@ -314,7 +331,6 @@ const verifyRegistrationOtp = async (req, res) => {
 
         const org = orgId ? await Organisation.findById(orgId) : null;
 
-        // Auto-login — ease-of-onboarding requirement.
         const accessToken  = generateAccessToken(user);
         const refreshToken = await generateRefreshToken(user._id);
         setRefreshCookie(res, refreshToken);
@@ -325,7 +341,6 @@ const verifyRegistrationOtp = async (req, res) => {
             meta:      { event: 'registration_otp', orgId: orgId?.toString() ?? null },
         });
 
-        // Welcome email — fire-and-forget, not required for the response.
         sendMail({
             to:  user.email,
             org,
@@ -343,12 +358,10 @@ const verifyRegistrationOtp = async (req, res) => {
 // OTP FEATURE: Forgot password (request-otp → verify-otp → reset)
 // ────────────────────────────────────────────────────────────────────────────
 
-// ─── POST /api/auth/forgot-password ───────────────────────────────────────────
-// Always returns the same generic response regardless of whether the email
-// exists, to avoid account enumeration.
 const GENERIC_FORGOT_PASSWORD_MESSAGE =
     'If an account with that email exists, a verification code has been sent.';
 
+// ─── POST /api/auth/forgot-password ───────────────────────────────────────────
 const forgotPassword = async (req, res) => {
     try {
         const { email } = req.body;
@@ -364,9 +377,6 @@ const forgotPassword = async (req, res) => {
             const otp     = generateOtp();
             const otpHash = await hashOtp(otp);
 
-            // Keyed by userId (not a random uuid) so verify-forgot-password-otp
-            // can look the session up again by re-resolving email → user,
-            // without ever handing the client an internal session identifier.
             await createSession('forgot', {
                 userId: user._id.toString(),
                 otpHash,
@@ -388,17 +398,23 @@ const forgotPassword = async (req, res) => {
                 }),
             });
 
-            audit(req, 'AUTH_LOGIN_FAILED', {
+            // NEW-M3 FIX: this event was previously logged as
+            // AUTH_LOGIN_FAILED with success:true, which is self-
+            // contradictory in the audit trail. It now has its own,
+            // accurately-named action.
+            audit(req, 'AUTH_PASSWORD_RESET_REQUESTED', {
                 actorId: user._id, actorRole: user.role, success: true,
-                meta: { event: 'forgot_password_requested' },
             });
+        } else {
+            // NEW-L1: burn roughly the same amount of time as the
+            // hash-and-send path above so response timing doesn't hint at
+            // whether the email exists.
+            await burnTimingBudget();
         }
 
         return res.status(200).json({ message: GENERIC_FORGOT_PASSWORD_MESSAGE });
     } catch (err) {
         console.error('[Auth] forgotPassword:', err.message);
-        // Still return the generic message — don't leak errors that could
-        // hint at account existence via response shape/timing.
         return res.status(200).json({ message: GENERIC_FORGOT_PASSWORD_MESSAGE });
     }
 };
@@ -413,7 +429,6 @@ const resendForgotPasswordOtp = async (req, res) => {
             : { email, deletedAt: null };
         const user = await User.findOne(userFilter).skipTenantFilter();
 
-        // Same generic response whether or not the user/session exists.
         if (user) {
             const session = await getSession('forgot', user._id.toString());
             if (session) {
@@ -421,8 +436,16 @@ const resendForgotPasswordOtp = async (req, res) => {
                 if (secondsSinceLastSend >= FORGOT_PASSWORD_RESEND_COOLDOWN_SECONDS) {
                     const otp     = generateOtp();
                     const otpHash = await hashOtp(otp);
-                    await patchSession('forgot', user._id.toString(), { otpHash, lastSentAt: Date.now() });
-                    await clearOtpFailures(`forgot:${user._id.toString()}`);
+
+                    // NEW-M2 FIX: restart the full TTL window on resend.
+                    await patchSession('forgot', user._id.toString(), {
+                        otpHash,
+                        lastSentAt: Date.now(),
+                    }, { ttlSeconds: FORGOT_PASSWORD_OTP_TTL_SECONDS });
+
+                    // NEW-C1 FIX: do NOT clear the OTP failure/lockout
+                    // counter on resend — see the identical fix note in
+                    // resendRegistrationOtp above.
 
                     const userOrg = user.organisationId ? await Organisation.findById(user.organisationId) : org;
                     sendMail({
@@ -437,6 +460,8 @@ const resendForgotPasswordOtp = async (req, res) => {
                     });
                 }
             }
+        } else {
+            await burnTimingBudget();
         }
 
         return res.status(200).json({ message: GENERIC_FORGOT_PASSWORD_MESSAGE });
@@ -457,7 +482,12 @@ const verifyForgotPasswordOtp = async (req, res) => {
         const user = await User.findOne(userFilter).skipTenantFilter();
 
         const GENERIC_INVALID = { status: 401, message: 'Invalid or expired code.' };
-        if (!user) return res.status(GENERIC_INVALID.status).json({ message: GENERIC_INVALID.message });
+
+        if (!user) {
+            // NEW-L1: equalize timing with the "user exists, wrong OTP" path.
+            await burnTimingBudget();
+            return res.status(GENERIC_INVALID.status).json({ message: GENERIC_INVALID.message });
+        }
 
         const lockoutKey = `forgot:${user._id.toString()}`;
         const lockout = await checkOtpLockout(lockoutKey);
@@ -467,7 +497,10 @@ const verifyForgotPasswordOtp = async (req, res) => {
         }
 
         const session = await getSession('forgot', user._id.toString());
-        if (!session) return res.status(GENERIC_INVALID.status).json({ message: GENERIC_INVALID.message });
+        if (!session) {
+            await burnTimingBudget();
+            return res.status(GENERIC_INVALID.status).json({ message: GENERIC_INVALID.message });
+        }
 
         const isValid = await verifyOtpHash(otp, session.otpHash);
         if (!isValid) {
@@ -492,9 +525,6 @@ const verifyForgotPasswordOtp = async (req, res) => {
 };
 
 // ─── POST /api/auth/forgot-password/reset ─────────────────────────────────────
-// Deliberately does NOT auto-login — a fresh normal login is required after
-// this security-sensitive action, consistent with the admin-triggered
-// resetPassword flow.
 const resetPasswordWithToken = async (req, res) => {
     try {
         const { resetToken, newPassword } = req.body;
@@ -556,16 +586,10 @@ const sendMfaChallenge = (
 
 
 // ─── POST /api/auth/login ─────────────────────────────────────────────────────
-// PATIENT MFA REMOVAL: patients now bypass the entire MFA decision tree via a
-// single centralized gate right after password verification / lockout reset.
-// - org.features.mfaRequired is now interpreted as "require MFA for staff"
-//   (see Organisation.js comment + SecurityPanel.jsx copy) — it is simply
-//   never evaluated for a patient login.
-// - Existing patient mfaEnabled/mfaSecret/recoveryCodes fields are left
-//   completely untouched (no migration). If patient MFA is ever reintroduced,
-//   removing this early-return is the only change needed.
-// - Staff (admin/super_admin/doctor/receptionist) MFA behavior is 100%
-//   unchanged below this gate.
+// PATIENT MFA REMOVAL: patients bypass the entire MFA decision tree via a
+// single centralized gate right after password verification. Staff behavior
+// is unchanged below that gate. See Organisation.js / SecurityPanel.jsx for
+// the "mfaRequired = staff-only" reinterpretation.
 const loginUser = async (req, res) => {
     try {
         const { email, password } = req.body;
@@ -623,73 +647,29 @@ const loginUser = async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────
 // Enterprise MFA Decision Tree (STAFF ONLY from here down)
-// Priority:
-// 1. Organisation Policy (staff-scoped)
-// 2. User Force MFA
-// 3. User Voluntary MFA
 // ─────────────────────────────────────────────────────────────────────
 
         const orgMfaRequired = org?.features?.mfaRequired ?? false;
         const forceMfa = Boolean(user.forceMfa);
 
-        // ----------------------------------------------------
-        // CASE 1
-        // Organisation requires MFA (staff)
-        // ----------------------------------------------------
         if (orgMfaRequired) {
             if (user.mfaEnabled) {
-                return sendMfaChallenge(
-                    res,
-                    user._id,
-                    false,
-                    "Please enter your authenticator code."
-                );
+                return sendMfaChallenge(res, user._id, false, "Please enter your authenticator code.");
             }
-
-            return sendMfaChallenge(
-                res,
-                user._id,
-                true,
-                "Your organisation requires MFA."
-            );
+            return sendMfaChallenge(res, user._id, true, "Your organisation requires MFA.");
         }
 
-        // ----------------------------------------------------
-        // CASE 2
-        // Admin forced MFA for this user
-        // ----------------------------------------------------
         if (forceMfa) {
             if (user.mfaEnabled) {
-                return sendMfaChallenge(
-                    res,
-                    user._id,
-                    false,
-                    "Please enter your authenticator code."
-                );
+                return sendMfaChallenge(res, user._id, false, "Please enter your authenticator code.");
             }
-
-            return sendMfaChallenge(
-                res,
-                user._id,
-                true,
-                "Your organisation requires MFA."
-            );
+            return sendMfaChallenge(res, user._id, true, "Your organisation requires MFA.");
         }
 
-        // ----------------------------------------------------
-        // CASE 3
-        // User voluntarily enabled MFA
-        // ----------------------------------------------------
         if (user.mfaEnabled) {
-            return sendMfaChallenge(
-                res,
-                user._id,
-                false,
-                "Please enter your authenticator code."
-            );
+            return sendMfaChallenge(res, user._id, false, "Please enter your authenticator code.");
         }
 
-        // ── Normal login (no MFA) ─────────────────────────────────────────────
         return issueLoginResponse(res, req, user, org);
     } catch (err) {
         console.error('[Auth] loginUser:', err.message);
@@ -802,7 +782,6 @@ const getMe = async (req, res) => {
 export {
     registerUser, loginUser, refreshAccessToken,
     logoutUser, logoutAllDevices, changePassword, getMe,
-    // OTP FEATURE
     requestRegistrationOtp, resendRegistrationOtp, verifyRegistrationOtp,
     forgotPassword, resendForgotPasswordOtp, verifyForgotPasswordOtp, resetPasswordWithToken,
 };

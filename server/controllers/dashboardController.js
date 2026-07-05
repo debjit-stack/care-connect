@@ -5,8 +5,6 @@ import PackageBooking from '../models/PackageBooking.js';
 import HealthPackage  from '../models/HealthPackage.js';
 
 // ─── GET /api/dashboard/stats ─────────────────────────────────────────────────
-// Extended to include all chart data alongside existing KPI shape.
-// Existing response fields are preserved exactly — additive only.
 const getDashboardStats = async (req, res) => {
     try {
         const orgId = req.orgId;
@@ -47,10 +45,16 @@ const getDashboardStats = async (req, res) => {
         // ── WS3: New chart aggregations ───────────────────────────────────────
 
         // 1. Appointments by month (last 12 months) — line chart
+        // B8 FIX: setHours (local server time) → setUTCHours. All stored
+        // dates in this app are UTC (see Appointment.appointmentDate, always
+        // constructed as `${date}T00:00:00Z`). Using local time here made the
+        // 12-month window boundary drift by the server's UTC offset on any
+        // non-UTC host — a real (if subtle) bug even though Render defaults
+        // to UTC and masks it in production today.
         const twelveMonthsAgo = new Date();
         twelveMonthsAgo.setMonth(twelveMonthsAgo.getMonth() - 11);
         twelveMonthsAgo.setDate(1);
-        twelveMonthsAgo.setHours(0, 0, 0, 0);
+        twelveMonthsAgo.setUTCHours(0, 0, 0, 0);
 
         const appointmentsByMonth = await Appointment.aggregate([
             { $match: { organisationId: orgId, appointmentDate: { $gte: twelveMonthsAgo } } },
@@ -114,10 +118,11 @@ const getDashboardStats = async (req, res) => {
         ]);
 
         // 7. New patients per month (last 6 months) — line chart
+        // B8 FIX: same setHours → setUTCHours correction.
         const sixMonthsAgo = new Date();
         sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 5);
         sixMonthsAgo.setDate(1);
-        sixMonthsAgo.setHours(0, 0, 0, 0);
+        sixMonthsAgo.setUTCHours(0, 0, 0, 0);
 
         const newPatientsByMonth = await User.aggregate([
             { $match: { organisationId: orgId, role: 'patient', deletedAt: null, createdAt: { $gte: sixMonthsAgo } } },
@@ -127,10 +132,8 @@ const getDashboardStats = async (req, res) => {
         ]);
 
         res.json({
-            // ── Preserved existing shape ───────────────────────────────────────
             kpi: { totalPatients, totalDoctors, totalAppointments, totalRevenue },
             recentActivity: { newPatientsLast30Days, recentAppointments },
-            // ── WS3: Extended chart data ───────────────────────────────────────
             charts: {
                 appointmentsByMonth,
                 appointmentsByStatus,
@@ -148,9 +151,6 @@ const getDashboardStats = async (req, res) => {
 };
 
 // ─── GET /api/dashboard/export ────────────────────────────────────────────────
-// CSV export of appointments within a date range.
-// Query params: from=YYYY-MM-DD, to=YYYY-MM-DD (both required)
-// Returns: CSV attachment
 const exportAppointments = async (req, res) => {
     try {
         const { from, to } = req.query;
@@ -183,7 +183,6 @@ const exportAppointments = async (req, res) => {
             .sort({ appointmentDate: 1, appointmentTime: 1 })
             .lean();
 
-        // Build CSV
         const MONTH_NAMES = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
 
         const formatDate = (d) => {

@@ -23,7 +23,13 @@ const env = {
 
     MFA_ENCRYPTION_KEY: required('MFA_ENCRYPTION_KEY'),
 
-    REDIS_URL: required('REDIS_URL'),
+    // B12 FIX: this was previously required('REDIS_URL'), which threw at
+    // import time if REDIS_URL wasn't set — before redis.js's local fallback
+    // (127.0.0.1:6379 with optional REDIS_HOST/PORT/USERNAME/PASSWORD) ever
+    // got a chance to run. That made it impossible to start the server
+    // locally without a Redis Cloud URL. REDIS_URL is now optional here;
+    // redis.js's own fallback logic decides what to connect to.
+    REDIS_URL: process.env.REDIS_URL || null,
 
     NODE_ENV: process.env.NODE_ENV || 'development',
 };

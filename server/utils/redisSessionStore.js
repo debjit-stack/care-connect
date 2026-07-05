@@ -8,12 +8,7 @@
  *   - forgot-password OTP flow   (prefix: 'forgot')
  *
  * NOT used by mfaSetupStore.js — that file is live, working, staff-only
- * code and is intentionally left untouched by this feature. A future
- * cleanup pass could migrate it onto this generic store, but that's a
- * separate refactor with its own review, not bundled here.
- *
- * Session shape is caller-defined; this module only handles the
- * get/set/patch/delete/TTL mechanics.
+ * code and is intentionally left untouched by this feature.
  */
 
 import { v4 as uuidv4 } from 'uuid';
@@ -50,11 +45,20 @@ export const getSession = async (prefix, id) => {
 };
 
 /**
- * Merges `patch` into the existing session and rewrites it, optionally
- * resetting the TTL (pass the same ttlSeconds used at creation to refresh,
- * or omit to preserve the current remaining TTL).
+ * Merges `patch` into the existing session and rewrites it.
+ *
+ * NEW-M2 FIX: `ttlSeconds` is now a REQUIRED, explicit choice at every call
+ * site rather than an optional "preserve current TTL if omitted" default.
+ * The previous implicit-preserve behavior meant a "resend code" action
+ * (which should restart the full validity window for the new code) silently
+ * kept whatever time was left on the OLD session — so a code resent near
+ * the end of a 10-minute window could expire almost immediately. Every
+ * caller must now say what it wants:
+ *   - resend flows: pass the full TTL constant (restart the clock)
+ *   - minor in-place updates that shouldn't extend validity: pass
+ *     `preserveTtl: true` to explicitly keep the current remaining TTL.
  */
-export const patchSession = async (prefix, id, patch, ttlSeconds = null) => {
+export const patchSession = async (prefix, id, patch, { ttlSeconds, preserveTtl = false } = {}) => {
     const redis = getRedisClient();
     const redisKey = key(prefix, id);
     const existing = await getSession(prefix, id);
@@ -62,11 +66,14 @@ export const patchSession = async (prefix, id, patch, ttlSeconds = null) => {
 
     const updated = { ...existing, ...patch };
 
-    if (ttlSeconds) {
-        await redis.set(redisKey, JSON.stringify(updated), 'EX', ttlSeconds);
-    } else {
+    if (preserveTtl) {
         const ttl = await redis.ttl(redisKey);
         await redis.set(redisKey, JSON.stringify(updated), 'EX', ttl > 0 ? ttl : 60);
+    } else {
+        if (!ttlSeconds) {
+            throw new Error('patchSession: ttlSeconds is required unless preserveTtl is true');
+        }
+        await redis.set(redisKey, JSON.stringify(updated), 'EX', ttlSeconds);
     }
 
     return updated;

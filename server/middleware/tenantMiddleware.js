@@ -2,9 +2,9 @@ import Organisation from '../models/Organisation.js';
 import { runWithTenant } from '../plugins/tenantPlugin.js';
 
 // ── Paths that bypass tenant resolution completely ────────────────────────────
-// isPublicPath() is METHOD-AWARE (see prior fix notes): every public entry
-// declares which HTTP method(s) it applies to, so a mutating route added
-// under a "public" prefix never inherits the bypass by accident.
+// isPublicPath() is METHOD-AWARE: every public entry declares which HTTP
+// method(s) it applies to, so a mutating route added under a "public" prefix
+// never inherits the bypass by accident.
 
 // Exact-match public routes: { method, path }
 const PUBLIC_EXACT = [
@@ -14,15 +14,25 @@ const PUBLIC_EXACT = [
     { method: 'POST', path: '/api/auth/logout' },
     { method: 'POST', path: '/api/auth/logout-all' },
     { method: 'GET',  path: '/api/health' },
-    // /validate and /recover both use an mfaPending JWT in the request body,
-    // not an access token — they resolve their own user context from the
-    // pending token, so no X-Organisation-Slug is required from the client.
+
+    // MFA pending-token routes: all four authenticate via the short-lived
+    // mfaPending JWT (as a Bearer header for setup/verify-setup, or in the
+    // request body for validate/recover) — they resolve their own user
+    // context from that token and never need an X-Organisation-Slug header.
+    // B6 FIX: /mfa/setup and /mfa/verify-setup were missing from this list.
+    // In any multi-org deployment where the client doesn't send an org slug
+    // header (a very plausible situation — different tab, cleared session
+    // storage, etc.), these two routes would 400 with "Organisation not
+    // specified" before ever reaching requireMfaPending/the controller,
+    // breaking staff MFA setup entirely outside single-org deployments.
+    { method: 'GET',  path: '/api/auth/mfa/setup' },
+    { method: 'POST', path: '/api/auth/mfa/verify-setup' },
     { method: 'POST', path: '/api/auth/mfa/validate' },
     { method: 'POST', path: '/api/auth/mfa/recover' },
 
-    // OTP FEATURE: these all resolve org internally via resolveOrgFromRequest
-    // (same pattern as the existing /register endpoint above), and none of
-    // them require an authenticated session — they ARE the pre-auth flows.
+    // OTP FEATURE: patient self-registration / forgot-password — resolve org
+    // internally (same pattern as /register above) and are the pre-auth
+    // flows themselves, so no authenticated session or org header applies.
     { method: 'POST', path: '/api/auth/register/request-otp' },
     { method: 'POST', path: '/api/auth/register/resend-otp' },
     { method: 'POST', path: '/api/auth/register/verify-otp' },

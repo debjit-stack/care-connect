@@ -3,15 +3,24 @@ import React, { useRef, useEffect } from 'react';
 /**
  * OtpInput
  * ────────
- * Six-digit code entry, shared by RegisterPage, ForgotPasswordPage, and (in
- * spirit) MFAVerifyStep's TOTP box. Extracted here so the paste/backspace/
- * auto-focus/auto-submit behavior lives in one place instead of being
- * copy-pasted across every OTP screen this feature adds.
+ * Six-digit code entry, shared by RegisterPage and ForgotPasswordPage.
+ *
+ * NEW-C2 FIX: `onComplete` now receives the completed digit array as its
+ * argument — e.g. `onComplete(['1','2','3','4','5','6'])`. Previously it was
+ * called with no arguments, and callers wired it as `() => handleVerify()`,
+ * where `handleVerify` read `digits` from the PARENT's React state via
+ * closure. Because `onComplete` fired synchronously inside the same
+ * onChange/paste handler that calls `onChange(next)`, the parent's state
+ * update hadn't committed/re-rendered yet — so `handleVerify` ran against
+ * the previous (5-digit) value and silently no-opped on its length check.
+ * Auto-submit looked broken even though the manual "Verify" button worked
+ * fine (it reads state at click time, after render). Passing the array
+ * directly removes the dependency on stale closures entirely.
  *
  * Props:
  *   value        — array of 6 strings, e.g. ['1','2','3','4','5','6']
  *   onChange     — (nextValueArray) => void
- *   onComplete   — () => void, called once when all 6 digits are filled
+ *   onComplete   — (completedValueArray) => void, called once all 6 digits are filled
  *   disabled     — boolean
  *   autoFocus    — boolean, focuses the first box on mount (default true)
  */
@@ -29,7 +38,7 @@ const OtpInput = ({ value, onChange, onComplete, disabled = false, autoFocus = t
                 const next = cleaned.split('');
                 onChange(next);
                 inputRefs.current[5]?.focus();
-                onComplete?.();
+                onComplete?.(next);
                 return;
             }
         }
@@ -40,7 +49,7 @@ const OtpInput = ({ value, onChange, onComplete, disabled = false, autoFocus = t
         onChange(next);
 
         if (digit && index < 5) inputRefs.current[index + 1]?.focus();
-        if (digit && index === 5 && next.every((d) => d)) onComplete?.();
+        if (digit && index === 5 && next.every((d) => d)) onComplete?.(next);
     };
 
     const handleKeyDown = (index, e) => {

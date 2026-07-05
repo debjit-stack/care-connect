@@ -23,13 +23,18 @@ dotenv.config();
 
 await connectDB();
 
+// B1/B2 FIX: redis.js already registers 'connect', 'ready', 'reconnecting',
+// 'end', and 'error' listeners on the shared client. This used to be
+// duplicated here (extra 'connect'/'ready' in the try block, extra 'error'
+// in the catch block), so every event logged twice and the catch block's
+// listener registration served no purpose before process.exit(1) ran.
+// redis.js owns all event logging now — this block only decides whether to
+// exit the process on a failed initial connection.
 const redis = getRedisClient();
 try {
     await redis.connect();
-    redis.on('connect', () => console.log('[Redis] connected'));
-    redis.on('ready',   () => console.log('[Redis] ready'));
 } catch (err) {
-    redis.on('error', (e) => console.error('[Redis]', e.message));
+    console.error('[Redis] Failed to connect on startup:', err.message);
     process.exit(1);
 }
 

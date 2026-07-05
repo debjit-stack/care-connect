@@ -44,11 +44,28 @@ const tenantPlugin = (schema) => {
         });
     });
 
+    // B5 FIX: several controllers (dashboardController.js's aggregations, in
+    // particular) already put `{ $match: { organisationId: orgId } }` as the
+    // first stage of their own pipeline before calling .aggregate(). This
+    // hook used to unconditionally unshift ANOTHER identical $match ahead of
+    // it — harmless to MongoDB's query planner, but redundant and confusing
+    // to read/debug. Now it only injects one if the pipeline doesn't already
+    // start with a matching organisationId filter.
     schema.pre('aggregate', function () {
         if (this.options?._skipTenantFilter) return;
         const orgId = getCurrentOrgId();
         if (!orgId) return;
-        this.pipeline().unshift({ $match: { organisationId: orgId } });
+
+        const pipeline = this.pipeline();
+        const firstStageMatch = pipeline[0]?.$match;
+        const alreadyScoped =
+            firstStageMatch &&
+            Object.prototype.hasOwnProperty.call(firstStageMatch, 'organisationId') &&
+            String(firstStageMatch.organisationId) === String(orgId);
+
+        if (alreadyScoped) return;
+
+        pipeline.unshift({ $match: { organisationId: orgId } });
     });
 
     schema.statics.withOrg = function (orgId) {

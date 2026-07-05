@@ -25,6 +25,12 @@ const auditLogSchema = mongoose.Schema(
                 'AUTH_PASSWORD_CHANGED',
                 'AUTH_ACCOUNT_LOCKED',
 
+                // NEW-M3: dedicated event for "user requested a forgot-password
+                // OTP" — this used to be (incorrectly) logged as
+                // AUTH_LOGIN_FAILED with success:true, which is self-
+                // contradictory and confusing in a compliance audit trail.
+                'AUTH_PASSWORD_RESET_REQUESTED',
+
                 // ── MFA ────────────────────────────────────────────────────────
                 'AUTH_MFA_SETUP_STARTED',
                 'AUTH_MFA_SETUP_COMPLETED',
@@ -32,7 +38,6 @@ const auditLogSchema = mongoose.Schema(
                 'AUTH_MFA_DISABLED',
 
                 // ── Security administration ────────────────────────────────────
-                // Used by adminSecurityController.js
                 'SECURITY_POLICY_UPDATED',
                 'SECURITY_USER_VIEWED',
                 'SECURITY_FORCE_MFA_UPDATED',
