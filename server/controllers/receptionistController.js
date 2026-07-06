@@ -9,11 +9,34 @@ import { sendMail, templates } from '../utils/mailer.js';
 import { validateBookingSlot } from '../utils/bookingValidation.js';
 
 // ─── POST /api/receptionist/register-patient ─────────────────────────────────
+// PHASE5-L2 FIX: the existence/restore check below previously ran
+// `User.findOne({ email }).skipTenantFilter()` — fully global, with NO
+// organisationId in the filter at all. This caused two distinct bugs:
+//
+//   1. Cross-tenant restore: if a patient with this email was soft-deleted
+//      in a DIFFERENT organisation, this lookup would match that deleted
+//      record and the code below would restore it — reactivating another
+//      org's patient data, invisible to that org, triggered by an
+//      unrelated org's receptionist action. organisationId was never
+//      touched by the restore branch, compounding the confusion.
+//   2. False conflict: the compound (email, organisationId) unique index
+//      on User exists specifically so the same email CAN belong to
+//      different orgs' patients. This global check returned 409 "already
+//      exists" whenever ANY org had that email active, even when the
+//      CURRENT org had no conflict — actively blocking a legitimate,
+//      by-design multi-tenant scenario.
+//
+// Scoping the filter to `organisationId: req.orgId` (kept explicit
+// alongside .skipTenantFilter(), same pattern as the Phase 3B fixes) closes
+// both: restore now only ever matches a deleted record within the SAME
+// org, and the same email in a different org no longer false-conflicts.
 const registerPatient = async (req, res) => {
     try {
         const { name, email, password } = req.body;
 
-        const existingUser = await User.findOne({ email }).skipTenantFilter();
+        const existingUser = await User
+            .findOne({ email, organisationId: req.orgId })
+            .skipTenantFilter();
 
         if (existingUser && existingUser.deletedAt) {
             existingUser.name      = name;

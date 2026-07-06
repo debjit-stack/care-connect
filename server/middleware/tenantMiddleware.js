@@ -1,7 +1,6 @@
-import Organisation from '../models/Organisation.js';
-import env from '../config/env.js';
 import { runWithTenant } from '../plugins/tenantPlugin.js';
 import { extractOrgIdentifier } from '../utils/orgIdentifier.js';
+import { resolveOrganisation } from '../utils/resolveOrg.js';
 
 // ── Paths that bypass tenant resolution completely ────────────────────────────
 // isPublicPath() is METHOD-AWARE: every public entry declares which HTTP
@@ -86,32 +85,19 @@ const isPublicPath = (method, url) => {
 // of its own — it IS the tenant), and organisationController.js already does
 // its own explicit authorization (super_admin-only for global list/create/
 // delete/stats; `req.user.organisationId === org._id` for org-admin's own-org
-// read/update — see getOrganisationById/updateOrganisation). None of these
-// controllers read req.org or req.orgId at all.
+// read/update). None of these controllers read req.org or req.orgId at all.
 //
-// PHASE1B covered the "no header sent" branch: a super_admin calling
-// `GET /api/organisations` (list all orgs) or `POST /api/organisations`
-// (create a brand new org) has no reason to send an X-Organisation-Slug
-// header, and previously got a 400 once a second org existed (H2-adjacent
-// trap). That fix only handled the case where NO org resolves at all.
-//
-// PHASE4 FIX (this addition): the client's axios layer (see
-// client/src/api/index.js) attaches whatever org slug is currently in
-// sessionStorage/memory to essentially every outgoing request once one is
-// known — including a super_admin's own requests, whose "current" org
-// context is really just whichever org they last looked at, not a
-// meaningful scope for platform-wide actions. If that remembered org
-// happens to be SUSPENDED, the org-found branch below used to still 403
-// with "organisation account is suspended" — blocking a super_admin from
-// listing or managing ALL organisations (including ones completely
-// unrelated to the suspended one) purely because of stale client-side
-// context. Since these routes don't depend on the resolved org being
-// accessible (they don't use req.org for anything but incidental context),
-// the isAccessible check is now skipped for tenant-optional paths too, not
-// just the "no header" case. The 404 "org not found" check is deliberately
-// UNCHANGED for these paths — a header pointing at a nonexistent org is a
-// genuine client error worth surfacing, unlike suspension status, which is
-// simply irrelevant to what these routes do.
+// PHASE1B: a super_admin calling `GET /api/organisations` or
+// `POST /api/organisations` has no reason to send an org header, and
+// previously got a 400 once a second org existed. PHASE4: a super_admin's
+// stale/remembered org header (attached automatically by the frontend's
+// axios layer — see client/src/api/index.js) resolving to a SUSPENDED org
+// used to still 403 these routes, blocking platform-wide management for a
+// reason completely irrelevant to what these routes do. Both are handled by
+// skipping the corresponding checks (ambiguity-as-400, and
+// suspended-as-403) for this route family. A genuinely nonexistent org
+// (bad header value) still 404s — that's a real client error worth
+// surfacing, unlike ambiguity or suspension status.
 const TENANT_OPTIONAL_PREFIXES = [
     '/api/organisations',
 ];
@@ -124,91 +110,66 @@ const isTenantOptionalPath = (url) => {
 };
 
 // ── Main middleware ────────────────────────────────────────────────────────────
+// PHASE5-L1 FIX: this function's own org-lookup and single-org-fallback
+// logic has been extracted into the shared resolveOrganisation() utility
+// (server/utils/resolveOrg.js), also used by authController.js. Behavior is
+// unchanged from the pre-Phase-5 version — this is a pure consolidation,
+// not a functional change — except for one deliberate efficiency
+// preservation noted inline below.
 export const resolveTenant = async (req, res, next) => {
     if (isPublicPath(req.method, req.originalUrl)) return next();
 
     const tenantOptional = isTenantOptionalPath(req.originalUrl);
 
-    // PHASE2 FIX: the old inline resolveSlug() extraction logic has been
-    // replaced with the shared, DB-free extractOrgIdentifier() utility (see
-    // server/utils/orgIdentifier.js). Same extraction rules as before, now
-    // shared with rateLimiter.js so the two can never silently diverge on
-    // "what counts as the client's claimed org" for the one thing they both
-    // need it for.
-    const resolved = extractOrgIdentifier(req);
-
-    if (!resolved) {
-        // PHASE1B FIX: super-admin Organisation-management routes proceed
-        // with no ambient tenant context rather than being forced to 400 —
-        // see the TENANT_OPTIONAL_PREFIXES comment above for why this is
-        // safe for this specific route family.
-        if (tenantOptional) return next();
-
-        try {
-            const count = await Organisation.countDocuments({ deletedAt: null, isActive: true });
-
-            // PHASE2-H2 FIX: the single-active-org auto-pick is now gated
-            // behind ALLOW_SINGLE_ORG_AUTO_RESOLVE (default false — see
-            // env.js). Previously this branch ran unconditionally whenever
-            // count === 1, regardless of environment, which meant a
-            // deployment's behavior for any header-less client silently
-            // changed the moment a second hospital was onboarded (H2 in the
-            // multi-tenant audit) — a breaking change occurring at exactly
-            // the moment multi-tenancy starts to matter. With the flag off
-            // (the production default), a header-less request is now
-            // rejected with 400 regardless of how many orgs currently exist
-            // (count === 0 is still a pass-through — nothing to scope
-            // against), so onboarding hospital #2 changes nothing about this
-            // middleware's behavior for existing, well-behaved clients.
-            if (env.ALLOW_SINGLE_ORG_AUTO_RESOLVE && count === 1) {
-                const org = await Organisation.findOne({ deletedAt: null, isActive: true });
-                if (org && org.isAccessible) {
-                    req.org   = org;
-                    req.orgId = org._id;
-                    return runWithTenant(org._id, () => next());
-                }
-            }
-
-            if (count === 0) {
-                return next();
-            }
-
-            return res.status(400).json({
-                message: 'Organisation not specified. Include X-Organisation-Slug header or use your subdomain.',
-            });
-        } catch (err) {
-            console.error('[Tenant] auto-resolve error:', err.message);
-            return res.status(500).json({ message: 'Failed to resolve organisation' });
-        }
+    // Fast path: a tenant-optional route with no client-supplied identifier
+    // at all (the common case — e.g. a super_admin listing/creating
+    // organisations with no org header sent) skips the DB round-trip
+    // entirely, matching this middleware's pre-consolidation behavior for
+    // this specific case rather than paying for a countDocuments() call
+    // whose result would just be discarded a moment later.
+    if (tenantOptional && !extractOrgIdentifier(req)) {
+        return next();
     }
 
     try {
-        const org = resolved.type === 'slug'
-            ? await Organisation.findOne({ slug: resolved.value, deletedAt: null })
-            : await Organisation.findOne({ _id: resolved.value, deletedAt: null });
+        const result = await resolveOrganisation(req);
 
-        if (!org) {
+        if (result.status === 'resolved') {
+            const { org } = result;
+
+            // PHASE4 FIX: tenant-optional paths proceed regardless of the
+            // resolved org's accessibility — see the TENANT_OPTIONAL_PREFIXES
+            // comment above.
+            if (!org.isAccessible && !tenantOptional) {
+                return res.status(403).json({
+                    message: 'Your organisation account is suspended or your trial has ended. Please contact support.',
+                });
+            }
+
+            req.org   = org;
+            req.orgId = org._id;
+            return runWithTenant(org._id, () => next());
+        }
+
+        if (result.status === 'not_found') {
             return res.status(404).json({ message: 'Organisation not found' });
         }
 
-        // PHASE4 FIX: tenant-optional paths (organisation management routes)
-        // proceed regardless of the resolved org's accessibility — see the
-        // TENANT_OPTIONAL_PREFIXES comment above. Every other route keeps
-        // the existing strict behavior: a suspended/trial-expired org's
-        // members cannot proceed at all.
-        if (!org.isAccessible && !tenantOptional) {
-            return res.status(403).json({
-                message: 'Your organisation account is suspended or your trial has ended. Please contact support.',
-            });
+        if (result.status === 'no_orgs') {
+            return next();
         }
 
-        req.org   = org;
-        req.orgId = org._id;
+        // result.status === 'ambiguous'
+        // PHASE1B FIX: tenant-optional routes proceed with no ambient
+        // context instead of being forced to 400 here too.
+        if (tenantOptional) return next();
 
-        runWithTenant(org._id, () => next());
+        return res.status(400).json({
+            message: 'Organisation not specified. Include X-Organisation-Slug header or use your subdomain.',
+        });
     } catch (err) {
         console.error('[Tenant] resolution error:', err.message);
-        res.status(500).json({ message: 'Failed to resolve organisation' });
+        return res.status(500).json({ message: 'Failed to resolve organisation' });
     }
 };
 

@@ -160,7 +160,14 @@ const createDoctor = async (req, res) => {
     try {
         const { name, email, password, specialty, qualifications, experienceYears } = req.body;
 
-        const exists = await User.findOne({ email, deletedAt: null }).skipTenantFilter();
+        // PHASE5-L2 FIX: scoped to the current org, same reasoning as
+        // createStaff/registerPatient below — a global (no organisationId)
+        // existence check here would both incorrectly block a legitimate
+        // same-email-different-org doctor creation, and (though this
+        // function has no soft-delete-restore branch, so no cross-tenant
+        // restore risk specifically) would report a false 409 for an email
+        // that has no actual conflict within this organisation.
+        const exists = await User.findOne({ email, organisationId: req.orgId }).skipTenantFilter();
         if (exists) {
             await session.abortTransaction();
             session.endSession();
@@ -223,11 +230,23 @@ const updateDoctorProfile = async (req, res) => {
 };
 
 // ─── POST /api/admin/staff ────────────────────────────────────────────────────
+// PHASE5-L2 FIX: the existence/restore check below previously ran
+// `User.findOne({ email }).skipTenantFilter()` — fully global, with no
+// organisationId in the filter. Same two bugs as registerPatient
+// (receptionistController.js) had: (1) a soft-deleted staff member with
+// this email in a DIFFERENT org could be matched and restored here,
+// reactivating another org's user record and changing its role, entirely
+// invisible to that org; (2) a legitimate same-email-different-org staff
+// creation would incorrectly 409 even though the current org has no actual
+// conflict. Scoping the filter to `organisationId: req.orgId` (kept
+// explicit alongside .skipTenantFilter()) closes both.
 const createStaff = async (req, res) => {
     try {
         const { name, email, password, role } = req.body;
 
-        const existingUser = await User.findOne({ email }).skipTenantFilter();
+        const existingUser = await User
+            .findOne({ email, organisationId: req.orgId })
+            .skipTenantFilter();
 
         if (existingUser && existingUser.deletedAt) {
             const roleChanged      = existingUser.role !== role;
