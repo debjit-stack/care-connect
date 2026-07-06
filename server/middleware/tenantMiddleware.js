@@ -1,5 +1,7 @@
 import Organisation from '../models/Organisation.js';
+import env from '../config/env.js';
 import { runWithTenant } from '../plugins/tenantPlugin.js';
+import { extractOrgIdentifier } from '../utils/orgIdentifier.js';
 
 // ── Paths that bypass tenant resolution completely ────────────────────────────
 // isPublicPath() is METHOD-AWARE: every public entry declares which HTTP
@@ -78,37 +80,85 @@ const isPublicPath = (method, url) => {
     return false;
 };
 
-// ── Resolve org slug/id from request ─────────────────────────────────────────
-const resolveSlug = (req) => {
-    const headerSlug = req.headers['x-organisation-slug'];
-    if (headerSlug) return { type: 'slug', value: headerSlug.toLowerCase().trim() };
+// ── PHASE1B FIX ────────────────────────────────────────────────────────────────
+// Routes under these prefixes manage the `Organisation` collection itself.
+// `Organisation` is NOT a tenant-scoped model (it has no organisationId field
+// of its own — it IS the tenant), and organisationController.js already does
+// its own explicit authorization (super_admin-only for global list/create/
+// delete/stats; `req.user.organisationId === org._id` for org-admin's own-org
+// read/update — see getOrganisationById/updateOrganisation). None of these
+// controllers read req.org or req.orgId at all.
+//
+// Before this fix, resolveTenant() still forced full org resolution ahead of
+// these routes like every other protected route: a super_admin calling
+// `GET /api/organisations` (list all orgs) or `POST /api/organisations`
+// (create a brand new org) has no reason to send an X-Organisation-Slug
+// header — there is no "current org" context for those actions — but once a
+// second organisation existed in the system, resolveTenant's "ambiguous,
+// no header, count > 1" branch would 400 the request with "Organisation not
+// specified" before it ever reached `protect` or the controller. This is
+// exactly the operational trap flagged as H2 in the multi-tenant audit,
+// specific to the one route family that never needed ambient tenant scoping
+// in the first place.
+//
+// Fix: for these prefixes, if no org can be resolved from the header/
+// subdomain, proceed WITHOUT setting req.org/req.orgId (skip the 400)
+// instead of forcing resolution. If a header IS supplied and does resolve,
+// normal resolution still runs — this is harmless (nothing here uses
+// ambient tenant filtering) and lets an org-admin who does send their own
+// org's header for context continue to work exactly as before. This also
+// composes correctly with the Phase 1 tenant-binding check in
+// authMiddleware.js's `protect`, which already no-ops whenever req.orgId is
+// unset.
+const TENANT_OPTIONAL_PREFIXES = [
+    '/api/organisations',
+];
 
-    const headerId = req.headers['x-organisation-id'];
-    if (headerId) return { type: 'id', value: headerId.trim() };
-
-    const host  = req.headers.host || '';
-    const parts = host.split('.');
-    if (
-        parts.length >= 3 &&
-        !['www', 'api', 'careconnect', 'localhost'].includes(parts[0])
-    ) {
-        return { type: 'slug', value: parts[0] };
-    }
-
-    return null;
+const isTenantOptionalPath = (url) => {
+    const path = url.split('?')[0];
+    return TENANT_OPTIONAL_PREFIXES.some(
+        (prefix) => path === prefix || path.startsWith(prefix + '/') || path.startsWith(prefix + '?')
+    );
 };
 
 // ── Main middleware ────────────────────────────────────────────────────────────
 export const resolveTenant = async (req, res, next) => {
     if (isPublicPath(req.method, req.originalUrl)) return next();
 
-    const resolved = resolveSlug(req);
+    const tenantOptional = isTenantOptionalPath(req.originalUrl);
+
+    // PHASE2 FIX: the old inline resolveSlug() extraction logic has been
+    // replaced with the shared, DB-free extractOrgIdentifier() utility (see
+    // server/utils/orgIdentifier.js). Same extraction rules as before, now
+    // shared with rateLimiter.js so the two can never silently diverge on
+    // "what counts as the client's claimed org" for the one thing they both
+    // need it for.
+    const resolved = extractOrgIdentifier(req);
 
     if (!resolved) {
+        // PHASE1B FIX: super-admin Organisation-management routes proceed
+        // with no ambient tenant context rather than being forced to 400 —
+        // see the TENANT_OPTIONAL_PREFIXES comment above for why this is
+        // safe for this specific route family.
+        if (tenantOptional) return next();
+
         try {
             const count = await Organisation.countDocuments({ deletedAt: null, isActive: true });
 
-            if (count === 1) {
+            // PHASE2-H2 FIX: the single-active-org auto-pick is now gated
+            // behind ALLOW_SINGLE_ORG_AUTO_RESOLVE (default false — see
+            // env.js). Previously this branch ran unconditionally whenever
+            // count === 1, regardless of environment, which meant a
+            // deployment's behavior for any header-less client silently
+            // changed the moment a second hospital was onboarded (H2 in the
+            // multi-tenant audit) — a breaking change occurring at exactly
+            // the moment multi-tenancy starts to matter. With the flag off
+            // (the production default), a header-less request is now
+            // rejected with 400 regardless of how many orgs currently exist
+            // (count === 0 is still a pass-through — nothing to scope
+            // against), so onboarding hospital #2 changes nothing about this
+            // middleware's behavior for existing, well-behaved clients.
+            if (env.ALLOW_SINGLE_ORG_AUTO_RESOLVE && count === 1) {
                 const org = await Organisation.findOne({ deletedAt: null, isActive: true });
                 if (org && org.isAccessible) {
                     req.org   = org;

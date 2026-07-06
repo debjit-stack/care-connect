@@ -63,6 +63,38 @@ const organisationSchema = mongoose.Schema(
             timezone:     { type: String, default: 'Asia/Kolkata' },
             locale:       { type: String, default: 'en-IN' },
             currency:     { type: String, default: 'INR' },
+
+            // PHASE3-3C FIX: mailer.js's buildTransport(org) has read
+            // org?.settings?.smtp?.{host,port,secure,user,pass,from} since
+            // the per-org email feature was built, but this sub-schema
+            // never formally declared an `smtp` field, and
+            // organisationValidators.js's settingsSchema (used by both
+            // create and update) had no `smtp` field either. Since that
+            // validator schema does not use .passthrough(), any attempt to
+            // set custom SMTP settings through the API was silently
+            // stripped by Zod before ever reaching this model — the only
+            // way per-org SMTP could actually be configured was a direct,
+            // out-of-band database edit. This formalizes the field so the
+            // admin-facing API (once organisationValidators.js is updated
+            // to match — see that file) can actually set it.
+            //
+            // `pass` is marked select: false, matching the credential-
+            // hygiene pattern already used for User.password/mfaSecret —
+            // it will never be returned by a normal find()/findById() read
+            // (including the .lean() reads in organisationController.js),
+            // and must be explicitly requested with
+            // .select('+settings.smtp.pass') by any code that genuinely
+            // needs it (mailer.js's buildTransport does need it and must
+            // be called with a document fetched that way — see the note
+            // left in that file).
+            smtp: {
+                host:   { type: String,  default: null },
+                port:   { type: Number,  default: 587 },
+                secure: { type: Boolean, default: false },
+                user:   { type: String,  default: null },
+                pass:   { type: String,  default: null, select: false },
+                from:   { type: String,  default: null },
+            },
         },
 
         // ── Feature flags (Phase 4 — simple object until LaunchDarkly) ───────

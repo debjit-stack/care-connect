@@ -13,9 +13,23 @@ const MFA_PENDING_EXPIRES     = process.env.JWT_MFA_PENDING_EXPIRES || '5m';
 const RESET_PENDING_EXPIRES   = process.env.JWT_RESET_PENDING_EXPIRES || '10m';
 
 // ─── Access token ─────────────────────────────────────────────────────────────
+// PHASE1-C2 FIX: access tokens now carry an `organisationId` claim (null for
+// super_admin / any user with no org). Previously the payload was only
+// { id, role }, which meant the token itself carried no verifiable tenant
+// binding — any consumer of the token (including this app's own `protect`
+// middleware) had no way to detect a user being silently re-scoped to a
+// different tenant after the token was issued, without a fresh DB lookup
+// AND an explicit comparison (which nothing did — see authMiddleware.js).
+// This claim doesn't replace the DB check in `protect` (a live lookup is
+// still authoritative), it lets `protect` catch drift between the org the
+// token was issued for and the user's *current* org in one extra comparison.
 export const generateAccessToken = (user) => {
     return jwt.sign(
-        { id: user._id, role: user.role },
+        {
+            id:             user._id,
+            role:           user.role,
+            organisationId: user.organisationId ? user.organisationId.toString() : null,
+        },
         process.env.JWT_SECRET,
         { expiresIn: ACCESS_TOKEN_EXPIRES }
     );

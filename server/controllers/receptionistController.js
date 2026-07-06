@@ -120,18 +120,40 @@ const bookOfflineAppointment = async (req, res) => {
 };
 
 // ─── GET /api/receptionist/search-patients?q= ────────────────────────────────
+// PHASE3-3B FIX: previously relied SOLELY on tenantPlugin's implicit
+// query-hook filtering to keep this search scoped to the receptionist's own
+// organisation — no explicit organisationId anywhere in the query. That
+// implicit filtering is real and (post-Phase-1) trustworthy for the request
+// lifecycle that reaches this controller today, so this was not a live
+// exploitable gap — but a search endpoint returning names/emails is exactly
+// the kind of place where "trust the ambient context and nothing else" is
+// worth hardening rather than just leaving as the only line of defense.
+// Now explicit and self-contained: .skipTenantFilter() plus an explicit
+// `organisationId: req.orgId` clause in the query itself. If req.orgId is
+// somehow unset when this runs (it always should be — receptionistRoutes
+// requires protect + isReceptionistOrAdmin, both of which run after
+// resolveTenant has already succeeded or the request never reaches here),
+// this fails CLOSED (returns an empty result) rather than falling through
+// to an unscoped, cross-tenant search.
 const searchPatients = async (req, res) => {
     try {
         const { q } = req.query;
 
+        if (!req.orgId) {
+            console.error('[Receptionist] searchPatients: req.orgId unexpectedly unset — refusing unscoped search.');
+            return res.json([]);
+        }
+
         const patients = await User.find({
-            role:      'patient',
-            deletedAt: null,
+            role:           'patient',
+            deletedAt:      null,
+            organisationId: req.orgId,
             $or: [
                 { name:  { $regex: q, $options: 'i' } },
                 { email: { $regex: q, $options: 'i' } },
             ],
         })
+            .skipTenantFilter()
             .select('_id name email')
             .limit(10)
             .lean();

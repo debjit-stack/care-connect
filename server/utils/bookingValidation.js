@@ -1,4 +1,5 @@
 import Doctor from '../models/Doctor.js';
+import { getCurrentOrgId } from '../plugins/tenantPlugin.js';
 
 /**
  * validateBookingSlot
@@ -8,9 +9,31 @@ import Doctor from '../models/Doctor.js';
  *
  * Checks:
  *   (a) appointmentDate is today or in the future
- *   (b) Doctor exists and is not soft-deleted (C4 FIX)
+ *   (b) Doctor exists, is not soft-deleted (C4 FIX), AND belongs to the
+ *       ambient tenant (PHASE3-3B FIX — see below)
  *   (c) The day of week is a working day for this doctor
  *   (d) The requested time slot falls within working hours
+ *
+ * PHASE3-3B FIX: the doctor lookup previously relied SOLELY on
+ * tenantPlugin's implicit query-hook filtering (no explicit organisationId
+ * check anywhere in this function) to prevent a doctorId from a different
+ * organisation from ever being found here. That filtering is real and,
+ * after Phase 1's tenant-binding enforcement, trustworthy for the request
+ * lifecycles that actually reach this function today — this was not a live
+ * exploitable gap. But it meant tenant isolation for one of the app's most
+ * security-sensitive operations (booking an appointment) depended entirely
+ * on every future caller remembering never to call this with
+ * .skipTenantFilter() active or from outside a runWithTenant() context —
+ * an easy thing for a future change to get wrong silently, since nothing
+ * here would fail loudly if it did.
+ *
+ * This now does the lookup with .skipTenantFilter() explicitly (so it is
+ * self-contained and correct regardless of ambient context) and adds an
+ * explicit organisationId comparison. The 404 message is deliberately
+ * identical to the "doctor doesn't exist at all" case — a cross-tenant
+ * doctorId should be indistinguishable from a nonexistent one to the caller,
+ * so this never becomes an oracle for probing which doctor IDs exist in
+ * other organisations.
  *
  * @param {string} doctorId        — Doctor document _id
  * @param {string} appointmentDate — YYYY-MM-DD string (already Zod-validated)
@@ -31,9 +54,22 @@ export const validateBookingSlot = async (doctorId, appointmentDate, appointment
         };
     }
 
-    // (b) C4 FIX: check Doctor.deletedAt — soft-deleted doctors must not be bookable
-    const doctor = await Doctor.findOne({ _id: doctorId, deletedAt: null }).lean();
+    // (b) C4 FIX: check Doctor.deletedAt — soft-deleted doctors must not be bookable.
+    // PHASE3-3B FIX: explicit .skipTenantFilter() + explicit organisationId
+    // comparison — see function-level comment above.
+    const doctor = await Doctor.findOne({ _id: doctorId, deletedAt: null }).skipTenantFilter().lean();
     if (!doctor) {
+        return {
+            valid:   false,
+            status:  404,
+            message: 'Doctor not found or no longer available.',
+        };
+    }
+
+    const ambientOrgId = getCurrentOrgId();
+    if (ambientOrgId && String(doctor.organisationId ?? '') !== String(ambientOrgId)) {
+        // Deliberately the SAME message/status as "doctor doesn't exist" —
+        // never reveal that a doctorId is valid in a different organisation.
         return {
             valid:   false,
             status:  404,

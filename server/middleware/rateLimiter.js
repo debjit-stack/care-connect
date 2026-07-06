@@ -1,5 +1,6 @@
 import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
 import getRedisClient from '../config/redis.js';
+import { extractOrgIdentifier } from '../utils/orgIdentifier.js';
 
 // -- Redis store for rate limiter ------------------------------------------
 // B4 FIX: makeRedisStore previously hardcoded `redis.expire(key, 900)` (15
@@ -44,7 +45,24 @@ const makeRedisStore = (prefix, windowSec) => ({
 });
 
 // -- Login rate limiter ------------------------------------------------------
-
+// PHASE2-H1 FIX: the key previously was `${ip}:${email}` only. Because
+// CareConnect intentionally allows the same email to exist independently in
+// different hospitals (that's the whole point of the (email, organisationId)
+// compound unique index — see User.js), two completely unrelated accounts
+// that happen to share an email — one in Hospital A, one in Hospital B —
+// produced the IDENTICAL rate-limit key when attempted from the same IP.
+// Five failed attempts against Hospital A's account would lock out attempts
+// against Hospital B's account too, for 15 minutes, even though the accounts
+// share nothing but an email string and an unlucky visitor's IP.
+//
+// The key now also includes the raw org identifier the client claims
+// (X-Organisation-Slug/-Id header or subdomain — extracted with no DB call
+// via extractOrgIdentifier, since a rate-limit key only needs to bucket
+// correctly, not validate that the claimed org actually exists). Two
+// different claimed orgs now get two different buckets. Single-org
+// deployments that never send an org header are unaffected — every request
+// resolves to the same 'no-org' bucket component, identical to today's
+// behavior.
 const LOGIN_WINDOW_MS = 15 * 60 * 1000;
 export const loginRateLimiter = rateLimit({
     validate: false,
@@ -58,8 +76,11 @@ export const loginRateLimiter = rateLimit({
     legacyHeaders: false,
     skipSuccessfulRequests: true,
     store: makeRedisStore('login', LOGIN_WINDOW_MS / 1000),
-    keyGenerator: (req) =>
-        `${ipKeyGenerator(req.ip)}:${(req.body?.email || '').toLowerCase()}`,
+    keyGenerator: (req) => {
+        const org    = extractOrgIdentifier(req);
+        const orgKey = org ? `${org.type}:${org.value}` : 'no-org';
+        return `${ipKeyGenerator(req.ip)}:${orgKey}:${(req.body?.email || '').toLowerCase()}`;
+    },
 });
 
 // -- Register rate limiter ----------------------------------------------------

@@ -1,6 +1,7 @@
 import bcrypt        from 'bcryptjs';
 import User          from '../models/User.js';
 import Organisation  from '../models/Organisation.js';
+import env            from '../config/env.js';
 import {
     generateAccessToken,
     generateRefreshToken,
@@ -63,6 +64,22 @@ const safeUser = (user, org) => ({
 });
 
 // ─── Resolve org from request ─────────────────────────────────────────────────
+// PHASE2-H2 FIX: the count===1 auto-pick below is now gated behind
+// ALLOW_SINGLE_ORG_AUTO_RESOLVE (see config/env.js — defaults to false).
+// This is the same fix as tenantMiddleware.resolveTenant's equivalent
+// branch, applied here too since this function is the independent
+// org-resolution path used by login/register/OTP flows (routes that bypass
+// resolveTenant entirely — see tenantMiddleware.js's PUBLIC_EXACT list).
+// Without this, a header-less login/registration request's behavior would
+// silently change the moment a second hospital was onboarded (H2).
+//
+// Scope note: this function's header/subdomain EXTRACTION logic is left as
+// its own independent implementation for now (not yet consolidated onto
+// the shared extractOrgIdentifier() utility in utils/orgIdentifier.js —
+// see that file's header comment). Only the count===1 fallback behavior is
+// changed here, to keep this Phase 2 diff scoped to H1/H2. Full
+// consolidation of the two extraction implementations (flagged as L1 in the
+// multi-tenant audit) is deferred to a later cleanup pass.
 const resolveOrgFromRequest = async (req) => {
     const slug = req.headers['x-organisation-slug'];
     if (slug) return Organisation.findOne({ slug: slug.toLowerCase().trim(), deletedAt: null });
@@ -75,6 +92,8 @@ const resolveOrgFromRequest = async (req) => {
     if (parts.length >= 3 && !['www', 'api', 'careconnect', 'localhost'].includes(parts[0])) {
         return Organisation.findOne({ slug: parts[0], deletedAt: null });
     }
+
+    if (!env.ALLOW_SINGLE_ORG_AUTO_RESOLVE) return null;
 
     const count = await Organisation.countDocuments({ deletedAt: null, isActive: true });
     if (count === 1) return Organisation.findOne({ deletedAt: null, isActive: true });
@@ -596,9 +615,33 @@ const loginUser = async (req, res) => {
         const org   = await resolveOrgFromRequest(req);
         const orgId = org?._id ?? null;
 
+        // PHASE2-H2 FOLLOW-UP FIX: this was a SECOND, independent
+        // count-based check living directly in loginUser, separate from the
+        // one now gated inside resolveOrgFromRequest — it was missed in the
+        // first Phase 2 pass because it duplicates rather than calls that
+        // logic. With ALLOW_SINGLE_ORG_AUTO_RESOLVE=false (the default),
+        // resolveOrgFromRequest correctly returns null for any header-less
+        // request regardless of how many orgs exist — but this local check
+        // only rejected when count > 1, so at exactly count === 1 a
+        // header-less login used to fall through with orgId = null and run
+        // an unscoped-by-org lookup (`{ email, deletedAt: null }` via
+        // skipTenantFilter()) against every organisation's users at once.
+        // The rule now mirrors resolveOrgFromRequest's: when auto-resolve is
+        // disabled, ANY existing organisation (count >= 1) requires an
+        // explicit header; only a genuinely org-less system (count === 0)
+        // passes through. When auto-resolve is enabled, behavior is
+        // unchanged from before (count > 1 required an explicit header,
+        // since count === 1 was already silently auto-picked inside
+        // resolveOrgFromRequest and would never reach this branch as null).
         if (!org) {
             const count = await Organisation.countDocuments({ deletedAt: null, isActive: true });
-            if (count > 1) return res.status(400).json({ message: 'Organisation not specified. Include X-Organisation-Slug header.' });
+            const requiresExplicitOrg = env.ALLOW_SINGLE_ORG_AUTO_RESOLVE
+                ? count > 1
+                : count >= 1;
+
+            if (requiresExplicitOrg) {
+                return res.status(400).json({ message: 'Organisation not specified. Include X-Organisation-Slug header.' });
+            }
         }
 
         if (org && !org.isAccessible) return res.status(403).json({ message: 'Organisation account is not active.' });
