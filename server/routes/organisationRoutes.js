@@ -6,6 +6,7 @@ import {
     updateOrganisation,
     deleteOrganisation,
     getOrganisationStats,
+    getPlatformStats,
 } from '../controllers/organisationController.js';
 import { protect, requireRole } from '../middleware/authMiddleware.js';
 import {
@@ -33,6 +34,16 @@ router.post('/',
     superAdmin,
     validate(createOrganisationSchema),
     createOrganisation
+);
+
+// PHASE4 FIX: MUST be registered before GET /:id — otherwise Express would
+// match "GET /api/organisations/platform-stats" against the /:id route
+// first, treating "platform-stats" as an id value (same class of ordering
+// bug already called out in doctorRoutes.js's "must come before /:id"
+// comment for its own protected routes).
+router.get('/platform-stats',
+    superAdmin,
+    getPlatformStats
 );
 
 router.get('/:id',

@@ -80,7 +80,7 @@ const isPublicPath = (method, url) => {
     return false;
 };
 
-// ── PHASE1B FIX ────────────────────────────────────────────────────────────────
+// ── PHASE1B / PHASE4 FIX ────────────────────────────────────────────────────────
 // Routes under these prefixes manage the `Organisation` collection itself.
 // `Organisation` is NOT a tenant-scoped model (it has no organisationId field
 // of its own — it IS the tenant), and organisationController.js already does
@@ -89,27 +89,29 @@ const isPublicPath = (method, url) => {
 // read/update — see getOrganisationById/updateOrganisation). None of these
 // controllers read req.org or req.orgId at all.
 //
-// Before this fix, resolveTenant() still forced full org resolution ahead of
-// these routes like every other protected route: a super_admin calling
+// PHASE1B covered the "no header sent" branch: a super_admin calling
 // `GET /api/organisations` (list all orgs) or `POST /api/organisations`
 // (create a brand new org) has no reason to send an X-Organisation-Slug
-// header — there is no "current org" context for those actions — but once a
-// second organisation existed in the system, resolveTenant's "ambiguous,
-// no header, count > 1" branch would 400 the request with "Organisation not
-// specified" before it ever reached `protect` or the controller. This is
-// exactly the operational trap flagged as H2 in the multi-tenant audit,
-// specific to the one route family that never needed ambient tenant scoping
-// in the first place.
+// header, and previously got a 400 once a second org existed (H2-adjacent
+// trap). That fix only handled the case where NO org resolves at all.
 //
-// Fix: for these prefixes, if no org can be resolved from the header/
-// subdomain, proceed WITHOUT setting req.org/req.orgId (skip the 400)
-// instead of forcing resolution. If a header IS supplied and does resolve,
-// normal resolution still runs — this is harmless (nothing here uses
-// ambient tenant filtering) and lets an org-admin who does send their own
-// org's header for context continue to work exactly as before. This also
-// composes correctly with the Phase 1 tenant-binding check in
-// authMiddleware.js's `protect`, which already no-ops whenever req.orgId is
-// unset.
+// PHASE4 FIX (this addition): the client's axios layer (see
+// client/src/api/index.js) attaches whatever org slug is currently in
+// sessionStorage/memory to essentially every outgoing request once one is
+// known — including a super_admin's own requests, whose "current" org
+// context is really just whichever org they last looked at, not a
+// meaningful scope for platform-wide actions. If that remembered org
+// happens to be SUSPENDED, the org-found branch below used to still 403
+// with "organisation account is suspended" — blocking a super_admin from
+// listing or managing ALL organisations (including ones completely
+// unrelated to the suspended one) purely because of stale client-side
+// context. Since these routes don't depend on the resolved org being
+// accessible (they don't use req.org for anything but incidental context),
+// the isAccessible check is now skipped for tenant-optional paths too, not
+// just the "no header" case. The 404 "org not found" check is deliberately
+// UNCHANGED for these paths — a header pointing at a nonexistent org is a
+// genuine client error worth surfacing, unlike suspension status, which is
+// simply irrelevant to what these routes do.
 const TENANT_OPTIONAL_PREFIXES = [
     '/api/organisations',
 ];
@@ -189,7 +191,12 @@ export const resolveTenant = async (req, res, next) => {
             return res.status(404).json({ message: 'Organisation not found' });
         }
 
-        if (!org.isAccessible) {
+        // PHASE4 FIX: tenant-optional paths (organisation management routes)
+        // proceed regardless of the resolved org's accessibility — see the
+        // TENANT_OPTIONAL_PREFIXES comment above. Every other route keeps
+        // the existing strict behavior: a suspended/trial-expired org's
+        // members cannot proceed at all.
+        if (!org.isAccessible && !tenantOptional) {
             return res.status(403).json({
                 message: 'Your organisation account is suspended or your trial has ended. Please contact support.',
             });

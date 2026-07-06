@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { validate, mongoId } from './shared.js';
+import { validate, mongoId, nameField, emailField, passwordField } from './shared.js';
 
 const slugField = z
     .string({ required_error: 'Slug is required' })
@@ -18,20 +18,6 @@ const addressSchema = z.object({
     country: z.string().trim().max(100).optional(),
 }).optional();
 
-// PHASE3-3C FIX: previously missing entirely from settingsSchema. Since
-// validate() (shared.js) rewrites req.body with the Zod-parsed result and
-// this schema did not use .passthrough(), any `smtp` key sent by a client
-// was silently dropped before it ever reached organisationController.js —
-// there was no way to configure per-org SMTP through the API at all, even
-// though mailer.js has read org.settings.smtp.* since the per-org email
-// feature was built. Mirrors the field shape now declared on the
-// Organisation model (see models/Organisation.js).
-//
-// `pass` intentionally has a generous but bounded max length (SMTP auth
-// "passwords" for many providers are actually long API keys/app passwords,
-// not short human passwords) and no other complexity requirements — it's a
-// credential for an external system CareConnect doesn't control, not an
-// account password subject to this app's own password policy.
 const smtpSchema = z.object({
     host:   z.string().trim().min(1).max(255).nullable().optional(),
     port:   z.number().int().min(1).max(65535).optional(),
@@ -50,6 +36,23 @@ const settingsSchema = z.object({
     smtp:         smtpSchema,
 }).optional();
 
+// PHASE4 FIX: optional first-admin payload for atomic hospital onboarding.
+// When provided, organisationController.createOrganisation creates this
+// user (role: 'admin', scoped to the new org) in the SAME transaction as
+// the organisation itself — see that controller for why atomicity matters
+// here (an org created with no admin able to log into it is a dead-end
+// requiring direct DB intervention to recover from).
+//
+// Reuses the exact same nameField/emailField/passwordField rules already
+// enforced everywhere else a user is created (createStaffSchema,
+// createDoctorSchema, registerSchema) — no bespoke, potentially-drifting
+// validation rules for this one path.
+const adminUserSchema = z.object({
+    name:     nameField,
+    email:    emailField,
+    password: passwordField,
+}).optional();
+
 // ─── POST /api/organisations (super-admin only) ───────────────────────────────
 export const createOrganisationSchema = z.object({
     body: z.object({
@@ -60,6 +63,7 @@ export const createOrganisationSchema = z.object({
         address:      addressSchema,
         plan:         z.enum(['trial', 'basic', 'pro', 'enterprise']).optional(),
         settings:     settingsSchema,
+        adminUser:    adminUserSchema,
     }),
 });
 
