@@ -598,6 +598,47 @@ const sendMfaChallenge = (
 const loginUser = async (req, res) => {
     try {
         const { email, password } = req.body;
+        // Super Admin login bypass (organisation-independent)
+        const superAdmin = await User.findOne({
+            email,
+            role: 'super_admin',
+            deletedAt: null,
+        })
+        .select('+password +loginAttempts +lockUntil +passwordChangedAt +forceMfa')
+        .skipTenantFilter();
+
+        if (superAdmin) {
+            if (superAdmin.isLocked) {
+                const m = Math.ceil((superAdmin.lockUntil - Date.now()) / 60000);
+                return res.status(423).json({
+                    message: `Account locked. Try again in ${m} minute${m === 1 ? '' : 's'}.`,
+                });
+            }
+
+            const isMatch = await superAdmin.matchPassword(password);
+
+            if (!isMatch) {
+                await superAdmin.recordFailedLogin();
+
+                const after = superAdmin.loginAttempts + 1;
+                const remaining = 5 - after;
+
+                if (after >= 5) {
+                    return res.status(423).json({
+                        message: 'Account locked. Try again in 15 minutes.',
+                    });
+                }
+
+                return res.status(401).json({
+                    message: `Invalid email or password. ${remaining} attempt${remaining === 1 ? '' : 's'} remaining.`,
+                });
+            }
+
+            await superAdmin.resetLoginAttempts();
+
+            // Super Admin never belongs to an organisation
+            return issueLoginResponse(res, req, superAdmin, null);
+        }
 
         // PHASE5-L1 FIX: previously called resolveOrgFromRequest() (a plain
         // nullable-org wrapper) and then re-derived its own separate

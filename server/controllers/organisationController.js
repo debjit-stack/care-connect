@@ -5,9 +5,19 @@ import audit        from '../utils/audit.js';
 import { revokeAllRefreshTokens } from '../utils/tokens.js';
 
 // ─── GET /api/organisations (super-admin only) ────────────────────────────────
+// PHASE-B FIX: previously filtered to { deletedAt: null }, which silently
+// excluded every suspended organisation from this list entirely. That was
+// harmless before Phase A added reactivateOrganisation (there was no UI
+// action a suspended org's row could ever need), but now that a super_admin
+// needs to actually SEE a suspended org to reactivate it, filtering it out
+// of the one endpoint that lists organisations makes reactivation
+// unreachable through the UI — the only way to find a suspended org's ID
+// would be a direct database query. This now returns every organisation
+// regardless of status; the client is responsible for displaying status
+// (see SuperAdminDashboard.jsx's Active/Suspended badge).
 export const getAllOrganisations = async (req, res) => {
     try {
-        const orgs = await Organisation.find({ deletedAt: null })
+        const orgs = await Organisation.find({})
             .select('-__v')
             .sort({ createdAt: -1 })
             .lean();
@@ -40,25 +50,9 @@ export const getOrganisationById = async (req, res) => {
 // ─── POST /api/organisations (super-admin only) ───────────────────────────────
 // PHASE4 FIX: optionally creates the organisation's first admin user
 // ATOMICALLY with the organisation itself, when `adminUser` is provided in
-// the request body (see organisationValidators.js's adminUserSchema).
-//
-// Before this fix, hospital onboarding was a two-step, non-atomic process:
-// super_admin creates the org here, then separately has to create a staff
-// user for it via a different endpoint/flow scoped to that org. If anything
-// went wrong between those two steps (or nobody remembered to do the
-// second step at all), the result was an organisation that exists but that
-// literally nobody can log into — recoverable only via direct database
-// intervention, since there is no "invite the first admin" flow and
-// self-registration only ever creates patients (see authController.js).
-//
-// Both documents are created in a single MongoDB transaction: either both
-// succeed, or neither is persisted. The admin user's organisationId is set
-// EXPLICITLY to the newly created org's _id (not left to tenantPlugin's
-// ambient-context pre-save hook — there is no ambient tenant context for
-// this request, by design; see tenantMiddleware.js's TENANT_OPTIONAL_PREFIXES
-// for /api/organisations). No email-uniqueness precheck is needed for the
-// admin user beyond ordinary schema validation: since the organisation is
-// brand new, no (email, organisationId) collision is possible for it.
+// the request body (see organisationValidators.js's adminUserSchema). Both
+// documents are created in a single MongoDB transaction: either both
+// succeed, or neither is persisted.
 export const createOrganisation = async (req, res) => {
     const session = await mongoose.startSession();
     session.startTransaction();
@@ -123,9 +117,6 @@ export const createOrganisation = async (req, res) => {
         await session.abortTransaction();
         session.endSession();
 
-        // Duplicate slug can also surface here under a race between the
-        // precheck above and a concurrent request — same defensive pattern
-        // used in adminController.updateUser for the analogous email race.
         if (err.code === 11000) {
             return res.status(409).json({ message: 'Slug is already taken' });
         }
@@ -138,23 +129,11 @@ export const createOrganisation = async (req, res) => {
 // ─── PUT /api/organisations/:id ───────────────────────────────────────────────
 export const updateOrganisation = async (req, res) => {
     try {
-        // PHASE3-3C FOLLOW-UP FIX (part 2): must explicitly load
-        // settings.smtp.pass here despite its select:false default.
-        // Without this, the deep-merge below would build its base object
-        // from an smtp sub-object that never had `pass` loaded in the first
-        // place (not merely blank — genuinely absent from the fetched
-        // document), so reassigning org.settings.smtp and saving would
-        // erase the stored password on ANY smtp update that doesn't resend
-        // it — exactly the bug this fix set out to prevent, just one layer
-        // deeper. `pass` is stripped back out of the response before
-        // res.json() below so this internal load never actually exposes the
-        // credential back over the API.
         const org = await Organisation
             .findOne({ _id: req.params.id, deletedAt: null })
             .select('+settings.smtp.pass');
         if (!org) return res.status(404).json({ message: 'Organisation not found' });
 
-        // Org-admin can only update their own org, and cannot change plan or features
         const isSuperAdmin = req.user.role === 'super_admin';
         if (!isSuperAdmin &&
             org._id.toString() !== req.user.organisationId?.toString()) {
@@ -171,19 +150,6 @@ export const updateOrganisation = async (req, res) => {
         if (contactPhone !== undefined) org.contactPhone = contactPhone;
         if (address      !== undefined) org.address      = { ...org.address, ...address };
 
-        // PHASE3-3C FOLLOW-UP FIX: `settings.smtp` is the one nested object
-        // under `settings` (see models/Organisation.js). A plain shallow
-        // merge here — `{ ...org.settings, ...settings }` — only merges
-        // TOP-LEVEL keys of `settings`; if the incoming `settings` payload
-        // includes a partial `smtp` object (e.g. just `{ host: '...' }` to
-        // update one field), the shallow merge REPLACES the entire existing
-        // `smtp` sub-object wholesale, silently discarding any previously
-        // saved `user`/`pass`/`from` that weren't resent. This merges
-        // `smtp` one level deeper than the rest of `settings`, so a partial
-        // `smtp` update only overwrites the keys actually provided. All
-        // other `settings` fields keep the existing flat shallow-merge
-        // behavior (unchanged, and correct for them, since none of them
-        // are nested objects).
         if (settings !== undefined) {
             const { smtp: incomingSmtp, ...restSettings } = settings;
 
@@ -200,7 +166,6 @@ export const updateOrganisation = async (req, res) => {
             }
         }
 
-        // Only super-admin can toggle feature flags
         if (features !== undefined && isSuperAdmin) {
             org.features = { ...org.features, ...features };
         }
@@ -214,14 +179,6 @@ export const updateOrganisation = async (req, res) => {
             resourceId:   updated._id,
         });
 
-        // PHASE3-3C FOLLOW-UP FIX (part 2, continued): `updated` was loaded
-        // with settings.smtp.pass explicitly selected (see the fetch above)
-        // so the deep-merge could preserve it correctly on save. It must
-        // NOT be echoed back in the API response — same credential-hygiene
-        // intent as the model's select:false default, just enforced by hand
-        // here since this one code path deliberately overrides that default
-        // for internal merge correctness. toObject() + delete avoids
-        // mutating the in-memory Mongoose document itself.
         const responseBody = updated.toObject();
         if (responseBody.settings?.smtp) {
             delete responseBody.settings.smtp.pass;
@@ -234,23 +191,7 @@ export const updateOrganisation = async (req, res) => {
     }
 };
 
-// ─── DELETE /api/organisations/:id (super-admin only — soft delete) ───────────
-// PHASE4 FIX: suspension side-effect — deactivating an organisation now also
-// revokes every active refresh-token session for every user belonging to
-// it. Before this fix, soft-deleting/deactivating an org (isActive: false,
-// deletedAt set) had no effect on already-issued sessions: any staff member
-// or patient of that org with a still-valid access/refresh token pair could
-// keep using the app completely normally until their access token's normal
-// 15-minute expiry, and — worse — could keep silently refreshing past that
-// point too, since refreshAccessToken (authController.js) never checks
-// whether the user's organisation is still accessible, only whether the
-// user document itself exists and isn't individually deleted. A suspended
-// hospital's staff/patients effectively retained full access for as long as
-// they kept their tab open and refreshing.
-//
-// Uses .skipTenantFilter() + an explicit organisationId filter (consistent
-// with the Phase 3B pattern) since this route has no ambient tenant context
-// at all — see tenantMiddleware.js's TENANT_OPTIONAL_PREFIXES.
+// ─── DELETE /api/organisations/:id (super-admin only — soft delete/suspend) ───
 export const deleteOrganisation = async (req, res) => {
     try {
         const org = await Organisation.findOne({ _id: req.params.id, deletedAt: null });
@@ -283,6 +224,57 @@ export const deleteOrganisation = async (req, res) => {
     }
 };
 
+// ─── PATCH /api/organisations/:id/reactivate (super-admin only) ──────────────
+// PHASE-A FIX: closes the gap identified during the Super Admin frontend
+// readiness review — deleteOrganisation (above) could suspend an org, but
+// nothing in the API could ever reverse it; the only path back to active
+// was a direct database edit. Deliberately the narrow inverse of
+// deleteOrganisation: clears deletedAt/isActive/suspendedAt only.
+//
+// Does NOT attempt to restore the sessions that were revoked at suspension
+// time (see deleteOrganisation) — that revocation was correct and complete
+// at the time it happened; reactivation just means the org's users CAN log
+// in again going forward, not that their old sessions come back. They log
+// in normally, same as any session-expired user.
+//
+// Does NOT touch billingStatus or plan/trialEndsAt — those are separate,
+// billing-flow concerns (deleteOrganisation never set them either, so
+// there's nothing for this endpoint to symmetrically undo there). If an
+// org's `isAccessible` virtual is still false after reactivation because of
+// an expired trial or a billing-side suspension, that's correct and
+// intentional — this endpoint only reverses what deleteOrganisation does,
+// not every possible reason an org could be inaccessible.
+export const reactivateOrganisation = async (req, res) => {
+    try {
+        // Deliberately NOT filtering by deletedAt: null here — the whole
+        // point is to find an org that IS currently deleted/suspended.
+        const org = await Organisation.findOne({ _id: req.params.id });
+        if (!org) return res.status(404).json({ message: 'Organisation not found' });
+
+        if (org.isActive && !org.deletedAt) {
+            return res.status(400).json({ message: 'Organisation is already active.' });
+        }
+
+        org.isActive    = true;
+        org.deletedAt   = null;
+        org.suspendedAt = null;
+        await org.save();
+
+        audit(req, 'DATA_UPDATE', {
+            actorId:      req.user._id,
+            actorRole:    req.user.role,
+            resourceType: 'Organisation',
+            resourceId:   org._id,
+            meta:         { action: 'reactivate' },
+        });
+
+        res.json({ message: 'Organisation reactivated successfully.', organisation: org });
+    } catch (err) {
+        console.error('[Org] reactivateOrganisation:', err.message);
+        res.status(500).json({ message: 'Failed to reactivate organisation' });
+    }
+};
+
 // ─── GET /api/organisations/:id/stats (super-admin overview) ──────────────────
 export const getOrganisationStats = async (req, res) => {
     try {
@@ -302,14 +294,22 @@ export const getOrganisationStats = async (req, res) => {
 };
 
 // ─── GET /api/organisations/platform-stats (super-admin only) ────────────────
-// PHASE4 addition: a basic platform-wide rollup, distinct from
-// getOrganisationStats above (which is scoped to one org). Kept
-// deliberately simple — total/active org counts plus global user-role
-// counts — as a starting point rather than a full analytics surface.
+// PHASE-B FIX: totalOrganisations previously counted only { deletedAt: null }
+// — but deleteOrganisation always sets deletedAt alongside isActive: false,
+// so that filter silently excluded every suspended org from the total too.
+// Since activeOrganisations was ALSO scoped to { deletedAt: null }, the two
+// counts were almost always identical in practice, meaning
+// suspendedOrDeletedOrganisations (computed as their difference) would show
+// ~0 regardless of how many organisations were actually suspended — the
+// same "deletedAt used as a combined delete+suspend flag, but read as if it
+// only meant delete" mismatch that also affected getAllOrganisations (see
+// that function's fix above). totalOrganisations now counts every
+// organisation regardless of status; only activeOrganisations stays scoped
+// to the accessible subset, so the subtraction is now meaningful.
 export const getPlatformStats = async (req, res) => {
     try {
         const [totalOrganisations, activeOrganisations, totalUsers, totalDoctors, totalPatients] = await Promise.all([
-            Organisation.countDocuments({ deletedAt: null }),
+            Organisation.countDocuments({}),
             Organisation.countDocuments({ deletedAt: null, isActive: true }),
             User.countDocuments({ deletedAt: null }).skipTenantFilter(),
             User.countDocuments({ deletedAt: null, role: 'doctor' }).skipTenantFilter(),

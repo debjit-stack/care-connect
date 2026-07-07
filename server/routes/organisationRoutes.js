@@ -5,6 +5,7 @@ import {
     createOrganisation,
     updateOrganisation,
     deleteOrganisation,
+    reactivateOrganisation,
     getOrganisationStats,
     getPlatformStats,
 } from '../controllers/organisationController.js';
@@ -36,11 +37,9 @@ router.post('/',
     createOrganisation
 );
 
-// PHASE4 FIX: MUST be registered before GET /:id — otherwise Express would
-// match "GET /api/organisations/platform-stats" against the /:id route
-// first, treating "platform-stats" as an id value (same class of ordering
-// bug already called out in doctorRoutes.js's "must come before /:id"
-// comment for its own protected routes).
+// Must be registered before GET /:id — otherwise Express would match
+// "GET /api/organisations/platform-stats" against the /:id route first,
+// treating "platform-stats" as an id value.
 router.get('/platform-stats',
     superAdmin,
     getPlatformStats
@@ -62,6 +61,16 @@ router.delete('/:id',
     superAdmin,
     validate(idParam),
     deleteOrganisation
+);
+
+// PHASE-A addition: inverse of DELETE /:id above. super-admin only, same as
+// delete — reactivating an org's access is exactly as consequential as
+// suspending it, and org-admins should never be able to reactivate their
+// own suspended org unilaterally (suspension is a platform-level decision).
+router.patch('/:id/reactivate',
+    superAdmin,
+    validate(idParam),
+    reactivateOrganisation
 );
 
 router.get('/:id/stats',

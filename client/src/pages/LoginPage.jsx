@@ -4,12 +4,19 @@ import { useAuth } from '../context/AuthContext';
 import { setAccessToken, setOrgSlug } from '../api/index.js';
 import MFAVerifyStep from '../components/auth/MFAVerifyStep.jsx';
 
+// PHASE-B FIX: super_admin now redirects to /super-admin after login, not
+// /admin — see Header.jsx for the identical, more detailed rationale (this
+// mapping previously existed independently in two places and needed the
+// same fix in both, which is exactly the kind of duplication Phase 5's L1
+// consolidation was about — flagging here since this ad-hoc duplicate
+// wasn't part of that cleanup pass; a future pass could hoist this single
+// role→route map into one shared constant imported by both files).
 const DASHBOARD_ROUTES = {
     admin:        '/admin',
     doctor:       '/doctor',
     receptionist: '/receptionist',
     patient:      '/patient',
-    super_admin:  '/admin',
+    super_admin:  '/super-admin',
 };
 
 const LoginPage = () => {

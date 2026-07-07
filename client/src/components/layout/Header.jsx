@@ -3,12 +3,21 @@ import { NavLink, useNavigate } from 'react-router-dom';
 import { useAuth } from '../../context/AuthContext';
 import NotificationBell from './NotificationBell.jsx';
 
+// PHASE-B FIX: super_admin's default "My Dashboard" link now points to
+// /super-admin, not /admin. Before this fix, a super_admin's dashboard link
+// landed them in AdminDashboard.jsx with no organisation context set at
+// all — every data call that page makes (getDashboardStats, getAllUsers,
+// fetchPackages, getDoctorProfiles) hits a route that requires resolved
+// tenant context and would 400 with "Organisation not specified" the
+// moment a second hospital existed in the system. super_admin can still
+// reach /admin deliberately (via SuperAdminDashboard's org switcher, which
+// sets an org slug first) — this only changes their DEFAULT landing point.
 const DASHBOARD_ROUTES = {
     admin:        '/admin',
     doctor:       '/doctor',
     receptionist: '/receptionist',
     patient:      '/patient',
-    super_admin:  '/admin',
+    super_admin:  '/super-admin',
 };
 
 const navLinkClass = ({ isActive }) =>
