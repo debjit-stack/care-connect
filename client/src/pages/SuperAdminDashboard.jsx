@@ -115,12 +115,24 @@ const SuperAdminDashboard = () => {
         <div>
             <div className="flex justify-between items-center mb-6 flex-wrap gap-3">
                 <h1 className="text-3xl font-bold">Super Admin — Platform Overview</h1>
-                <button
-                    onClick={() => setModal({ type: 'create' })}
-                    className="bg-blue-500 hover:bg-blue-600 text-white font-semibold py-2 px-4 rounded transition-colors"
-                >
-                    + Create Organisation
-                </button>
+                <div className="flex gap-3">
+                    {/* PHASE-C addition: dedicated guided onboarding flow,
+                        distinct from the quick-create modal below — see
+                        HospitalOnboardingPage.jsx for why these are kept
+                        as two separate paths rather than one. */}
+                    <button
+                        onClick={() => navigate('/super-admin/onboard')}
+                        className="bg-green-500 hover:bg-green-600 text-white font-semibold py-2 px-4 rounded transition-colors"
+                    >
+                        Onboard New Hospital
+                    </button>
+                    <button
+                        onClick={() => setModal({ type: 'create' })}
+                        className="bg-blue-500 hover:bg-blue-600 text-white font-semibold py-2 px-4 rounded transition-colors"
+                    >
+                        + Quick Create
+                    </button>
+                </div>
             </div>
 
             {error && <p className="bg-red-100 text-red-700 p-3 rounded mb-4">{error}</p>}

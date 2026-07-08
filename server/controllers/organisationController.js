@@ -4,6 +4,30 @@ import User         from '../models/User.js';
 import audit        from '../utils/audit.js';
 import { revokeAllRefreshTokens } from '../utils/tokens.js';
 
+// ─── GET /api/organisations/slug-availability/:slug (super-admin only) ───────
+// PHASE-C addition: supports live slug-availability checking in the
+// guided Hospital Onboarding flow (client/src/pages/HospitalOnboardingPage.jsx),
+// so a conflict surfaces while the user is still typing rather than only on
+// final submit (a 409 from createOrganisation). Deliberately checks
+// EXISTENCE only (deletedAt: null) — a slug belonging to a suspended org is
+// still "taken" and must not be reused, since reactivating that org later
+// would then collide with whatever new org took its slug.
+export const checkSlugAvailability = async (req, res) => {
+    try {
+        const slug = (req.params.slug || '').toLowerCase().trim();
+
+        if (!/^[a-z0-9-]{3,63}$/.test(slug)) {
+            return res.json({ available: false, reason: 'invalid_format' });
+        }
+
+        const exists = await Organisation.findOne({ slug, deletedAt: null }).select('_id').lean();
+        res.json({ available: !exists });
+    } catch (err) {
+        console.error('[Org] checkSlugAvailability:', err.message);
+        res.status(500).json({ message: 'Failed to check slug availability' });
+    }
+};
+
 // ─── GET /api/organisations (super-admin only) ────────────────────────────────
 // PHASE-B FIX: previously filtered to { deletedAt: null }, which silently
 // excluded every suspended organisation from this list entirely. That was

@@ -23,3 +23,7 @@ export const reactivateOrganisation = (id) => API.patch(`/organisations/${id}/re
 
 export const getOrganisationStats = (id) => API.get(`/organisations/${id}/stats`);
 export const getPlatformStats     = () => API.get('/organisations/platform-stats');
+
+// PHASE-C addition: live slug-availability checking for the guided
+// onboarding flow (HospitalOnboardingPage.jsx).
+export const checkSlugAvailability = (slug) => API.get(`/organisations/slug-availability/${encodeURIComponent(slug)}`);

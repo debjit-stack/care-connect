@@ -8,6 +8,7 @@ import {
     reactivateOrganisation,
     getOrganisationStats,
     getPlatformStats,
+    checkSlugAvailability,
 } from '../controllers/organisationController.js';
 import { protect, requireRole } from '../middleware/authMiddleware.js';
 import {
@@ -43,6 +44,14 @@ router.post('/',
 router.get('/platform-stats',
     superAdmin,
     getPlatformStats
+);
+
+// PHASE-C addition: no ordering conflict with /:id (different segment
+// count) or /:id/stats (different literal segment) — see route-ordering
+// analysis in the Phase C notes.
+router.get('/slug-availability/:slug',
+    superAdmin,
+    checkSlugAvailability
 );
 
 router.get('/:id',

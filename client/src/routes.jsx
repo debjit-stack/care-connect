@@ -13,6 +13,7 @@ import PatientProfilePage from './pages/PatientProfilePage';
 
 import AdminDashboard        from './pages/AdminDashboard';
 import SuperAdminDashboard   from './pages/SuperAdminDashboard';
+import HospitalOnboardingPage from './pages/HospitalOnboardingPage';
 import DoctorDashboard       from './pages/DoctorDashboard';
 import ReceptionistDashboard from './pages/ReceptionistDashboard';
 import PatientDashboard      from './pages/PatientDashboard';
@@ -52,6 +53,12 @@ const AppRoutes = () => {
       <Route path="/super-admin" element={
         <ProtectedRoute allowedRoles={['super_admin']}>
           <SuperAdminDashboard />
+        </ProtectedRoute>
+      } />
+      {/* PHASE-C addition: guided hospital onboarding flow */}
+      <Route path="/super-admin/onboard" element={
+        <ProtectedRoute allowedRoles={['super_admin']}>
+          <HospitalOnboardingPage />
         </ProtectedRoute>
       } />
       <Route path="/doctor" element={
