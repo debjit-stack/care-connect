@@ -13,8 +13,59 @@ export const setOrgSlug = (slug) => {
     if (slug) sessionStorage.setItem('cc_org_slug', slug);
     else sessionStorage.removeItem('cc_org_slug');
 };
-export const getOrgSlug   = () => _orgSlug || sessionStorage.getItem('cc_org_slug')|| import.meta.env.VITE_ORGANISATION_SLUG;
 export const clearOrgSlug = () => { _orgSlug = null; sessionStorage.removeItem('cc_org_slug'); };
+
+// PHASE-D addition: Platform Mode flag. Same module-variable +
+// sessionStorage-mirror pattern as _orgSlug, so it survives a page refresh
+// (e.g. a super_admin refreshing while on /super-admin shouldn't suddenly
+// fall back into Hospital Mode).
+let _platformMode = null;
+
+export const setPlatformMode = (on) => {
+    _platformMode = on;
+    if (on) sessionStorage.setItem('cc_platform_mode', 'true');
+    else sessionStorage.removeItem('cc_platform_mode');
+};
+export const getPlatformMode = () => {
+    if (_platformMode !== null) return _platformMode;
+    return sessionStorage.getItem('cc_platform_mode') === 'true';
+};
+export const clearPlatformMode = () => { _platformMode = false; sessionStorage.removeItem('cc_platform_mode'); };
+
+// PHASE-D FIX: root cause of the Super Admin login/dashboard breakage.
+// Previously: `_orgSlug || sessionStorage.getItem('cc_org_slug') ||
+// import.meta.env.VITE_ORGANISATION_SLUG` — meaning ANY session, including
+// a super_admin's, silently fell back to the hospital's env-configured
+// slug the moment no explicit slug was set. That's exactly backwards for
+// Platform Mode: a super_admin must start with NO organisation header at
+// all (see authController.loginUser's super_admin bypass, which depends on
+// this), but previously could never actually reach that state as long as
+// VITE_ORGANISATION_SLUG was configured for hospital deployments — leaving
+// only "break hospital logins by unsetting the env var" as the workaround,
+// which is what caused the original bug report.
+//
+// Precedence, in order:
+//   1. An explicit slug (via setOrgSlug — e.g. "Manage Hospital") always
+//      wins, regardless of mode. This is what lets a super_admin
+//      deliberately step INTO a specific hospital's context.
+//   2. Platform Mode with no explicit slug → null, always. Never falls
+//      back to the env var. This is what makes the org-header-free login
+//      and dashboard calls actually reach the backend's super_admin
+//      bypass path instead of accidentally scoping to whatever hospital
+//      the .env happens to be configured for.
+//   3. Otherwise (ordinary Hospital Mode) → unchanged from before: the
+//      explicit slug if set, else the env fallback. Hospital deployments
+//      using VITE_ORGANISATION_SLUG continue working exactly as they did
+//      before this fix — this is what Task 1 (restore hospital frontend
+//      behaviour) required.
+export const getOrgSlug = () => {
+    const explicit = _orgSlug || sessionStorage.getItem('cc_org_slug');
+    if (explicit) return explicit;
+
+    if (getPlatformMode()) return null;
+
+    return import.meta.env.VITE_ORGANISATION_SLUG;
+};
 
 // ── Axios instance ────────────────────────────────────────────────────────────
 const API = axios.create({

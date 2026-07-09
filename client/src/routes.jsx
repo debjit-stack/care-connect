@@ -2,6 +2,7 @@ import React from 'react';
 import { Routes, Route } from 'react-router-dom';
 import HomePage          from './pages/HomePage';
 import LoginPage         from './pages/LoginPage';
+import SuperAdminLoginPage from './pages/SuperAdminLoginPage';
 import RegisterPage      from './pages/RegisterPage';
 import ForgotPasswordPage from './pages/ForgotPasswordPage';
 import MFASetupPage      from './pages/MFASetupPage';
@@ -24,6 +25,8 @@ const AppRoutes = () => {
       {/* Public Routes */}
       <Route path="/"                element={<HomePage />} />
       <Route path="/login"           element={<LoginPage />} />
+      {/* PHASE-D addition */}
+      <Route path="/super-admin/login" element={<SuperAdminLoginPage />} />
       <Route path="/register"        element={<RegisterPage />} />
       <Route path="/forgot-password" element={<ForgotPasswordPage />} />
       <Route path="/mfa-setup"       element={<MFASetupPage />} />

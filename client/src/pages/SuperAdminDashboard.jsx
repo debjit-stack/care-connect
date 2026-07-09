@@ -3,25 +3,26 @@ import { useNavigate } from 'react-router-dom';
 import {
     getPlatformStats,
     getAllOrganisations,
-    createOrganisation,
     suspendOrganisation,
     reactivateOrganisation,
 } from '../api/organisations.js';
-import { setOrgSlug } from '../api/index.js';
+import { setOrgSlug, clearOrgSlug } from '../api/index.js';
 import StatsCard          from '../components/admin/StatsCard';
 import ConfirmModal       from '../components/common/ConfirmModal';
-import CreateOrganisationModal from '../components/admin/modals/CreateOrganisationModal';
 
-// PHASE-B addition: super_admin's own dashboard — platform-wide overview
-// plus organisation lifecycle management (create / suspend / reactivate)
-// and the "switch into an org's admin view" entry point.
+// PHASE-D FIX (Task 4): clearOrgSlug() now runs on every mount of this
+// page — not just when the user clicks something. This closes the actual
+// bug reported: Platform → Manage Hospital → Return to Platform used to
+// leave organisationSlug still set to whatever hospital was last managed,
+// because nothing ever cleared it on the way BACK. Running it
+// unconditionally on mount covers every path back here — clicking a "back
+// to platform" link, browser back button, or typing the URL directly —
+// without requiring any of them to remember to call it themselves.
 //
-// Deliberately NOT built as a variant of AdminDashboard.jsx: that
-// component's entire data model (org-scoped users/doctors/packages/stats)
-// doesn't apply here at all — a super_admin with no organisationId of
-// their own has nothing for those org-scoped endpoints to return before
-// they've chosen a specific org to act within (see the "Manage" action
-// below, which is exactly that choice).
+// PHASE-D FIX (Task 5): Quick Create has been removed entirely. Guided
+// Onboarding (HospitalOnboardingPage.jsx) is now the only organisation
+// creation workflow — CreateOrganisationModal.jsx should be deleted from
+// the repository; nothing imports it anymore.
 const SuperAdminDashboard = () => {
     const navigate = useNavigate();
 
@@ -32,6 +33,10 @@ const SuperAdminDashboard = () => {
     const [search,  setSearch]  = useState('');
 
     const [modal, setModal] = useState({ type: null, data: null });
+
+    useEffect(() => {
+        clearOrgSlug();
+    }, []);
 
     const loadData = useCallback(async () => {
         try {
@@ -54,13 +59,6 @@ const SuperAdminDashboard = () => {
     useEffect(() => { loadData(); }, [loadData]);
 
     const closeModal = () => setModal({ type: null, data: null });
-
-    // ── Create organisation ─────────────────────────────────────────────────
-    const handleCreateOrg = async (payload) => {
-        await createOrganisation(payload); // lets CreateOrganisationModal show its own error on failure
-        closeModal();
-        loadData();
-    };
 
     // ── Suspend (consequential — revokes every user's session in that org) ──
     const handleSuspendClick = (org) => {
@@ -115,24 +113,15 @@ const SuperAdminDashboard = () => {
         <div>
             <div className="flex justify-between items-center mb-6 flex-wrap gap-3">
                 <h1 className="text-3xl font-bold">Super Admin — Platform Overview</h1>
-                <div className="flex gap-3">
-                    {/* PHASE-C addition: dedicated guided onboarding flow,
-                        distinct from the quick-create modal below — see
-                        HospitalOnboardingPage.jsx for why these are kept
-                        as two separate paths rather than one. */}
-                    <button
-                        onClick={() => navigate('/super-admin/onboard')}
-                        className="bg-green-500 hover:bg-green-600 text-white font-semibold py-2 px-4 rounded transition-colors"
-                    >
-                        Onboard New Hospital
-                    </button>
-                    <button
-                        onClick={() => setModal({ type: 'create' })}
-                        className="bg-blue-500 hover:bg-blue-600 text-white font-semibold py-2 px-4 rounded transition-colors"
-                    >
-                        + Quick Create
-                    </button>
-                </div>
+                {/* PHASE-D FIX (Task 5): Quick Create removed — Guided
+                    Onboarding is now the only organisation creation
+                    workflow. */}
+                <button
+                    onClick={() => navigate('/super-admin/onboard')}
+                    className="bg-green-500 hover:bg-green-600 text-white font-semibold py-2 px-4 rounded transition-colors"
+                >
+                    Onboard New Hospital
+                </button>
             </div>
 
             {error && <p className="bg-red-100 text-red-700 p-3 rounded mb-4">{error}</p>}
@@ -230,9 +219,6 @@ const SuperAdminDashboard = () => {
                 </div>
             </div>
 
-            {modal.type === 'create' && (
-                <CreateOrganisationModal onClose={closeModal} onSave={handleCreateOrg} />
-            )}
             {modal.type === 'confirm' && (
                 <ConfirmModal
                     title={modal.data.title}

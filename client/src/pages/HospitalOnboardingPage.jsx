@@ -3,12 +3,12 @@ import { useNavigate } from 'react-router-dom';
 import { createOrganisation, checkSlugAvailability } from '../api/organisations.js';
 import { setOrgSlug } from '../api/index.js';
 
-// PHASE-C addition: guided, multi-step hospital onboarding — distinct from
-// SuperAdminDashboard's quick CreateOrganisationModal (which stays as the
-// lightweight/optional-admin path). This flow makes the first-admin step
-// mandatory and adds live slug-availability feedback, on the premise that
-// dedicated onboarding should always produce an immediately-usable
-// hospital, not a shell organisation.
+// PHASE-C addition, PHASE-D FIX (Task 5): guided, multi-step hospital
+// onboarding. Originally built alongside a separate "Quick Create" modal
+// in SuperAdminDashboard with an optional first-admin step; that modal has
+// since been removed entirely (Task 5) — this guided flow, with a
+// MANDATORY first-admin step, is now the only organisation creation
+// workflow in the app.
 
 const emptyAddress = { line1: '', city: '', state: '', pincode: '', country: 'India' };
 
@@ -129,7 +129,10 @@ const HospitalOnboardingPage = () => {
             setStep(3);
         } catch (err) {
             setError(err?.response?.data?.message || 'Failed to create organisation. Please try again.');
-            setStep(2); // stay on review so they can see the error and retry
+            // Deliberately no setStep() here — the user is already on
+            // step 2 (Review) when this fires, since that's the only step
+            // handleConfirm is ever called from. The error banner renders
+            // in place; no navigation is needed.
         } finally {
             setSaving(false);
         }

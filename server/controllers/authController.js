@@ -598,18 +598,33 @@ const sendMfaChallenge = (
 const loginUser = async (req, res) => {
     try {
         const { email, password } = req.body;
-        // Super Admin login bypass (organisation-independent)
+
+        // Super Admin login bypass (organisation-independent). Checked
+        // unconditionally, before any org resolution, so this works
+        // regardless of whether the client sends no header, a stale
+        // header, or a wrong header — a super_admin's organisationId is
+        // always null, so an org-scoped user lookup could never find them
+        // anyway; there is no tenant context this account could ever
+        // "belong" to. Strictly role-gated (role: 'super_admin') — no
+        // ordinary tenant account can ever match this query, so it adds no
+        // new attack surface for hospital users.
         const superAdmin = await User.findOne({
             email,
             role: 'super_admin',
             deletedAt: null,
         })
-        .select('+password +loginAttempts +lockUntil +passwordChangedAt +forceMfa')
-        .skipTenantFilter();
+            .select('+password +loginAttempts +lockUntil +passwordChangedAt +forceMfa')
+            .skipTenantFilter();
 
         if (superAdmin) {
             if (superAdmin.isLocked) {
                 const m = Math.ceil((superAdmin.lockUntil - Date.now()) / 60000);
+                // FIX: failed/locked attempts against this account must be
+                // audited exactly like any other user's — see review notes.
+                audit(req, 'AUTH_LOGIN_FAILED', {
+                    actorId: superAdmin._id, actorRole: superAdmin.role, success: false,
+                    meta: { reason: 'account_locked' },
+                });
                 return res.status(423).json({
                     message: `Account locked. Try again in ${m} minute${m === 1 ? '' : 's'}.`,
                 });
@@ -623,7 +638,13 @@ const loginUser = async (req, res) => {
                 const after = superAdmin.loginAttempts + 1;
                 const remaining = 5 - after;
 
+                audit(req, 'AUTH_LOGIN_FAILED', {
+                    actorId: superAdmin._id, actorRole: superAdmin.role, success: false,
+                    meta: { reason: 'wrong_password', after },
+                });
+
                 if (after >= 5) {
+                    audit(req, 'AUTH_ACCOUNT_LOCKED', { actorId: superAdmin._id, actorRole: superAdmin.role });
                     return res.status(423).json({
                         message: 'Account locked. Try again in 15 minutes.',
                     });
@@ -636,7 +657,22 @@ const loginUser = async (req, res) => {
 
             await superAdmin.resetLoginAttempts();
 
-            // Super Admin never belongs to an organisation
+            // FIX: super_admin must still pass through the same MFA
+            // decision as any other staff role. Omitting this silently
+            // disabled MFA enforcement for the platform's highest-privilege
+            // account even when mfaEnabled/forceMfa is explicitly set —
+            // SecurityPanel.jsx already treats super_admin as a manageable
+            // "staff" role for exactly this purpose. Org-level mfaRequired
+            // never applies here (org is always null for this role), but
+            // the account's OWN mfaEnabled/forceMfa still must.
+            if (superAdmin.forceMfa && !superAdmin.mfaEnabled) {
+                return sendMfaChallenge(res, superAdmin._id, true, 'MFA setup is required for this account.');
+            }
+            if (superAdmin.mfaEnabled) {
+                return sendMfaChallenge(res, superAdmin._id, false, 'Please enter your authenticator code.');
+            }
+
+            // Super Admin never belongs to an organisation.
             return issueLoginResponse(res, req, superAdmin, null);
         }
 

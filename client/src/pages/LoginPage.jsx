@@ -183,6 +183,12 @@ const LoginPage = () => {
                     </Link>
                 </p>
             </form>
+            {/* PHASE-D addition: low-emphasis entry point for platform
+                staff — deliberately not styled as a primary action, since
+                this page is for hospital users. */}
+            <p className="text-center text-xs text-gray-400 mt-3">
+                <Link to="/super-admin/login" className="hover:underline">Platform admin sign in →</Link>
+            </p>
         </div>
     );
 };

@@ -20,6 +20,7 @@ import {
     clearAccessToken,
     setOrgSlug,
     clearOrgSlug,
+    clearPlatformMode,
 } from "../api/index.js";
 
 const AuthContext = createContext(null);
@@ -60,6 +61,15 @@ export const AuthProvider = ({ children }) => {
                 if (meData.user.organisation?.slug) {
                     setOrgSlug(meData.user.organisation.slug);
                 }
+                // PHASE-D note: super_admin's meData.user.organisation is
+                // always null, so this branch is simply skipped for them —
+                // no explicit slug gets set on session restore, which is
+                // correct: getOrgSlug()'s Platform Mode branch (see
+                // api/index.js) handles the rest, as long as Platform Mode
+                // itself was already set before this restore ran (it was —
+                // see SuperAdminLoginPage.jsx, which sets it before calling
+                // login(), and it persists across refresh via
+                // sessionStorage same as the org slug does).
             } catch {
                 clearAccessToken();
                 clearOrgSlug();
@@ -137,12 +147,20 @@ export const AuthProvider = ({ children }) => {
     // LOGOUT
     // ============================================================
 
+    // PHASE-D FIX: logout now also clears Platform Mode. Without this, a
+    // super_admin logging out and a hospital user logging into the SAME
+    // browser tab afterward would inherit Platform Mode's "never fall back
+    // to VITE_ORGANISATION_SLUG" behaviour — breaking that hospital user's
+    // login for a reason that would be very confusing to debug (the same
+    // class of bug this whole phase exists to fix, just triggered from the
+    // opposite direction).
     const logout = useCallback(async () => {
         try {
             await logoutApi();
         } finally {
             clearAccessToken();
             clearOrgSlug();
+            clearPlatformMode();
 
             setUser(null);
             setOrg(null);
@@ -159,6 +177,7 @@ export const AuthProvider = ({ children }) => {
         } finally {
             clearAccessToken();
             clearOrgSlug();
+            clearPlatformMode();
 
             setUser(null);
             setOrg(null);
