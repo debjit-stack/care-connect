@@ -2,6 +2,7 @@ import express from 'express';
 import {
     registerUser,
     loginUser,
+    platformLoginUser,
     refreshAccessToken,
     logoutUser,
     logoutAllDevices,
@@ -50,6 +51,19 @@ router.post('/login',
     loginRateLimiter,
     validate(loginSchema),
     loginUser
+);
+
+// PHASE-E addition (Bug #1 fix): dedicated platform login endpoint — the
+// only route that can ever authenticate a super_admin. Reuses loginSchema
+// (email/password only — no extra field needed; the distinction is the
+// route itself, not a client-supplied flag) and the same loginRateLimiter
+// (same protective purpose; the rate-limit key naturally becomes a
+// 'no-org' bucket for these attempts, since this endpoint never resolves
+// an organisation — see rateLimiter.js's extractOrgIdentifier usage).
+router.post('/platform-login',
+    loginRateLimiter,
+    validate(loginSchema),
+    platformLoginUser
 );
 
 router.post('/refresh',

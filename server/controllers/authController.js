@@ -590,90 +590,169 @@ const sendMfaChallenge = (
 };
 
 
-// ─── POST /api/auth/login ─────────────────────────────────────────────────────
+// ─── Shared: password/lockout/MFA decision, used by BOTH login endpoints ──────
+// PHASE-E FIX: previously this logic existed twice — once inline for the
+// super_admin bypass, once inline for ordinary users — with the two copies
+// already having drifted once (the super_admin copy initially omitted MFA
+// enforcement and audit-on-failure; see the earlier review notes). Extracted
+// once, here, so there is exactly one implementation for both
+// /api/auth/login and the new /api/auth/platform-login to call — a third
+// inline copy is exactly the kind of drift risk Phase 5's L1 consolidation
+// was about avoiding elsewhere in this file. Behavior is unchanged from
+// both prior inline versions — same messages, same status codes, same
+// audit calls — this is a structural extraction only, not a logic change.
+// `org` is null for the platform-login path (super_admin never has one);
+// `orgMfaRequired` naturally evaluates to false in that case.
+// ─── Shared: lockout check + password verification, used by BOTH
+// authenticateAndRespond below AND loginUser's wrong-endpoint rejection ──
+// PHASE-E FOLLOW-UP FIX (maintainability): this used to exist twice — once
+// here, once again inline inside loginUser's super_admin-rejection branch
+// (added when that branch was changed to verify the password before
+// revealing anything, per the account-enumeration fix). Two copies of
+// lockout/password-verification logic is exactly the drift risk this
+// file's other extractions (authenticateAndRespond itself, Phase 5's
+// resolveOrganisation) exist to avoid — this consolidates it back down to
+// one implementation. Callers get back a discriminated result rather than
+// a response directly, since what happens on a successful match differs
+// between the two call sites (issue a real session vs. reveal a redirect
+// message) — only the locked/wrong-password outcomes are identical
+// everywhere, so only those are respond-agnostic here.
+const verifyPasswordAndLockout = async (req, user, org = null) => {
+    const orgId = org?._id?.toString() ?? null;
+
+    if (user.isLocked) {
+        const m = Math.ceil((user.lockUntil - Date.now()) / 60000);
+        audit(req, 'AUTH_LOGIN_FAILED', {
+            actorId: user._id, actorRole: user.role, success: false,
+            meta: { reason: 'account_locked', orgId },
+        });
+        return {
+            outcome: 'locked',
+            status:  423,
+            message: `Account locked. Try again in ${m} minute${m === 1 ? '' : 's'}.`,
+        };
+    }
+
+    const isMatch = await user.matchPassword(req.body.password);
+
+    if (!isMatch) {
+        await user.recordFailedLogin();
+        const after     = user.loginAttempts + 1;
+        const remaining = 5 - after;
+
+        audit(req, 'AUTH_LOGIN_FAILED', {
+            actorId: user._id, actorRole: user.role, success: false,
+            meta: { reason: 'wrong_password', after, orgId },
+        });
+
+        if (after >= 5) {
+            audit(req, 'AUTH_ACCOUNT_LOCKED', { actorId: user._id, actorRole: user.role, meta: { orgId } });
+            return { outcome: 'locked', status: 423, message: 'Account locked. Try again in 15 minutes.' };
+        }
+
+        return {
+            outcome: 'wrong_password',
+            status:  401,
+            message: `Invalid email or password. ${remaining} attempt${remaining === 1 ? '' : 's'} remaining.`,
+        };
+    }
+
+    await user.resetLoginAttempts();
+    return { outcome: 'match' };
+};
+
+const authenticateAndRespond = async (req, res, user, org) => {
+    const check = await verifyPasswordAndLockout(req, user, org);
+
+    if (check.outcome !== 'match') {
+        return res.status(check.status).json({ message: check.message });
+    }
+
+    // PATIENT MFA REMOVAL: single centralized bypass gate. (super_admin
+    // never matches this — role is always 'super_admin' on that path.)
+    if (user.role === 'patient') {
+        return issueLoginResponse(res, req, user, org);
+    }
+
+    // Enterprise MFA Decision Tree (STAFF ONLY from here down — includes
+    // super_admin, per SecurityPanel.jsx treating it as a manageable
+    // "staff" role for MFA enforcement purposes).
+    const orgMfaRequired = org?.features?.mfaRequired ?? false;
+    const forceMfa = Boolean(user.forceMfa);
+
+    if (orgMfaRequired || forceMfa) {
+        if (user.mfaEnabled) {
+            return sendMfaChallenge(res, user._id, false, 'Please enter your authenticator code.');
+        }
+        return sendMfaChallenge(res, user._id, true, 'Your organisation requires MFA.');
+    }
+
+    if (user.mfaEnabled) {
+        return sendMfaChallenge(res, user._id, false, 'Please enter your authenticator code.');
+    }
+
+    return issueLoginResponse(res, req, user, org);
+};
+
+// ─── POST /api/auth/login (hospital users only) ────────────────────────────────
 // PATIENT MFA REMOVAL: patients bypass the entire MFA decision tree via a
-// single centralized gate right after password verification. Staff behavior
-// is unchanged below that gate. See Organisation.js / SecurityPanel.jsx for
-// the "mfaRequired = staff-only" reinterpretation.
+// single centralized gate right after password verification (see
+// authenticateAndRespond above). Staff behavior is unchanged below that
+// gate. See Organisation.js / SecurityPanel.jsx for the "mfaRequired =
+// staff-only" reinterpretation.
 const loginUser = async (req, res) => {
     try {
-        const { email, password } = req.body;
+        const { email } = req.body;
 
-        // Super Admin login bypass (organisation-independent). Checked
-        // unconditionally, before any org resolution, so this works
-        // regardless of whether the client sends no header, a stale
-        // header, or a wrong header — a super_admin's organisationId is
-        // always null, so an org-scoped user lookup could never find them
-        // anyway; there is no tenant context this account could ever
-        // "belong" to. Strictly role-gated (role: 'super_admin') — no
-        // ordinary tenant account can ever match this query, so it adds no
-        // new attack surface for hospital users.
-        const superAdmin = await User.findOne({
-            email,
-            role: 'super_admin',
-            deletedAt: null,
+        // PHASE-E FIX (Bug #1, route-based — not a client-supplied flag):
+        // a super_admin may ONLY authenticate via the dedicated
+        // /api/auth/platform-login endpoint. The actual super_admin
+        // authentication logic still lives exclusively in
+        // platformLoginUser below — this block never issues a real login
+        // or MFA challenge — but it DOES verify the password before
+        // deciding what to reveal.
+        //
+        // PHASE-E FOLLOW-UP FIX: previously this rejected with the
+        // specific "Please use the Platform Login" message the MOMENT an
+        // email matching a super_admin was found — before any password
+        // check at all. That let anyone probe /api/auth/login with
+        // candidate emails and learn, with zero knowledge of any password,
+        // which ones belong to a super_admin account: the single highest-
+        // privilege role in the system. The specific redirect message is
+        // now only ever returned AFTER the password has been verified
+        // against that account — i.e. only to someone who already knows
+        // the correct credentials and simply used the wrong page. A wrong
+        // password on a super_admin's email now produces the exact same
+        // response shape as a wrong password on any other account (see the
+        // normal-path wrong-password branch further down — same message
+        // format, same lockout behavior, same audit reason string), so
+        // response content alone can never distinguish "this email belongs
+        // to a super_admin" from "this email belongs to an ordinary user"
+        // without a correct password either way.
+        const maybeSuperAdmin = await User.findOne({
+            email, role: 'super_admin', deletedAt: null,
         })
-            .select('+password +loginAttempts +lockUntil +passwordChangedAt +forceMfa')
+            .select('+password +loginAttempts +lockUntil')
             .skipTenantFilter();
 
-        if (superAdmin) {
-            if (superAdmin.isLocked) {
-                const m = Math.ceil((superAdmin.lockUntil - Date.now()) / 60000);
-                // FIX: failed/locked attempts against this account must be
-                // audited exactly like any other user's — see review notes.
-                audit(req, 'AUTH_LOGIN_FAILED', {
-                    actorId: superAdmin._id, actorRole: superAdmin.role, success: false,
-                    meta: { reason: 'account_locked' },
-                });
-                return res.status(423).json({
-                    message: `Account locked. Try again in ${m} minute${m === 1 ? '' : 's'}.`,
-                });
+        if (maybeSuperAdmin) {
+            const check = await verifyPasswordAndLockout(req, maybeSuperAdmin, null);
+
+            if (check.outcome !== 'match') {
+                return res.status(check.status).json({ message: check.message });
             }
 
-            const isMatch = await superAdmin.matchPassword(password);
-
-            if (!isMatch) {
-                await superAdmin.recordFailedLogin();
-
-                const after = superAdmin.loginAttempts + 1;
-                const remaining = 5 - after;
-
-                audit(req, 'AUTH_LOGIN_FAILED', {
-                    actorId: superAdmin._id, actorRole: superAdmin.role, success: false,
-                    meta: { reason: 'wrong_password', after },
-                });
-
-                if (after >= 5) {
-                    audit(req, 'AUTH_ACCOUNT_LOCKED', { actorId: superAdmin._id, actorRole: superAdmin.role });
-                    return res.status(423).json({
-                        message: 'Account locked. Try again in 15 minutes.',
-                    });
-                }
-
-                return res.status(401).json({
-                    message: `Invalid email or password. ${remaining} attempt${remaining === 1 ? '' : 's'} remaining.`,
-                });
-            }
-
-            await superAdmin.resetLoginAttempts();
-
-            // FIX: super_admin must still pass through the same MFA
-            // decision as any other staff role. Omitting this silently
-            // disabled MFA enforcement for the platform's highest-privilege
-            // account even when mfaEnabled/forceMfa is explicitly set —
-            // SecurityPanel.jsx already treats super_admin as a manageable
-            // "staff" role for exactly this purpose. Org-level mfaRequired
-            // never applies here (org is always null for this role), but
-            // the account's OWN mfaEnabled/forceMfa still must.
-            if (superAdmin.forceMfa && !superAdmin.mfaEnabled) {
-                return sendMfaChallenge(res, superAdmin._id, true, 'MFA setup is required for this account.');
-            }
-            if (superAdmin.mfaEnabled) {
-                return sendMfaChallenge(res, superAdmin._id, false, 'Please enter your authenticator code.');
-            }
-
-            // Super Admin never belongs to an organisation.
-            return issueLoginResponse(res, req, superAdmin, null);
+            // Correct credentials, wrong endpoint — safe to reveal now,
+            // since the requester has already proven they know this
+            // account's password. verifyPasswordAndLockout has already
+            // handled the locked/wrong-password outcomes identically to
+            // any other account above; this audit entry is specific to
+            // the 'match' outcome only.
+            audit(req, 'AUTH_LOGIN_FAILED', {
+                actorId: maybeSuperAdmin._id, actorRole: maybeSuperAdmin.role, success: false,
+                meta: { reason: 'wrong_login_endpoint' },
+            });
+            return res.status(403).json({ message: 'Please use the Platform Login.' });
         }
 
         // PHASE5-L1 FIX: previously called resolveOrgFromRequest() (a plain
@@ -689,13 +768,6 @@ const loginUser = async (req, res) => {
         if (orgResult.status === 'resolved') {
             org = orgResult.org;
         } else if (orgResult.status === 'not_found') {
-            // PHASE5 FIX (incidental correctness improvement, flagged): the
-            // previous implementation could not distinguish "client sent a
-            // bogus/unknown org slug header" from "client sent no header at
-            // all" — resolveOrgFromRequest returned null for both, and this
-            // function's old count-based check would then evaluate the
-            // "no header" case regardless of which one actually happened.
-            // An explicitly wrong org identifier is now rejected directly.
             return res.status(400).json({ message: 'Organisation not specified. Include X-Organisation-Slug header.' });
         } else if (orgResult.status === 'ambiguous') {
             return res.status(400).json({ message: 'Organisation not specified. Include X-Organisation-Slug header.' });
@@ -721,62 +793,48 @@ const loginUser = async (req, res) => {
             return res.status(401).json({ message: 'Invalid email or password' });
         }
 
-        if (user.isLocked) {
-            const m = Math.ceil((user.lockUntil - Date.now()) / 60000);
-            audit(req, 'AUTH_LOGIN_FAILED', { actorId: user._id, actorRole: user.role, success: false, meta: { reason: 'account_locked', orgId: orgId?.toString() ?? null } });
-            return res.status(423).json({ message: `Account locked. Try again in ${m} minute${m === 1 ? '' : 's'}.` });
-        }
-
-        const isMatch = await user.matchPassword(password);
-        if (!isMatch) {
-            await user.recordFailedLogin();
-            const after     = user.loginAttempts + 1;
-            const remaining = 5 - after;
-            audit(req, 'AUTH_LOGIN_FAILED', { actorId: user._id, actorRole: user.role, success: false, meta: { reason: 'wrong_password', after, orgId: orgId?.toString() ?? null } });
-            if (after >= 5) {
-                audit(req, 'AUTH_ACCOUNT_LOCKED', { actorId: user._id, actorRole: user.role, meta: { orgId: orgId?.toString() ?? null } });
-                return res.status(423).json({ message: 'Account locked. Try again in 15 minutes.' });
-            }
-            return res.status(401).json({ message: `Invalid email or password. ${remaining} attempt${remaining === 1 ? '' : 's'} remaining.` });
-        }
-
-        await user.resetLoginAttempts();
-
-        // ─────────────────────────────────────────────────────────────────
-        // PATIENT MFA REMOVAL: single centralized bypass gate.
-        // ─────────────────────────────────────────────────────────────────
-        if (user.role === 'patient') {
-            return issueLoginResponse(res, req, user, org);
-        }
-
-// ─────────────────────────────────────────────────────────────────────
-// Enterprise MFA Decision Tree (STAFF ONLY from here down)
-// ─────────────────────────────────────────────────────────────────────
-
-        const orgMfaRequired = org?.features?.mfaRequired ?? false;
-        const forceMfa = Boolean(user.forceMfa);
-
-        if (orgMfaRequired) {
-            if (user.mfaEnabled) {
-                return sendMfaChallenge(res, user._id, false, "Please enter your authenticator code.");
-            }
-            return sendMfaChallenge(res, user._id, true, "Your organisation requires MFA.");
-        }
-
-        if (forceMfa) {
-            if (user.mfaEnabled) {
-                return sendMfaChallenge(res, user._id, false, "Please enter your authenticator code.");
-            }
-            return sendMfaChallenge(res, user._id, true, "Your organisation requires MFA.");
-        }
-
-        if (user.mfaEnabled) {
-            return sendMfaChallenge(res, user._id, false, "Please enter your authenticator code.");
-        }
-
-        return issueLoginResponse(res, req, user, org);
+        return authenticateAndRespond(req, res, user, org);
     } catch (err) {
         console.error('[Auth] loginUser:', err.message);
+        return res.status(500).json({ message: 'Login failed. Please try again.' });
+    }
+};
+
+// ─── POST /api/auth/platform-login (super_admin only) ──────────────────────────
+// PHASE-E FIX (Bug #1, route-based): the ONLY endpoint that can ever
+// authenticate a super_admin. Structurally cannot authenticate a
+// non-super_admin — there is no hospital-user lookup anywhere in this
+// function at all, so "reject non-super_admin" isn't a check that could be
+// forgotten or bypassed, it's simply not a code path that exists here.
+// Never resolves an organisation, never sends/expects an
+// X-Organisation-Slug header — see tenantMiddleware.js's PUBLIC_EXACT list,
+// where this route is now included alongside /api/auth/login.
+const platformLoginUser = async (req, res) => {
+    try {
+        const { email } = req.body;
+
+        const superAdmin = await User.findOne({
+            email, role: 'super_admin', deletedAt: null,
+        })
+            .select('+password +loginAttempts +lockUntil +passwordChangedAt +forceMfa')
+            .skipTenantFilter();
+
+        if (!superAdmin) {
+            // Deliberately generic — see loginUser's rejection above for
+            // the asymmetric reasoning. An untrusted requester probing
+            // this endpoint learns nothing about whether the email exists
+            // or belongs to a hospital account.
+            audit(req, 'AUTH_LOGIN_FAILED', {
+                success: false,
+                meta: { reason: 'platform_login_no_such_super_admin', email },
+            });
+            return res.status(401).json({ message: 'Invalid email or password.' });
+        }
+
+        // Super Admin never belongs to an organisation.
+        return authenticateAndRespond(req, res, superAdmin, null);
+    } catch (err) {
+        console.error('[Auth] platformLoginUser:', err.message);
         return res.status(500).json({ message: 'Login failed. Please try again.' });
     }
 };
@@ -884,7 +942,7 @@ const getMe = async (req, res) => {
 };
 
 export {
-    registerUser, loginUser, refreshAccessToken,
+    registerUser, loginUser, platformLoginUser, refreshAccessToken,
     logoutUser, logoutAllDevices, changePassword, getMe,
     requestRegistrationOtp, resendRegistrationOtp, verifyRegistrationOtp,
     forgotPassword, resendForgotPasswordOtp, verifyForgotPasswordOtp, resetPasswordWithToken,

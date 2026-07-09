@@ -1,6 +1,10 @@
 import API from './index.js';
 
 export const login          = (formData)    => API.post('/auth/login', formData);
+// PHASE-E addition: dedicated endpoint for the platform login flow — see
+// authController.platformLoginUser. Same request/response shape as login()
+// above (including the mfaRequired branch), just a different URL.
+export const platformLogin  = (formData)    => API.post('/auth/platform-login', formData);
 export const register       = (formData)    => API.post('/auth/register', formData);
 export const logout         = ()            => API.post('/auth/logout');
 export const logoutAll      = ()            => API.post('/auth/logout-all');

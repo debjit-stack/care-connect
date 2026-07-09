@@ -15,54 +15,78 @@ export const setOrgSlug = (slug) => {
 };
 export const clearOrgSlug = () => { _orgSlug = null; sessionStorage.removeItem('cc_org_slug'); };
 
-// PHASE-D addition: Platform Mode flag. Same module-variable +
-// sessionStorage-mirror pattern as _orgSlug, so it survives a page refresh
-// (e.g. a super_admin refreshing while on /super-admin shouldn't suddenly
-// fall back into Hospital Mode).
-let _platformMode = null;
+// PHASE-E FIX: replaces the earlier `platformMode` flag entirely (removed
+// — setPlatformMode/getPlatformMode/clearPlatformMode no longer exist).
+//
+// Root cause of the bug this replaces: platformMode's only writer was a
+// single page's mount effect (SuperAdminLoginPage). A silent session
+// restore via the httpOnly refresh cookie (AuthContext.restoreSession)
+// never mounts that page — it redirects straight to the dashboard — so the
+// flag never got set on that path, and any leftover explicit org slug from
+// an earlier "Manage Hospital" click in the same browser session would
+// then leak into every request for the rest of that silently-restored
+// session, with no reliable way to have prevented it.
+//
+// The fix: stop tracking a separate flag at all. currentUserRole is set by
+// the SAME two code paths that reliably fire on every possible way to end
+// up authenticated — completeLogin() (password/MFA login) and
+// restoreSession()'s success branch (silent cookie restore) — so it can
+// never drift out of sync with who is actually logged in. Same
+// module-variable + sessionStorage-mirror pattern as _orgSlug, for the
+// same reason (survives a page refresh).
+let _currentUserRole = null;
 
-export const setPlatformMode = (on) => {
-    _platformMode = on;
-    if (on) sessionStorage.setItem('cc_platform_mode', 'true');
-    else sessionStorage.removeItem('cc_platform_mode');
+export const setCurrentUserRole = (role) => {
+    _currentUserRole = role;
+    if (role) sessionStorage.setItem('cc_user_role', role);
+    else sessionStorage.removeItem('cc_user_role');
 };
-export const getPlatformMode = () => {
-    if (_platformMode !== null) return _platformMode;
-    return sessionStorage.getItem('cc_platform_mode') === 'true';
-};
-export const clearPlatformMode = () => { _platformMode = false; sessionStorage.removeItem('cc_platform_mode'); };
+export const getCurrentUserRole = () => _currentUserRole ?? sessionStorage.getItem('cc_user_role');
+export const clearCurrentUserRole = () => { _currentUserRole = null; sessionStorage.removeItem('cc_user_role'); };
 
-// PHASE-D FIX: root cause of the Super Admin login/dashboard breakage.
-// Previously: `_orgSlug || sessionStorage.getItem('cc_org_slug') ||
-// import.meta.env.VITE_ORGANISATION_SLUG` — meaning ANY session, including
-// a super_admin's, silently fell back to the hospital's env-configured
-// slug the moment no explicit slug was set. That's exactly backwards for
-// Platform Mode: a super_admin must start with NO organisation header at
-// all (see authController.loginUser's super_admin bypass, which depends on
-// this), but previously could never actually reach that state as long as
-// VITE_ORGANISATION_SLUG was configured for hospital deployments — leaving
-// only "break hospital logins by unsetting the env var" as the workaround,
-// which is what caused the original bug report.
+// PHASE-E FIX: getOrgSlug() is the SINGLE function responsible for
+// determining the tenant header — the axios request interceptor below is
+// its only caller, and no other code in the app reads sessionStorage's
+// org-slug key directly. (Confirmed by audit: every setOrgSlug/
+// clearOrgSlug/getOrgSlug call site in the codebase goes through this
+// module; nothing bypasses it.)
 //
 // Precedence, in order:
-//   1. An explicit slug (via setOrgSlug — e.g. "Manage Hospital") always
-//      wins, regardless of mode. This is what lets a super_admin
-//      deliberately step INTO a specific hospital's context.
-//   2. Platform Mode with no explicit slug → null, always. Never falls
-//      back to the env var. This is what makes the org-header-free login
-//      and dashboard calls actually reach the backend's super_admin
-//      bypass path instead of accidentally scoping to whatever hospital
-//      the .env happens to be configured for.
-//   3. Otherwise (ordinary Hospital Mode) → unchanged from before: the
-//      explicit slug if set, else the env fallback. Hospital deployments
-//      using VITE_ORGANISATION_SLUG continue working exactly as they did
-//      before this fix — this is what Task 1 (restore hospital frontend
-//      behaviour) required.
-export const getOrgSlug = () => {
+//   0. PHASE-F FIX: the request is going to /auth/platform-login itself →
+//      null, unconditionally, before anything else is even checked. The
+//      platform-login REQUEST is sent before any response comes back, so
+//      currentUserRole (step 2 below) cannot possibly reflect the
+//      super_admin identity of a request that hasn't succeeded yet —
+//      role-derivation is correct for every request AFTER authentication,
+//      it structurally cannot be correct for the login request that
+//      produces that authentication. This is a stateless, per-call check
+//      against the request URL the interceptor already has — not a new
+//      flag, not sent to or trusted by the backend for any decision (the
+//      backend already independently guarantees this endpoint never
+//      resolves tenant context — see tenantMiddleware's PUBLIC_EXACT
+//      list). It only stops the client from ever sending the header here.
+//   1. An explicit slug (via setOrgSlug — "Manage Hospital") always wins,
+//      regardless of role. This is what lets a super_admin deliberately
+//      step INTO a specific hospital's context.
+//   2. currentUserRole === 'super_admin' with no explicit slug → null,
+//      always. Never falls back to the env var. Because currentUserRole is
+//      set by both completeLogin AND restoreSession, this is correct
+//      regardless of HOW the super_admin's session came to exist — fresh
+//      password login, MFA completion, or silent cookie restore all
+//      converge on the same role state (for every request except the
+//      platform-login request itself, which step 0 already handles).
+//   3. Otherwise (ordinary hospital user, or no known role yet) → the
+//      explicit slug if set, else the env fallback. Unchanged from
+//      original hospital-frontend behaviour.
+const PLATFORM_LOGIN_PATH = '/auth/platform-login';
+
+export const getOrgSlug = (requestUrl) => {
+    if (requestUrl?.includes(PLATFORM_LOGIN_PATH)) return null;
+
     const explicit = _orgSlug || sessionStorage.getItem('cc_org_slug');
     if (explicit) return explicit;
 
-    if (getPlatformMode()) return null;
+    if (getCurrentUserRole() === 'super_admin') return null;
 
     return import.meta.env.VITE_ORGANISATION_SLUG;
 };
@@ -77,7 +101,7 @@ const API = axios.create({
 API.interceptors.request.use((config) => {
     const token = getAccessToken();
     if (token) config.headers.Authorization = `Bearer ${token}`;
-    const slug = getOrgSlug();
+    const slug = getOrgSlug(config.url);
     if (slug)  config.headers['X-Organisation-Slug'] = slug;
     return config;
 }, (error) => Promise.reject(error));
@@ -98,7 +122,8 @@ API.interceptors.response.use(
             error.response?.status === 401 &&
             !orig._retry &&
             !orig.url.includes('/auth/refresh') &&
-            !orig.url.includes('/auth/login')
+            !orig.url.includes('/auth/login') &&
+            !orig.url.includes('/auth/platform-login')
         ) {
             if (isRefreshing) {
                 return new Promise((resolve, reject) => {

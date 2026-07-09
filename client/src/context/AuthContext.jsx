@@ -9,6 +9,7 @@ import React, {
 
 import {
     login as loginApi,
+    platformLogin as platformLoginApi,
     logout as logoutApi,
     logoutAll as logoutAllApi,
     refreshToken,
@@ -20,7 +21,8 @@ import {
     clearAccessToken,
     setOrgSlug,
     clearOrgSlug,
-    clearPlatformMode,
+    setCurrentUserRole,
+    clearCurrentUserRole,
 } from "../api/index.js";
 
 const AuthContext = createContext(null);
@@ -58,21 +60,33 @@ export const AuthProvider = ({ children }) => {
                 setUser(meData.user);
                 setOrg(meData.user.organisation ?? null);
 
+                // PHASE-E FIX: this is the critical fix for the root cause
+                // identified in this phase's audit. A silently-restored
+                // session (via httpOnly refresh cookie, e.g. reopening the
+                // app without having logged out) NEVER mounts
+                // SuperAdminLoginPage or LoginPage — it goes straight from
+                // this effect to whatever dashboard route the user's role
+                // sends them to. Setting currentUserRole HERE, on every
+                // restore, regardless of role, means getOrgSlug()'s
+                // super_admin check (api/index.js) is correct on this path
+                // too, not just on a fresh password login. This was
+                // previously missing entirely for the old platformMode
+                // flag, which is the actual bug this phase fixes.
+                setCurrentUserRole(meData.user.role);
+
                 if (meData.user.organisation?.slug) {
                     setOrgSlug(meData.user.organisation.slug);
                 }
-                // PHASE-D note: super_admin's meData.user.organisation is
-                // always null, so this branch is simply skipped for them —
-                // no explicit slug gets set on session restore, which is
-                // correct: getOrgSlug()'s Platform Mode branch (see
-                // api/index.js) handles the rest, as long as Platform Mode
-                // itself was already set before this restore ran (it was —
-                // see SuperAdminLoginPage.jsx, which sets it before calling
-                // login(), and it persists across refresh via
-                // sessionStorage same as the org slug does).
+                // Note: super_admin's meData.user.organisation is always
+                // null, so the branch above is simply skipped for them —
+                // correct, since Manage Hospital's explicit setOrgSlug call
+                // (if any, from before this refresh) is left untouched by
+                // this restore, and getOrgSlug()'s role-based branch
+                // handles the "no explicit slug" case correctly either way.
             } catch {
                 clearAccessToken();
                 clearOrgSlug();
+                clearCurrentUserRole();
                 setUser(null);
                 setOrg(null);
             } finally {
@@ -84,10 +98,18 @@ export const AuthProvider = ({ children }) => {
     }, []);
 
     // Session expired listener
+    // PHASE-E FIX: previously did not clear platform-related state at all
+    // (the old platformMode flag). Now clears currentUserRole too — closing
+    // the second, smaller gap found in this phase's audit: without this, a
+    // super_admin's session silently expiring would leave stale role state
+    // behind, and a DIFFERENT hospital user logging in on the same tab
+    // afterward could inherit "never fall back to the env slug" behaviour
+    // for a reason that would be very confusing to debug.
     useEffect(() => {
         const handler = () => {
             clearAccessToken();
             clearOrgSlug();
+            clearCurrentUserRole();
             setUser(null);
             setOrg(null);
         };
@@ -99,7 +121,7 @@ export const AuthProvider = ({ children }) => {
     }, []);
 
     // ============================================================
-    // COMPLETE LOGIN (MUST COME BEFORE login())
+    // COMPLETE LOGIN (MUST COME BEFORE login()/platformLogin())
     // ============================================================
 
     const completeLogin = useCallback((data) => {
@@ -109,13 +131,18 @@ export const AuthProvider = ({ children }) => {
 
         setOrg(data.user.organisation ?? null);
 
+        // PHASE-E FIX: same fix as restoreSession above, for the
+        // fresh-login path (password login and MFA-completion both funnel
+        // through this function).
+        setCurrentUserRole(data.user.role);
+
         if (data.user.organisation?.slug) {
             setOrgSlug(data.user.organisation.slug);
         }
     }, []);
 
     // ============================================================
-    // LOGIN
+    // LOGIN (hospital users — POST /api/auth/login)
     // ============================================================
 
     const login = useCallback(
@@ -144,23 +171,50 @@ export const AuthProvider = ({ children }) => {
     );
 
     // ============================================================
+    // PLATFORM LOGIN (super_admin only — POST /api/auth/platform-login)
+    // ============================================================
+    // PHASE-E addition. Deliberately a SEPARATE function calling a
+    // SEPARATE API endpoint, not login() with an extra parameter — the
+    // distinction between hospital and platform authentication is made by
+    // ROUTE, not by a client-supplied flag (see authController.js). Shares
+    // completeLogin() for the actual state-setting, since that part is
+    // identical either way.
+    const platformLogin = useCallback(
+        async (email, password) => {
+            const { data } = await platformLoginApi({
+                email,
+                password,
+            });
+
+            if (data.mfaRequired) {
+                const mfaError = new Error("MFA required");
+
+                mfaError.response = {
+                    status: 200,
+                    data,
+                };
+
+                throw mfaError;
+            }
+
+            completeLogin(data);
+
+            return data.user;
+        },
+        [completeLogin]
+    );
+
+    // ============================================================
     // LOGOUT
     // ============================================================
 
-    // PHASE-D FIX: logout now also clears Platform Mode. Without this, a
-    // super_admin logging out and a hospital user logging into the SAME
-    // browser tab afterward would inherit Platform Mode's "never fall back
-    // to VITE_ORGANISATION_SLUG" behaviour — breaking that hospital user's
-    // login for a reason that would be very confusing to debug (the same
-    // class of bug this whole phase exists to fix, just triggered from the
-    // opposite direction).
     const logout = useCallback(async () => {
         try {
             await logoutApi();
         } finally {
             clearAccessToken();
             clearOrgSlug();
-            clearPlatformMode();
+            clearCurrentUserRole();
 
             setUser(null);
             setOrg(null);
@@ -177,7 +231,7 @@ export const AuthProvider = ({ children }) => {
         } finally {
             clearAccessToken();
             clearOrgSlug();
-            clearPlatformMode();
+            clearCurrentUserRole();
 
             setUser(null);
             setOrg(null);
@@ -209,6 +263,7 @@ export const AuthProvider = ({ children }) => {
                 isAuthenticated: !!user,
 
                 login,
+                platformLogin,
                 completeLogin,
 
                 logout,

@@ -10,6 +10,11 @@ import { resolveOrganisation } from '../utils/resolveOrg.js';
 // Exact-match public routes: { method, path }
 const PUBLIC_EXACT = [
     { method: 'POST', path: '/api/auth/login' },
+    // PHASE-E addition: the new dedicated super_admin login endpoint.
+    // Must bypass resolveTenant exactly like /api/auth/login — it never
+    // sends or expects an X-Organisation-Slug header, by design (see
+    // authController.platformLoginUser).
+    { method: 'POST', path: '/api/auth/platform-login' },
     { method: 'POST', path: '/api/auth/register' },
     { method: 'POST', path: '/api/auth/refresh' },
     { method: 'POST', path: '/api/auth/logout' },

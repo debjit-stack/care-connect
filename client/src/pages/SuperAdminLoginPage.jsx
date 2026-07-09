@@ -1,25 +1,25 @@
 import React, { useState, useEffect } from 'react';
 import { useNavigate, Navigate, Link } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
-import { setPlatformMode, clearOrgSlug } from '../api/index.js';
+import { clearOrgSlug } from '../api/index.js';
 import MFAVerifyStep from '../components/auth/MFAVerifyStep.jsx';
 
-// PHASE-D addition: dedicated Super Admin login entry point.
+// PHASE-D/E: dedicated Super Admin login entry point.
 //
-// The ONE thing that matters here, functionally: Platform Mode must be set
-// — and any leftover org slug cleared — BEFORE the login request is sent,
-// not after. getOrgSlug() (api/index.js) checks Platform Mode to decide
-// whether to fall back to VITE_ORGANISATION_SLUG; if this page called
-// login() first and set Platform Mode after, the very first request would
-// still carry a hospital's org header (or none, ambiguously), fighting the
-// backend's super_admin bypass instead of cooperating with it as the
-// Phase D brief specifically asked for.
+// PHASE-E FIX: no longer calls setPlatformMode() — that flag has been
+// removed entirely. Authentication now goes through platformLogin()
+// (AuthContext), which calls the dedicated POST /api/auth/platform-login
+// endpoint — the ROUTE itself is what distinguishes this from hospital
+// login, not a flag this page has to remember to set. completeLogin()
+// (shared by both login paths) sets currentUserRole from the server's
+// response, which is what getOrgSlug() actually checks — and because that
+// happens inside AuthContext for BOTH a fresh login here AND a silent
+// session restore, there's no code path left where it can fail to be set.
 //
-// Everything else below mirrors LoginPage.jsx's existing structure
-// (including its MFA step handling — super_admin accounts can have MFA
-// enforced via SecurityPanel.jsx, same as any other staff role, see the
-// authController.js fix) rather than inventing a different pattern for a
-// login form that is otherwise functionally identical.
+// clearOrgSlug() on mount is kept as defensive cleanup — if a stale
+// EXPLICIT org slug happens to be sitting in sessionStorage from an
+// earlier "Manage Hospital" click in this same browser session, this
+// ensures a fresh platform-login attempt never accidentally inherits it.
 const DASHBOARD_ROUTES = {
     admin:        '/admin',
     doctor:       '/doctor',
@@ -37,14 +37,10 @@ const SuperAdminLoginPage = () => {
     const [mfaStep,    setMfaStep]    = useState(null); // null | 'verify' | 'setup'
     const [mfaPending, setMfaPending] = useState('');
 
-    const { login, isAuthenticated, user, completeLogin } = useAuth();
+    const { platformLogin, isAuthenticated, user, completeLogin } = useAuth();
     const navigate = useNavigate();
 
-    // Set Platform Mode the moment this page mounts — before any input is
-    // even typed — so there is no window where a stale org slug could leak
-    // into a request from this page.
     useEffect(() => {
-        setPlatformMode(true);
         clearOrgSlug();
     }, []);
 
@@ -64,7 +60,7 @@ const SuperAdminLoginPage = () => {
         setLoading(true);
 
         try {
-            const loggedInUser = await login(email, password);
+            const loggedInUser = await platformLogin(email, password);
             navigate(DASHBOARD_ROUTES[loggedInUser.role] ?? '/super-admin', { replace: true });
         } catch (err) {
             const status = err?.response?.status;
