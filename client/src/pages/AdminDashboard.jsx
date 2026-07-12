@@ -12,7 +12,7 @@ import {
     getDoctorProfiles,
     exportAppointments,
 } from '../api/admin';
-import { fetchPackages, createPackage, deletePackage, updatePackage } from '../api/packages';
+import { createPackage, deletePackage, updatePackage, getAdminPackages } from '../api/packages';
 import { useAuth } from '../context/AuthContext';
 
 // Existing components
@@ -82,10 +82,19 @@ const AdminDashboard = () => {
         try {
             setLoading(true);
             setError('');
+            // PHASE-F Task 4 FIX: was fetchPackages() (the PUBLIC catalog
+            // route, GET /api/packages) — now getAdminPackages() (the
+            // dedicated admin-scoped route, GET /api/admin/packages-full),
+            // mirroring how doctorProfiles already uses getDoctorProfiles()
+            // → /api/admin/doctors-full rather than the public /api/doctors
+            // route. The public route is now correctly tenant-resolved too
+            // (see tenantMiddleware.js), but the admin dashboard shouldn't
+            // depend on the public catalog endpoint regardless — same
+            // separation of concerns doctors already had.
             const [statsData, usersData, packagesData, doctorProfilesData] = await Promise.all([
                 getDashboardStats(),
                 getAllUsers(),
-                fetchPackages(),
+                getAdminPackages(),
                 getDoctorProfiles(),
             ]);
             setStats(statsData.data);

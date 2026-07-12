@@ -348,8 +348,35 @@ const getDoctorsWithProfiles = async (req, res) => {
     }
 };
 
+// ─── GET /api/admin/packages-full (PHASE-F, Task 3) ───────────────────────────
+// Mirrors getDoctorsWithProfiles above exactly: protected (adminRoutes.js
+// mounts this behind `protect, admin`, which was never in any tenant
+// bypass list), no explicit organisationId filter, relies entirely on
+// tenantPlugin's implicit pre-find hook via the ambient context resolveTenant
+// already established earlier in the middleware chain. HealthPackage has no
+// refs to populate (unlike Doctor → user), so no .populate() call is needed
+// here — otherwise identical shape/pattern.
+//
+// This exists specifically so AdminDashboard.jsx can stop depending on the
+// PUBLIC GET /api/packages route (see PHASE-F Task 4) — that route is
+// correctly tenant-resolved now too (see tenantMiddleware.js's
+// PUBLIC_WITH_TENANT category), but it's still the PUBLIC catalog endpoint;
+// giving admin its own dedicated route matches the separation of concerns
+// /api/doctors vs /api/admin/doctors-full already established, rather than
+// having the admin dashboard depend on a route whose primary purpose is
+// serving anonymous public visitors.
+const getPackagesFull = async (req, res) => {
+    try {
+        const packages = await HealthPackage.find({ deletedAt: null }).lean();
+        res.json(packages);
+    } catch (err) {
+        console.error('[Admin] getPackagesFull:', err.message);
+        res.status(500).json({ message: 'Failed to fetch package profiles' });
+    }
+};
+
 export {
     getUsers, getUserById, updateUser, deleteUser,
     createDoctor, updateDoctorProfile, createStaff,
-    resetPassword, getDoctorsWithProfiles,
+    resetPassword, getDoctorsWithProfiles, getPackagesFull,
 };

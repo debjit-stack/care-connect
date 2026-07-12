@@ -2,18 +2,40 @@ import { runWithTenant } from '../plugins/tenantPlugin.js';
 import { extractOrgIdentifier } from '../utils/orgIdentifier.js';
 import { resolveOrganisation } from '../utils/resolveOrg.js';
 
-// ── Paths that bypass tenant resolution completely ────────────────────────────
-// isPublicPath() is METHOD-AWARE: every public entry declares which HTTP
-// method(s) it applies to, so a mutating route added under a "public" prefix
-// never inherits the bypass by accident.
+// ── PHASE-F FIX: PUBLIC_NO_TENANT vs PUBLIC_WITH_TENANT ────────────────────────
+// Previously this file had one concept — "public" — implemented as "skip
+// tenant resolution entirely." That collapsed two genuinely different
+// kinds of routes into one bypass list:
+//
+//   (a) routes that truly have no tenant at all (login, refresh, MFA
+//       pending-token flows, OTP registration/forgot-password) — these
+//       authenticate a specific user or none at all, independent of any
+//       organisation, and correctly never touch runWithTenant().
+//
+//   (b) routes that have NO authenticated USER but absolutely DO have a
+//       TENANT — the public doctor listing and public package catalog are
+//       always being viewed as a specific hospital's public site. Lumping
+//       these into the same bypass as (a) meant runWithTenant() never ran
+//       for them, tenantPlugin's implicit pre-find hook had no ambient
+//       orgId to inject, and Doctor.find(...)/HealthPackage.find(...)
+//       silently executed across every organisation — regardless of
+//       whatever X-Organisation-Slug header the client correctly sent,
+//       since the header was never even read for these routes.
+//
+// The fix separates these into PUBLIC_NO_TENANT (authentication AND tenant
+// resolution both skipped) and PUBLIC_WITH_TENANT (authentication skipped,
+// tenant resolution runs exactly as it does for any protected route).
+// Category B requires no new resolution logic at all — resolveTenant()'s
+// existing header/subdomain lookup, resolveOrganisation() call, and
+// runWithTenant() wrapping already do precisely what these routes need;
+// they only needed to stop being short-circuited before reaching it.
 
-// Exact-match public routes: { method, path }
-const PUBLIC_EXACT = [
+// ── Category A: PUBLIC_NO_TENANT — routes with genuinely no tenant ────────────
+// isPublicNoTenantPath() is METHOD-AWARE: every entry declares which HTTP
+// method(s) it applies to, so a mutating route added under a "public"
+// prefix never inherits the bypass by accident.
+const PUBLIC_NO_TENANT_EXACT = [
     { method: 'POST', path: '/api/auth/login' },
-    // PHASE-E addition: the new dedicated super_admin login endpoint.
-    // Must bypass resolveTenant exactly like /api/auth/login — it never
-    // sends or expects an X-Organisation-Slug header, by design (see
-    // authController.platformLoginUser).
     { method: 'POST', path: '/api/auth/platform-login' },
     { method: 'POST', path: '/api/auth/register' },
     { method: 'POST', path: '/api/auth/refresh' },
@@ -25,20 +47,15 @@ const PUBLIC_EXACT = [
     // mfaPending JWT (as a Bearer header for setup/verify-setup, or in the
     // request body for validate/recover) — they resolve their own user
     // context from that token and never need an X-Organisation-Slug header.
-    // B6 FIX: /mfa/setup and /mfa/verify-setup were missing from this list.
-    // In any multi-org deployment where the client doesn't send an org slug
-    // header (a very plausible situation — different tab, cleared session
-    // storage, etc.), these two routes would 400 with "Organisation not
-    // specified" before ever reaching requireMfaPending/the controller,
-    // breaking staff MFA setup entirely outside single-org deployments.
     { method: 'GET',  path: '/api/auth/mfa/setup' },
     { method: 'POST', path: '/api/auth/mfa/verify-setup' },
     { method: 'POST', path: '/api/auth/mfa/validate' },
     { method: 'POST', path: '/api/auth/mfa/recover' },
 
-    // OTP FEATURE: patient self-registration / forgot-password — resolve org
-    // internally (same pattern as /register above) and are the pre-auth
-    // flows themselves, so no authenticated session or org header applies.
+    // OTP FEATURE: patient self-registration / forgot-password — resolve
+    // org internally (same pattern as /register above) and are the
+    // pre-auth flows themselves, so no authenticated session or org header
+    // applies.
     { method: 'POST', path: '/api/auth/register/request-otp' },
     { method: 'POST', path: '/api/auth/register/resend-otp' },
     { method: 'POST', path: '/api/auth/register/verify-otp' },
@@ -48,61 +65,43 @@ const PUBLIC_EXACT = [
     { method: 'POST', path: '/api/auth/forgot-password/reset' },
 ];
 
-// Prefixes where a SPECIFIC method is public for all sub-paths.
-const PUBLIC_METHOD_PREFIXES = [
-    // GET /api/packages — public catalog listing only.
-    // POST/PUT/DELETE under this prefix (create/update/delete package) are
-    // NOT public and must go through tenant resolution + admin auth.
-    { method: 'GET', prefix: '/api/packages' },
-];
-
-// Individual public doctor paths — using exact matches to avoid catching
-// /api/doctors/my-appointments, /api/doctors/my-profile, etc.
-const PUBLIC_DOCTOR_EXACT_GET = new Set([
-    '/api/doctors',       // GET /api/doctors  (list)
-]);
-const PUBLIC_DOCTOR_DETAIL_GET = /^\/api\/doctors\/[a-f\d]{24}(\/availability)?$/i;
-
-const isPublicPath = (method, url) => {
+const isPublicNoTenantPath = (method, url) => {
     const path = url.split('?')[0];
     const m = (method || 'GET').toUpperCase();
-
-    if (PUBLIC_EXACT.some((e) => e.method === m && e.path === path)) return true;
-
-    if (m === 'GET') {
-        if (PUBLIC_DOCTOR_EXACT_GET.has(path)) return true;
-        if (PUBLIC_DOCTOR_DETAIL_GET.test(path)) return true;
-    }
-
-    for (const { method: pm, prefix } of PUBLIC_METHOD_PREFIXES) {
-        if (pm !== m) continue;
-        if (path === prefix || path.startsWith(prefix + '/') || path.startsWith(prefix + '?')) {
-            return true;
-        }
-    }
-
-    return false;
+    return PUBLIC_NO_TENANT_EXACT.some((e) => e.method === m && e.path === path);
 };
 
-// ── PHASE1B / PHASE4 FIX ────────────────────────────────────────────────────────
-// Routes under these prefixes manage the `Organisation` collection itself.
-// `Organisation` is NOT a tenant-scoped model (it has no organisationId field
-// of its own — it IS the tenant), and organisationController.js already does
-// its own explicit authorization (super_admin-only for global list/create/
-// delete/stats; `req.user.organisationId === org._id` for org-admin's own-org
-// read/update). None of these controllers read req.org or req.orgId at all.
+// ── Category B: PUBLIC_WITH_TENANT — documented here for clarity ──────────────
+// These routes require NO code in this file — that's the point. They are
+// simply absent from PUBLIC_NO_TENANT_EXACT above (so resolveTenant() runs
+// its normal resolution logic for them, exactly as it does for any
+// protected route) AND have no `protect` middleware attached at the route
+// level in doctorRoutes.js / healthPackageRoutes.js (so no authenticated
+// user is required). Listed here purely so it's explicit which routes rely
+// on this behaviour:
 //
-// PHASE1B: a super_admin calling `GET /api/organisations` or
-// `POST /api/organisations` has no reason to send an org header, and
-// previously got a 400 once a second org existed. PHASE4: a super_admin's
-// stale/remembered org header (attached automatically by the frontend's
-// axios layer — see client/src/api/index.js) resolving to a SUSPENDED org
-// used to still 403 these routes, blocking platform-wide management for a
-// reason completely irrelevant to what these routes do. Both are handled by
-// skipping the corresponding checks (ambiguity-as-400, and
-// suspended-as-403) for this route family. A genuinely nonexistent org
-// (bad header value) still 404s — that's a real client error worth
-// surfacing, unlike ambiguity or suspension status.
+//   GET /api/doctors
+//   GET /api/doctors/:id
+//   GET /api/doctors/:id/availability
+//   GET /api/packages
+//
+// PHASE-F consequence, stated explicitly (not a regression): a request to
+// any of these with no X-Organisation-Slug header/subdomain, in a system
+// with 2+ organisations, now receives the same 400 "Organisation not
+// specified" that any other ambiguous request gets — these routes resolve
+// tenant context "exactly like authenticated routes" (skipping only the
+// authentication requirement, not the tenant requirement), which is the
+// explicit goal of this fix.
+
+// ── TENANT_OPTIONAL_PREFIXES — unrelated, pre-existing mechanism (Phase 1b/4) ──
+// Routes under /api/organisations manage the Organisation collection
+// itself and already do their own explicit authorization
+// (organisationController.js) — they proceed with no ambient tenant
+// context when none resolves, AND proceed even when the resolved org is
+// suspended (a super_admin managing a suspended org must not be blocked by
+// its own suspension status). This is orthogonal to the PUBLIC_NO_TENANT/
+// PUBLIC_WITH_TENANT split above and is left completely unchanged by this
+// phase.
 const TENANT_OPTIONAL_PREFIXES = [
     '/api/organisations',
 ];
@@ -115,23 +114,13 @@ const isTenantOptionalPath = (url) => {
 };
 
 // ── Main middleware ────────────────────────────────────────────────────────────
-// PHASE5-L1 FIX: this function's own org-lookup and single-org-fallback
-// logic has been extracted into the shared resolveOrganisation() utility
-// (server/utils/resolveOrg.js), also used by authController.js. Behavior is
-// unchanged from the pre-Phase-5 version — this is a pure consolidation,
-// not a functional change — except for one deliberate efficiency
-// preservation noted inline below.
 export const resolveTenant = async (req, res, next) => {
-    if (isPublicPath(req.method, req.originalUrl)) return next();
+    if (isPublicNoTenantPath(req.method, req.originalUrl)) return next();
 
     const tenantOptional = isTenantOptionalPath(req.originalUrl);
 
-    // Fast path: a tenant-optional route with no client-supplied identifier
-    // at all (the common case — e.g. a super_admin listing/creating
-    // organisations with no org header sent) skips the DB round-trip
-    // entirely, matching this middleware's pre-consolidation behavior for
-    // this specific case rather than paying for a countDocuments() call
-    // whose result would just be discarded a moment later.
+    // Fast path: a tenant-optional route with no client-supplied
+    // identifier at all skips the DB round-trip entirely.
     if (tenantOptional && !extractOrgIdentifier(req)) {
         return next();
     }
@@ -142,9 +131,6 @@ export const resolveTenant = async (req, res, next) => {
         if (result.status === 'resolved') {
             const { org } = result;
 
-            // PHASE4 FIX: tenant-optional paths proceed regardless of the
-            // resolved org's accessibility — see the TENANT_OPTIONAL_PREFIXES
-            // comment above.
             if (!org.isAccessible && !tenantOptional) {
                 return res.status(403).json({
                     message: 'Your organisation account is suspended or your trial has ended. Please contact support.',
@@ -165,8 +151,6 @@ export const resolveTenant = async (req, res, next) => {
         }
 
         // result.status === 'ambiguous'
-        // PHASE1B FIX: tenant-optional routes proceed with no ambient
-        // context instead of being forced to 400 here too.
         if (tenantOptional) return next();
 
         return res.status(400).json({

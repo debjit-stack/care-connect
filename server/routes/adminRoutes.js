@@ -10,6 +10,7 @@ import {
     createStaff,
     resetPassword,
     getDoctorsWithProfiles,
+    getPackagesFull,
 } from '../controllers/adminController.js';
 
 import {
@@ -127,6 +128,20 @@ router.put(
     '/doctors/:id',
     validate(updateDoctorProfileSchema),
     updateDoctorProfile
+);
+
+//
+// PACKAGES (PHASE-F, Task 3)
+//
+// Mirrors the doctors-full pattern above exactly — protected, admin-only,
+// no explicit organisationId filter, relies on tenantPlugin via the
+// ambient context already established by `router.use(protect, admin)`
+// (never in any tenant bypass list).
+//
+
+router.get(
+    '/packages-full',
+    getPackagesFull
 );
 
 //
