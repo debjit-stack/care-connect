@@ -8,11 +8,17 @@ import { sendMail, templates } from '../utils/mailer.js';
 // GET /api/doctors
 const getDoctors = async (req, res) => {
     try {
+        // FIX: match now also requires role: 'doctor' on the linked User —
+        // previously only checked User.deletedAt, which meant a Doctor
+        // document whose owning User had been role-converted (e.g. restored
+        // as 'patient' via receptionistController.registerPatient's old,
+        // now-fixed restore bug) but never itself soft-deleted would still
+        // populate and surface here as a bookable doctor.
         const doctors = await Doctor.find({ deletedAt: null })
             .populate({
                 path:   'user',
-                select: 'name',
-                match:  { $or: [{ deletedAt: null }, { deletedAt: { $exists: false } }] },
+                select: 'name role',
+                match:  { role: 'doctor', $or: [{ deletedAt: null }, { deletedAt: { $exists: false } }] },
             })
             .lean();
 
@@ -26,11 +32,12 @@ const getDoctors = async (req, res) => {
 // GET /api/doctors/:id
 const getDoctorById = async (req, res) => {
     try {
+        // FIX: same role guard as getDoctors — see comment there.
         const doctor = await Doctor.findOne({ _id: req.params.id, deletedAt: null })
             .populate({
                 path:   'user',
-                select: 'name',
-                match:  { $or: [{ deletedAt: null }, { deletedAt: { $exists: false } }] },
+                select: 'name role',
+                match:  { role: 'doctor', $or: [{ deletedAt: null }, { deletedAt: { $exists: false } }] },
             })
             .lean();
 
@@ -49,6 +56,15 @@ const getDoctorAvailability = async (req, res) => {
 
         const doctor = await Doctor.findOne({ _id: req.params.id, deletedAt: null }).lean();
         if (!doctor) return res.status(404).json({ message: 'Doctor not found' });
+
+        // FIX: same orphaned-Doctor guard as getDoctors/getDoctorById — a
+        // Doctor row can be "not deleted" while its linked User has been
+        // role-converted away from 'doctor' (or itself deleted). Availability
+        // must not be offered for booking in that case.
+        const linkedUser = await User.findById(doctor.user).select('role deletedAt').lean();
+        if (!linkedUser || linkedUser.deletedAt || linkedUser.role !== 'doctor') {
+            return res.status(404).json({ message: 'Doctor not found' });
+        }
 
         const requestedDate = new Date(`${date}T00:00:00Z`);
         const dayOfWeek     = requestedDate.toLocaleString('en-US', { weekday: 'long', timeZone: 'UTC' });
@@ -198,7 +214,12 @@ const updateAppointment = async (req, res) => {
 
         if (!appointment) return res.status(404).json({ message: 'Appointment not found' });
 
-        const doctorProfile = await Doctor.findOne({ user: req.user._id }).lean();
+        // FIX: was missing deletedAt: null — every other Doctor lookup in
+        // this codebase filters soft-deleted profiles; this one didn't,
+        // which let a soft-deleted-then-role-converted user's stale Doctor
+        // record still authorise updates against appointments it no longer
+        // legitimately owns.
+        const doctorProfile = await Doctor.findOne({ user: req.user._id, deletedAt: null }).lean();
         if (!doctorProfile || appointment.doctor.toString() !== doctorProfile._id.toString()) {
             return res.status(403).json({ message: 'Not authorised to update this appointment' });
         }

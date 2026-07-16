@@ -39,6 +39,25 @@ const registerPatient = async (req, res) => {
             .skipTenantFilter();
 
         if (existingUser && existingUser.deletedAt) {
+            // FIX: role-continuity gate. A soft-deleted identity may only be
+            // auto-restored if it was previously the SAME role being
+            // requested. Without this, a deleted doctor/staff account could
+            // be silently relabelled 'patient' here — a cross-role identity
+            // conversion, not a restore — leaving role-specific child
+            // records (e.g. Doctor, still soft-deleted but still pointing at
+            // this same User._id) orphaned yet intact. Any later code path
+            // that looks up those child records without a deletedAt guard
+            // would then treat them as live again the moment this User
+            // becomes non-deleted. See MIGRATIONS.md / AUTH_FLOW.md context:
+            // this restore branch existed to solve legitimate same-role
+            // re-registration (patient → patient), not role conversion.
+            if (existingUser.role !== 'patient') {
+                return res.status(409).json({
+                    message: 'This email belongs to a deleted account with a different role. ' +
+                              'Restore or convert it through account management instead of patient registration.',
+                });
+            }
+
             existingUser.name      = name;
             existingUser.password  = password;
             existingUser.role      = 'patient';

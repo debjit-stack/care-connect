@@ -114,17 +114,24 @@ const deleteUser = async (req, res) => {
             );
         }
 
-        if (user.role === 'doctor') {
-            const doctorProfile = await Doctor.findOne({ user: user._id }).session(session);
-            if (doctorProfile) {
-                await Appointment.updateMany(
-                    { doctor: doctorProfile._id, status: 'Scheduled' },
-                    { $set: { status: 'Cancelled', notes: 'Cancelled: doctor account deleted' } },
-                    { session }
-                );
-                doctorProfile.deletedAt = new Date();
-                await doctorProfile.save({ session });
-            }
+        // FIX: was gated on `user.role === 'doctor'` — if a User's role had
+        // ever drifted away from 'doctor' (e.g. via the now-fixed
+        // registerPatient/createStaff role-conversion bug) while a live
+        // Doctor document still existed for them, this cascade would be
+        // silently skipped and the Doctor record would be permanently
+        // orphaned (never soft-deleted, still surfaced by public doctor
+        // routes). Now looks up any live Doctor document linked to this
+        // user directly, regardless of the user's current role, so deletion
+        // always cleans up whatever role-specific records actually exist.
+        const doctorProfile = await Doctor.findOne({ user: user._id, deletedAt: null }).session(session);
+        if (doctorProfile) {
+            await Appointment.updateMany(
+                { doctor: doctorProfile._id, status: 'Scheduled' },
+                { $set: { status: 'Cancelled', notes: 'Cancelled: doctor account deleted' } },
+                { session }
+            );
+            doctorProfile.deletedAt = new Date();
+            await doctorProfile.save({ session });
         }
 
         user.deletedAt = new Date();
@@ -249,7 +256,24 @@ const createStaff = async (req, res) => {
             .skipTenantFilter();
 
         if (existingUser && existingUser.deletedAt) {
-            const roleChanged      = existingUser.role !== role;
+            // FIX: role-continuity gate, mirroring the identical fix in
+            // receptionistController.registerPatient. Previously this branch
+            // allowed a silent cross-role conversion (roleChanged was
+            // computed and even surfaced in the response message, but never
+            // used to BLOCK the conversion) — e.g. a deleted doctor account
+            // being restored as 'admin' or 'receptionist' with one API call.
+            // That leaves the deleted-but-still-user-linked Doctor document
+            // orphaned and re-activatable via any deletedAt-unguarded
+            // lookup. Restoration is now only permitted when the requested
+            // role matches the identity's previous role; anything else must
+            // go through an explicit account-conversion workflow.
+            if (existingUser.role !== role) {
+                return res.status(409).json({
+                    message: 'This email belongs to a deleted account with a different role. ' +
+                              'Restore or convert it through account management instead of creating new staff.',
+                });
+            }
+
             existingUser.name      = name;
             existingUser.password  = password;
             existingUser.role      = role;
@@ -261,11 +285,11 @@ const createStaff = async (req, res) => {
                 actorRole:    req.user.role,
                 resourceType: 'User',
                 resourceId:   existingUser._id,
-                meta:         { action: 'restore', roleChanged, newRole: role, orgId: req.orgId },
+                meta:         { action: 'restore', newRole: role, orgId: req.orgId },
             });
 
             return res.status(200).json({
-                message: roleChanged ? `Staff restored with role changed to ${role}` : 'Staff restored successfully',
+                message: 'Staff restored successfully',
                 user:    { _id: existingUser._id, name: existingUser.name, email: existingUser.email, role: existingUser.role },
             });
         }
