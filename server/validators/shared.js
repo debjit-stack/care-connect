@@ -1,13 +1,4 @@
-/**
- * shared.js
- * ─────────
- * Reusable Zod field definitions imported by every domain validator.
- * Single source of truth — change a rule here and it propagates everywhere.
- */
-
 import { z } from 'zod';
-
-// ─── Primitives ───────────────────────────────────────────────────────────────
 
 export const mongoId = z
     .string({ required_error: 'ID is required' })
@@ -34,18 +25,30 @@ export const passwordField = z
     .regex(/[0-9]/,        'Password must contain at least one number')
     .regex(/[^A-Za-z0-9]/, 'Password must contain at least one special character');
 
-// ISO 8601 date string — e.g. "2024-12-25"
+// FIX: Date.parse() silently rolls impossible calendar dates over into the
+// next valid date instead of failing (Date.parse('2026-02-30') resolves to
+// 2026-03-02), so `!isNaN(Date.parse(d))` never caught e.g. Feb 30 or Apr 31.
+// This reconstructs the date from its parts via Date.UTC and checks the
+// result's year/month/day still match what was submitted — Date.UTC also
+// silently rolls over out-of-range values, but round-tripping the result
+// back against the input catches exactly that rollover instead of ignoring it.
 export const isoDate = z
     .string({ required_error: 'Date is required' })
     .regex(/^\d{4}-\d{2}-\d{2}$/, 'Date must be in YYYY-MM-DD format')
-    .refine((d) => !isNaN(Date.parse(d)), 'Date is not a valid calendar date');
+    .refine((d) => {
+        const [year, month, day] = d.split('-').map(Number);
+        const rebuilt = new Date(Date.UTC(year, month - 1, day));
+        return (
+            rebuilt.getUTCFullYear() === year &&
+            rebuilt.getUTCMonth() === month - 1 &&
+            rebuilt.getUTCDate() === day
+        );
+    }, 'Date is not a valid calendar date');
 
-// Time in "HH:MM" 24-hour format (availability start/end)
 export const timeHHMM = z
     .string()
     .regex(/^([01]\d|2[0-3]):[0-5]\d$/, 'Time must be in HH:MM format (24-hour)');
 
-// Positive integer for things like experience years, price
 export const positiveInt = z
     .number({ invalid_type_error: 'Must be a number' })
     .int('Must be a whole number')
@@ -55,15 +58,9 @@ export const positiveNumber = z
     .number({ invalid_type_error: 'Must be a number' })
     .positive('Must be greater than zero');
 
-// ─── Reusable param schemas ───────────────────────────────────────────────────
-
 export const idParam = z.object({
     params: z.object({ id: mongoId }),
 });
-
-// ─── validate() middleware factory ────────────────────────────────────────────
-// FIX: removed the unreachable duplicate `next()` call that existed after
-// the `return next()` statement at the end of the function.
 
 export const validate = (schema) => (req, res, next) => {
     const result = schema.safeParse({

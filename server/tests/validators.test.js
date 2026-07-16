@@ -70,15 +70,21 @@ describe('shared.js — isoDate', () => {
     test('accepts a well-formed calendar date', () => {
         assert.doesNotThrow(() => isoDate.parse('2026-07-15'));
     });
-    // KNOWN DEFECT (found by this test, not yet fixed): `Date.parse()` silently
-    // rolls impossible calendar dates over into the next valid date instead of
-    // failing — Date.parse('2026-02-30') resolves to 2026-03-02, so
-    // `!isNaN(Date.parse(d))` never catches it. isoDate is used for appointment
-    // dates and date-of-birth across the app. Documenting current behavior here
-    // rather than silently patching validators/shared.js outside the agreed
-    // test-writing scope — see REMAINING_IMPLEMENTATION_PLAN.md Phase A7 notes.
-    test('does NOT currently reject an impossible calendar date like Feb 30 (known gap, tracked separately)', () => {
-        assert.doesNotThrow(() => isoDate.parse('2026-02-30'));
+    // FIXED: previously used `!isNaN(Date.parse(d))`, which silently rolls
+    // impossible dates over into the next valid one (Feb 30 → Mar 2) instead
+    // of failing. Now reconstructs the date via Date.UTC and round-trips it
+    // back against the submitted year/month/day.
+    test('rejects an impossible day-of-month (Feb 30)', () => {
+        assert.throws(() => isoDate.parse('2026-02-30'));
+    });
+    test('rejects an impossible day-of-month (Apr 31)', () => {
+        assert.throws(() => isoDate.parse('2026-04-31'));
+    });
+    test('correctly accepts Feb 29 on a leap year', () => {
+        assert.doesNotThrow(() => isoDate.parse('2024-02-29')); // 2024 is a leap year
+    });
+    test('correctly rejects Feb 29 on a non-leap year', () => {
+        assert.throws(() => isoDate.parse('2026-02-29')); // 2026 is not a leap year
     });
     test('rejects a non-ISO format', () => {
         assert.throws(() => isoDate.parse('15/07/2026'));
