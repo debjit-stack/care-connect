@@ -10,6 +10,8 @@ import {
     verifyMfaPendingToken,
     generateResetPendingToken,
     verifyResetPendingToken,
+    generateStepUpToken,
+    verifyStepUpToken,
 } from '../utils/tokens.js';
 
 describe('tokens.js — access token', () => {
@@ -93,5 +95,43 @@ describe('tokens.js — reset pending token', () => {
 
         const resetToken = generateResetPendingToken('user1');
         assert.throws(() => verifyMfaPendingToken(resetToken));
+    });
+});
+
+describe('tokens.js — step-up token (A2)', () => {
+    test('round-trips and carries the stepUp marker', () => {
+        const token = generateStepUpToken('user1');
+        const decoded = verifyStepUpToken(token);
+
+        assert.equal(decoded.id, 'user1');
+        assert.equal(decoded.stepUp, true);
+    });
+
+    test('is signed with a secret independent of MFA-pending and reset-pending tokens', () => {
+        // A step-up token must not verify against either sibling secret, and
+        // neither sibling token should verify as a step-up token — each
+        // proves a different claim (password/TOTP-just-now vs. email-OTP
+        // ownership vs. "about to complete MFA enrollment") and must not be
+        // interchangeable even if an attacker captures one of them.
+        const stepUpToken = generateStepUpToken('user1');
+        assert.throws(() => verifyMfaPendingToken(stepUpToken));
+        assert.throws(() => verifyResetPendingToken(stepUpToken));
+
+        const mfaToken = generateMfaPendingToken('user1');
+        const resetToken = generateResetPendingToken('user1');
+        assert.throws(() => verifyStepUpToken(mfaToken));
+        assert.throws(() => verifyStepUpToken(resetToken));
+    });
+
+    test('rejects a token from the correct secret family but missing the stepUp flag', () => {
+        const secret = process.env.JWT_STEP_UP_SECRET || process.env.JWT_SECRET + '_stepup';
+        const noFlagToken = jwt.sign({ id: 'user1' }, secret, { expiresIn: '5m' });
+        assert.throws(() => verifyStepUpToken(noFlagToken), /Not a step-up token/);
+    });
+
+    test('rejects an expired step-up token', () => {
+        const secret = process.env.JWT_STEP_UP_SECRET || process.env.JWT_SECRET + '_stepup';
+        const expired = jwt.sign({ id: 'user1', stepUp: true }, secret, { expiresIn: -10 });
+        assert.throws(() => verifyStepUpToken(expired), /jwt expired/);
     });
 });
