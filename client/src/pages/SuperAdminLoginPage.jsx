@@ -3,6 +3,7 @@ import { useNavigate, Navigate, Link } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 import { clearOrgSlug } from '../api/index.js';
 import MFAVerifyStep from '../components/auth/MFAVerifyStep.jsx';
+import useBfcacheReload from '../hooks/useBfcacheReload.js';
 
 // PHASE-D/E: dedicated Super Admin login entry point.
 //
@@ -39,6 +40,12 @@ const SuperAdminLoginPage = () => {
 
     const { platformLogin, isAuthenticated, user, completeLogin } = useAuth();
     const navigate = useNavigate();
+
+    // A1 FIX: same bfcache-restoration guard as LoginPage.jsx — the
+    // platform-admin login page carries the same risk of a browser
+    // repainting a stale mid-MFA-verify snapshot on back/forward. See
+    // useBfcacheReload's own comment for the full rationale.
+    useBfcacheReload();
 
     useEffect(() => {
         clearOrgSlug();

@@ -3,6 +3,7 @@ import { useNavigate, Navigate, Link } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 import { setAccessToken, setOrgSlug } from '../api/index.js';
 import MFAVerifyStep from '../components/auth/MFAVerifyStep.jsx';
+import useBfcacheReload from '../hooks/useBfcacheReload.js';
 
 // PHASE-B FIX: super_admin now redirects to /super-admin after login, not
 // /admin — see Header.jsx for the identical, more detailed rationale (this
@@ -31,6 +32,16 @@ const LoginPage = () => {
 
     const { login, isAuthenticated, user, completeLogin } = useAuth();
     const navigate = useNavigate();
+
+    // A1 FIX: forces a hard reload if this page is restored from the
+    // browser's bfcache — e.g. the user logs in, navigates away, then
+    // hits "back". Without this, the browser can repaint the exact frozen
+    // pre-login (or mid-MFA-verify) snapshot of this component, including
+    // a stale `mfaStep === 'verify'` screen tied to an mfaPending token
+    // that may since have been consumed. A reload forces isAuthenticated
+    // and all local state to be re-evaluated fresh — see useBfcacheReload's
+    // own comment for the full rationale.
+    useBfcacheReload();
 
     // M1 FIX: the MFA-setup redirect runs in a useEffect (not during render)
     // so it never triggers a router update while this component is still

@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { setupMfa, verifyMfaSetup } from '../api/mfa.js';
 import { useAuth } from '../context/AuthContext.jsx';
+import useBfcacheReload from '../hooks/useBfcacheReload.js';
 
 const SETUP_TTL_SECONDS = 300;
 
@@ -247,11 +248,59 @@ const MFASetupPage = () => {
     const inputRefs = useRef([]);
     const timerRef  = useRef(null);
     const navigate  = useNavigate();
-    const { completeLogin } = useAuth();
+    const { completeLogin, isAuthenticated } = useAuth();
 
-    const params     = new URLSearchParams(window.location.search);
-    const isRequired = params.get('required') === 'true';
-    const mfaPending = params.get('mfaPending');
+    // A1 FIX: forces a hard reload if this page is restored from the
+    // browser's bfcache (e.g. pressing back/forward after this tab was
+    // navigated away from) rather than freshly mounted — see the hook's
+    // own comment for why route-level `replace` navigation alone can't
+    // cover this case. Auth pages are exactly the class of page where a
+    // frozen, stale snapshot is worth actively guarding against.
+    useBfcacheReload();
+
+    // A1 FIX: previously read `new URLSearchParams(window.location.search)`
+    // directly in the render body on every render. That's fine as long as
+    // the URL never changes underneath the component — but scrubbing the
+    // query string (below) after mount would otherwise silently null out
+    // mfaPending/isRequired on the very next render and break the rest of
+    // this flow. Captured once via a lazy useState initializer instead —
+    // stable for the component's lifetime no matter what the visible URL
+    // bar shows afterward.
+    const [{ isRequired, mfaPending }] = useState(() => {
+        const params = new URLSearchParams(window.location.search);
+        return {
+            isRequired: params.get('required') === 'true',
+            mfaPending: params.get('mfaPending'),
+        };
+    });
+
+    // A1 FIX: the mfaPending token is single-purpose and short-lived
+    // (5 minutes), but previously sat visibly in the URL bar — and
+    // therefore in browser history/autocomplete — for the entire setup
+    // flow. Strip it immediately on mount. `history.replaceState` does not
+    // create a new history entry, so this has no effect on back-button
+    // behaviour; it only cleans up what's displayed and what gets
+    // persisted into browser history.
+    useEffect(() => {
+        window.history.replaceState({}, '', window.location.pathname);
+    }, []);
+
+    // A1 FIX: if the user already has a valid session — e.g. they
+    // completed this exact flow already and are revisiting this URL via a
+    // bookmark, browser autocomplete, or a stale shared link — send them
+    // straight to their dashboard instead of attempting to redeem an
+    // mfaPending token that may be expired, already consumed, or simply
+    // irrelevant to their current session. (During the normal setup flow
+    // this stays false the entire time; it only becomes true once this
+    // page itself calls completeLogin(), at which point the explicit
+    // navigate() calls elsewhere in this component already take over —
+    // this effect is a safety net for the revisit case, not the primary
+    // navigation path.)
+    useEffect(() => {
+        if (isAuthenticated) {
+            navigate('/', { replace: true });
+        }
+    }, [isAuthenticated, navigate]);
 
     // ── Timer ──────────────────────────────────────────────────────────────────
     const startTimer = useCallback((startSeconds = SETUP_TTL_SECONDS) => {
