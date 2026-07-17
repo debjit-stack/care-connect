@@ -2,27 +2,12 @@ import jwt from 'jsonwebtoken';
 import { v4 as uuidv4 } from 'uuid';
 import getRedisClient from '../config/redis.js';
 
-// ─── Constants ────────────────────────────────────────────────────────────────
 const ACCESS_TOKEN_EXPIRES    = process.env.JWT_ACCESS_EXPIRES    || '15m';
 const REFRESH_TOKEN_EXPIRES   = process.env.JWT_REFRESH_EXPIRES   || '7d';
 const REFRESH_TOKEN_TTL_SEC   = 7 * 24 * 60 * 60;
-// MFA-pending token is very short-lived — user has 5 minutes to enter their TOTP
 const MFA_PENDING_EXPIRES     = process.env.JWT_MFA_PENDING_EXPIRES || '5m';
-// Reset-pending token — issued after a forgot-password OTP is verified,
-// short-lived, single purpose (only usable against /auth/forgot-password/reset)
 const RESET_PENDING_EXPIRES   = process.env.JWT_RESET_PENDING_EXPIRES || '10m';
 
-// ─── Access token ─────────────────────────────────────────────────────────────
-// PHASE1-C2 FIX: access tokens now carry an `organisationId` claim (null for
-// super_admin / any user with no org). Previously the payload was only
-// { id, role }, which meant the token itself carried no verifiable tenant
-// binding — any consumer of the token (including this app's own `protect`
-// middleware) had no way to detect a user being silently re-scoped to a
-// different tenant after the token was issued, without a fresh DB lookup
-// AND an explicit comparison (which nothing did — see authMiddleware.js).
-// This claim doesn't replace the DB check in `protect` (a live lookup is
-// still authoritative), it lets `protect` catch drift between the org the
-// token was issued for and the user's *current* org in one extra comparison.
 export const generateAccessToken = (user) => {
     return jwt.sign(
         {
@@ -39,11 +24,6 @@ export const verifyAccessToken = (token) => {
     return jwt.verify(token, process.env.JWT_SECRET);
 };
 
-// ─── MFA-pending token ────────────────────────────────────────────────────────
-// Issued after password is correct but before TOTP is verified.
-// This is a DIFFERENT secret from JWT_SECRET — it signs only the pending state.
-// The client sends this back to /api/auth/mfa/validate with their TOTP token.
-// It contains no role or session claims — it only identifies the user for MFA.
 export const generateMfaPendingToken = (userId) => {
     return jwt.sign(
         { id: userId, mfaPending: true },
@@ -63,11 +43,6 @@ export const verifyMfaPendingToken = (token) => {
     return payload;
 };
 
-// ─── Reset-pending token (forgot-password flow) ──────────────────────────────
-// Issued only after the user has proven ownership of their email via OTP.
-// Single purpose: exchanged for a new password at /auth/forgot-password/reset.
-// Distinct secret from both JWT_SECRET and the MFA-pending secret so a leaked
-// reset token can never be replayed as an access or MFA token, and vice versa.
 export const generateResetPendingToken = (userId) => {
     return jwt.sign(
         { id: userId, resetPending: true },
@@ -87,7 +62,35 @@ export const verifyResetPendingToken = (token) => {
     return payload;
 };
 
-// ─── Refresh token ────────────────────────────────────────────────────────────
+// ─── Step-up token (A2: sensitive-action re-verification) ────────────────────
+// Proves the caller has recently re-supplied their password or a valid TOTP
+// code, independent of how old their access token is. Short-lived (5 min),
+// single-purpose, and — like mfaPending/resetPending — signed with its own
+// dedicated secret so a leaked token of one type can never be replayed as
+// another. Issued by POST /api/auth/step-up/verify (protected route — the
+// caller must already hold a valid access token; this only adds a second,
+// fresher proof on top of it), consumed by requireStepUp middleware.
+const STEP_UP_EXPIRES = process.env.JWT_STEP_UP_EXPIRES || '5m';
+
+export const generateStepUpToken = (userId) => {
+    return jwt.sign(
+        { id: userId, stepUp: true },
+        process.env.JWT_STEP_UP_SECRET || process.env.JWT_SECRET + '_stepup',
+        { expiresIn: STEP_UP_EXPIRES }
+    );
+};
+
+export const verifyStepUpToken = (token) => {
+    const payload = jwt.verify(
+        token,
+        process.env.JWT_STEP_UP_SECRET || process.env.JWT_SECRET + '_stepup'
+    );
+    if (!payload.stepUp) {
+        throw new Error('Not a step-up token');
+    }
+    return payload;
+};
+
 export const generateRefreshToken = async (userId) => {
     const redis   = getRedisClient();
     const tokenId = uuidv4();
@@ -130,7 +133,6 @@ export const revokeAllRefreshTokens = async (userId) => {
     } while (cursor !== '0');
 };
 
-// ─── Cookie helpers ───────────────────────────────────────────────────────────
 const COOKIE_NAME = 'careconnect_refresh';
 
 export const setRefreshCookie = (res, token) => {

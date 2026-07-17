@@ -12,6 +12,13 @@ export const refreshToken   = ()            => API.post('/auth/refresh');
 export const getMe          = ()            => API.get('/auth/me');
 export const changePassword = (formData)    => API.put('/auth/change-password', formData);
 
+// A2: step-up (re)verification — call before a requireStepUp-gated action
+// (change-password, MFA disable, org security-policy updates). Accepts
+// { password } or { token } (6-digit TOTP). On success, cache the returned
+// stepUpToken via setStepUpToken() from api/stepUp.js — see StepUpModal.jsx
+// for the standard integration pattern.
+export const stepUpVerify = (data) => API.post('/auth/step-up/verify', data);
+
 // ── OTP FEATURE: patient self-registration ─────────────────────────────────────
 export const requestRegistrationOtp = (data) => API.post('/auth/register/request-otp', data);
 export const resendRegistrationOtp  = (data) => API.post('/auth/register/resend-otp', data);

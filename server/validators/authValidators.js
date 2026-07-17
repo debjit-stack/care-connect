@@ -105,5 +105,22 @@ export const resetPasswordWithTokenSchema = z.object({
     }),
 });
 
+// ─── A2: step-up (re)verification for sensitive actions ──────────────────────
+// Accepts EITHER the caller's current password OR a 6-digit TOTP code — not
+// both required, since a user without MFA enrolled has no TOTP to give, and
+// a user WITH MFA enrolled can prove identity either way. At least one must
+// be present. Deliberately reuses the same passwordSchema/otpSchema shape
+// as login/MFA validation rather than a laxer "just check it's a string" —
+// this is proving identity for a sensitive action, not a throwaway field.
+export const stepUpVerifySchema = z.object({
+    body: z.object({
+        password: z.string({ invalid_type_error: 'Password must be a string' }).min(1).optional(),
+        token:    z.string().trim().regex(/^\d{6}$/, 'Code must be exactly 6 digits').optional(),
+    }).refine(
+        (d) => Boolean(d.password) || Boolean(d.token),
+        { message: 'Provide either your current password or a 6-digit authenticator code' }
+    ),
+});
+
 // ─── Re-export the single validate() implementation ───────────────────────────
 export { validate };

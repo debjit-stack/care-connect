@@ -157,3 +157,27 @@ export const forgotPasswordRateLimiter = rateLimit({
     legacyHeaders: false,
     store: makeRedisStore('forgot-password', FORGOT_PASSWORD_WINDOW_MS / 1000),
 });
+
+// -- A2: Step-up verification rate limiter ------------------------------------
+// Keyed by the AUTHENTICATED user's id rather than IP+email — this route
+// sits behind `protect`, so req.user is always populated by the time this
+// limiter runs, and the thing worth rate-limiting is "how many times has
+// THIS account's password/TOTP been guessed at just now", not IP traffic
+// generally (a shared-IP office full of legitimate staff shouldn't share a
+// bucket the way anonymous login attempts might reasonably want to).
+// Falls back to ipKeyGenerator only in the defensive case req.user is
+// somehow missing (should never happen given route ordering, but a rate
+// limiter should never itself throw if that invariant is ever violated).
+const STEP_UP_WINDOW_MS = 15 * 60 * 1000;
+export const stepUpRateLimiter = rateLimit({
+    validate: false,
+    windowMs: STEP_UP_WINDOW_MS,
+    max: 8,
+    message: {
+        message: 'Too many verification attempts. Please wait 15 minutes before trying again.',
+    },
+    standardHeaders: true,
+    legacyHeaders: false,
+    store: makeRedisStore('step-up', STEP_UP_WINDOW_MS / 1000),
+    keyGenerator: (req) => req.user?._id?.toString() || ipKeyGenerator(req.ip),
+});

@@ -13,12 +13,14 @@ import {
     setRefreshCookie,
     clearRefreshCookie,
     getRefreshCookie,
+    generateStepUpToken,
 } from '../utils/tokens.js';
 import audit             from '../utils/audit.js';
 import { runWithTenant } from '../plugins/tenantPlugin.js';
 import { resolveOrganisation } from '../utils/resolveOrg.js';
 import { sendMail, templates } from '../utils/mailer.js';
 import { generateOtp, hashOtp, verifyOtpHash } from '../utils/otp.js';
+import { decryptSecret, verifyToken } from '../utils/totp.js';
 import {
     createSession,
     getSession,
@@ -37,6 +39,12 @@ const REGISTRATION_RESEND_COOLDOWN_SECONDS = 60;
 const REGISTRATION_MAX_RESENDS = 5;
 const FORGOT_PASSWORD_OTP_TTL_SECONDS = 10 * 60;
 const FORGOT_PASSWORD_RESEND_COOLDOWN_SECONDS = 60;
+
+// A2: how long a step-up token is valid for once issued — matches
+// generateStepUpToken's own default expiry in tokens.js. Returned in the
+// response body so the frontend knows exactly when to re-prompt rather
+// than guessing or hardcoding a duplicate value.
+const STEP_UP_TOKEN_EXPIRES_IN_SECONDS = 300;
 
 // NEW-L1: a fixed, precomputed bcrypt hash used ONLY to burn roughly the same
 // amount of CPU time as a real bcrypt.compare() when no session/user exists,
@@ -904,6 +912,9 @@ const logoutAllDevices = async (req, res) => {
 };
 
 // ─── PUT /api/auth/change-password ────────────────────────────────────────────
+// A2: now sits behind requireStepUp (see authRoutes.js) — the route-level
+// middleware already guarantees a fresh step-up token was presented before
+// this handler ever runs, so no change needed in the handler body itself.
 const changePassword = async (req, res) => {
     try {
         const { currentPassword, newPassword } = req.body;
@@ -927,6 +938,67 @@ const changePassword = async (req, res) => {
     }
 };
 
+// ─── A2: POST /api/auth/step-up/verify ─────────────────────────────────────────
+// Issues a short-lived step-up token proving the caller has JUST re-supplied
+// their password or a valid TOTP code, for use by requireStepUp-gated
+// routes (change-password, MFA disable, org security-policy updates).
+//
+// Protected route (mounted with `protect` — see authRoutes.js): the caller
+// must already hold a valid access token. This adds a SECOND, fresher proof
+// on top of that, rather than replacing normal authentication. Accepts
+// EITHER a password OR a TOTP code (stepUpVerifySchema requires at least
+// one) — a user without MFA enrolled simply has no TOTP option available.
+const stepUpVerify = async (req, res) => {
+    try {
+        const { password, token } = req.body;
+
+        const user = await User
+            .findById(req.user._id)
+            .select('+password +mfaSecret')
+            .skipTenantFilter();
+
+        if (!user) return res.status(404).json({ message: 'User not found.' });
+
+        let verified = false;
+        let method   = null;
+
+        if (password) {
+            verified = await user.matchPassword(password);
+            method   = 'password';
+        } else if (token) {
+            if (!user.mfaEnabled || !user.mfaSecret) {
+                return res.status(400).json({ message: 'MFA is not enabled on this account — use your password instead.' });
+            }
+            const plainSecret = decryptSecret(user.mfaSecret);
+            verified = verifyToken(plainSecret, token);
+            method   = 'totp';
+        }
+
+        if (!verified) {
+            audit(req, 'AUTH_LOGIN_FAILED', {
+                actorId: user._id, actorRole: user.role, success: false,
+                meta: { reason: 'step_up_failed', method },
+            });
+            return res.status(401).json({ message: 'Verification failed. Please check your password or code.' });
+        }
+
+        const stepUpToken = generateStepUpToken(user._id);
+
+        audit(req, 'AUTH_MFA_VERIFIED', {
+            actorId: user._id, actorRole: user.role,
+            meta: { event: 'step_up_verified', method },
+        });
+
+        return res.status(200).json({
+            stepUpToken,
+            expiresIn: STEP_UP_TOKEN_EXPIRES_IN_SECONDS,
+        });
+    } catch (err) {
+        console.error('[Auth] stepUpVerify:', err.message);
+        return res.status(500).json({ message: 'Verification failed. Please try again.' });
+    }
+};
+
 // ─── GET /api/auth/me ─────────────────────────────────────────────────────────
 const getMe = async (req, res) => {
     try {
@@ -943,7 +1015,7 @@ const getMe = async (req, res) => {
 
 export {
     registerUser, loginUser, platformLoginUser, refreshAccessToken,
-    logoutUser, logoutAllDevices, changePassword, getMe,
+    logoutUser, logoutAllDevices, changePassword, getMe, stepUpVerify,
     requestRegistrationOtp, resendRegistrationOtp, verifyRegistrationOtp,
     forgotPassword, resendForgotPasswordOtp, verifyForgotPasswordOtp, resetPasswordWithToken,
 };

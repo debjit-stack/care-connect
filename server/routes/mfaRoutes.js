@@ -1,6 +1,7 @@
 /**
  * server/routes/mfaRoutes.js
  * P3C: recover / regenerate-codes routes.
+ * A2: /disable now requires a fresh step-up token (see requireStepUp).
  *
  * B7 -- investigated and NOT applying the originally suggested fix:
  * requireMfaPending expects the pending token as an `Authorization: Bearer`
@@ -17,6 +18,19 @@
  * two body-token routes vs. the two header-token routes, not an oversight --
  * so the route wiring here is left as-is rather than "fixed" into a
  * breaking change.
+ *
+ * NOTE on requireStepUp vs requireMfaPending on /disable: these are two
+ * different gates for two different moments. requireMfaPending (used by
+ * /setup and /verify-setup) identifies a user who is not yet fully logged
+ * in. requireStepUp (added here) applies to a user who IS fully logged in
+ * and is about to take a sensitive, session-persistent action — turning
+ * off their own MFA protection. disableMfa's handler body already checks
+ * the submitted password AND TOTP token itself (see mfaController.js) —
+ * requireStepUp does not replace that in-handler check, it adds a second,
+ * independent layer: the caller must have ALSO passed a fresh step-up
+ * challenge before the request is even allowed to reach the handler. This
+ * closes the gap where a stolen live access token alone was sufficient to
+ * reach the disableMfa handler and attempt the in-body checks at all.
  */
 
 import express from 'express';
@@ -31,6 +45,7 @@ import {
 } from '../controllers/mfaController.js';
 import { protect }          from '../middleware/authMiddleware.js';
 import {requireMfaPending}    from '../middleware/mfaPendingMiddleware.js';
+import { requireStepUp }    from '../middleware/stepUpMiddleware.js';
 import {
     validate,
     verifySetupSchema,
@@ -52,7 +67,7 @@ router.get('/setup',          requireMfaPending, setupMfa);
 
 // -- Full-session routes (require valid access token) -----------------------
 router.get('/status',                 protect, getMfaStatus);
-router.post('/disable',               protect, validate(disableMfaSchema),        disableMfa);
+router.post('/disable',               protect, requireStepUp, validate(disableMfaSchema),        disableMfa);
 router.post('/regenerate-codes',      protect, validate(regenerateCodesSchema),   regenerateCodes);
 
 export default router;

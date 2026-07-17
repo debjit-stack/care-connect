@@ -22,6 +22,7 @@ import {
 } from '../controllers/adminSecurityController.js';
 
 import { protect, admin } from '../middleware/authMiddleware.js';
+import { requireStepUp }  from '../middleware/stepUpMiddleware.js';
 
 import {
     validate,
@@ -82,8 +83,14 @@ router.get(
     getSecuritySettings
 );
 
+// A2: flipping an organisation's MFA-required policy is exactly the kind
+// of consequential, session-persistent security action requireStepUp
+// exists for — it affects every staff member in the org, not just the
+// caller's own account. requireStepUp runs after the router-level
+// protect+admin above, so req.user is already guaranteed to exist here.
 router.put(
     '/security',
+    requireStepUp,
     updateSecuritySettings
 );
 

@@ -1,4 +1,5 @@
 import axios from 'axios';
+import { getValidStepUpToken } from './stepUp.js';
 
 // ── Access token (in-memory only) ─────────────────────────────────────────────
 let _accessToken = null;
@@ -103,6 +104,16 @@ API.interceptors.request.use((config) => {
     if (token) config.headers.Authorization = `Bearer ${token}`;
     const slug = getOrgSlug(config.url);
     if (slug)  config.headers['X-Organisation-Slug'] = slug;
+
+    // A2: attach a cached step-up token, if one is still valid, to every
+    // request. Harmless on routes that don't check for it — requireStepUp
+    // only exists on a small, explicit set of sensitive-action routes
+    // (change-password, MFA disable, org security-policy updates) — and
+    // saves every call site from having to know whether the token cache
+    // still has something usable before deciding whether to attach it.
+    const stepUpToken = getValidStepUpToken();
+    if (stepUpToken) config.headers['X-Step-Up-Token'] = stepUpToken;
+
     return config;
 }, (error) => Promise.reject(error));
 

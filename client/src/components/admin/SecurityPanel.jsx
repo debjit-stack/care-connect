@@ -6,6 +6,7 @@ import {
     updateUserSecurity,
     resetUserMfa,
 } from '../../api/admin.js';
+import StepUpModal from '../auth/StepUpModal.jsx';
 
 // ── Status badge ───────────────────────────────────────────────────────────────
 const MfaBadge = ({ enabled }) => (
@@ -150,6 +151,15 @@ const SecurityPanel = ({ users }) => {
     const [userFilter,     setUserFilter]     = useState('');
     const [refreshKey,     setRefreshKey]     = useState(0);
 
+    // A2: when updateSecuritySettings comes back with stepUpRequired (the
+    // caller's last step-up token is missing/expired), we stash the value
+    // the user was trying to set and show StepUpModal instead of an error.
+    // On successful verification, the modal's onVerified callback re-fires
+    // the same toggle with the same pending value — the user only sees a
+    // brief extra prompt, not a failed action they have to retry manually.
+    const [showStepUp, setShowStepUp] = useState(false);
+    const [pendingPolicyValue, setPendingPolicyValue] = useState(null);
+
     // Load org-level security settings
     const fetchPolicy = useCallback(async () => {
         try {
@@ -164,7 +174,7 @@ const SecurityPanel = ({ users }) => {
 
     useEffect(() => { fetchPolicy(); }, [fetchPolicy]);
 
-    const handlePolicyToggle = async (value) => {
+    const applyPolicyToggle = async (value) => {
         setSavingPolicy(true);
         setPolicyError('');
         setPolicySuccess('');
@@ -178,10 +188,34 @@ const SecurityPanel = ({ users }) => {
             );
             setTimeout(() => setPolicySuccess(''), 4000);
         } catch (err) {
-            setPolicyError(err?.response?.data?.message || 'Failed to update policy.');
+            // A2: distinguish "needs step-up" from every other failure —
+            // the former opens the re-verification modal instead of just
+            // showing an error the user can't act on.
+            if (err?.response?.data?.stepUpRequired) {
+                setPendingPolicyValue(value);
+                setShowStepUp(true);
+            } else {
+                setPolicyError(err?.response?.data?.message || 'Failed to update policy.');
+            }
         } finally {
             setSavingPolicy(false);
         }
+    };
+
+    const handlePolicyToggle = (value) => applyPolicyToggle(value);
+
+    const handleStepUpVerified = () => {
+        setShowStepUp(false);
+        if (pendingPolicyValue !== null) {
+            const value = pendingPolicyValue;
+            setPendingPolicyValue(null);
+            applyPolicyToggle(value);
+        }
+    };
+
+    const handleStepUpCancel = () => {
+        setShowStepUp(false);
+        setPendingPolicyValue(null);
     };
 
     // Only show staff, doctors, admins — not patients (patients no longer use
@@ -299,6 +333,15 @@ const SecurityPanel = ({ users }) => {
                     </table>
                 </div>
             </div>
+
+            {/* A2: step-up re-verification prompt for the org policy toggle */}
+            {showStepUp && (
+                <StepUpModal
+                    title="Confirm It's You"
+                    onVerified={handleStepUpVerified}
+                    onCancel={handleStepUpCancel}
+                />
+            )}
         </div>
     );
 };

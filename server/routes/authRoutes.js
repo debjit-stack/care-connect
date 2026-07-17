@@ -8,6 +8,7 @@ import {
     logoutAllDevices,
     changePassword,
     getMe,
+    stepUpVerify,
     // OTP FEATURE
     requestRegistrationOtp,
     resendRegistrationOtp,
@@ -18,12 +19,14 @@ import {
     resetPasswordWithToken,
 } from '../controllers/authController.js';
 import { protect } from '../middleware/authMiddleware.js';
+import { requireStepUp } from '../middleware/stepUpMiddleware.js';
 import {
     loginRateLimiter,
     registerRateLimiter,
     refreshRateLimiter,
     registerOtpRateLimiter,
     forgotPasswordRateLimiter,
+    stepUpRateLimiter,
 } from '../middleware/rateLimiter.js';
 import {
     validate,
@@ -36,6 +39,7 @@ import {
     forgotPasswordSchema,
     verifyForgotPasswordOtpSchema,
     resetPasswordWithTokenSchema,
+    stepUpVerifySchema,
 } from '../validators/authValidators.js';
 
 const router = express.Router();
@@ -118,11 +122,32 @@ router.post('/forgot-password/reset',
 // ─── Protected routes ─────────────────────────────────────────────────────────
 router.post('/logout',       protect, logoutUser);
 router.post('/logout-all',   protect, logoutAllDevices);
+
+// A2: step-up verification itself only requires a valid access token
+// (protect) — it is how the caller PROVES freshness for the routes below,
+// so it can't itself require what it's trying to produce. Rate-limited per
+// authenticated user (see rateLimiter.js) since this is exactly the kind
+// of endpoint a compromised-but-not-fully-logged-in session might hammer
+// trying to guess a password.
+router.post('/step-up/verify',
+    protect,
+    stepUpRateLimiter,
+    validate(stepUpVerifySchema),
+    stepUpVerify
+);
+
+// A2: change-password now requires a fresh step-up token in addition to a
+// valid access token — an attacker who stole a live access token (e.g. via
+// an XSS on some other page, or a shoulder-surfed unlocked device) can no
+// longer silently change the account password without re-proving the
+// current password or TOTP code moments beforehand.
 router.put('/change-password',
     protect,
+    requireStepUp,
     validate(changePasswordSchema),
     changePassword
 );
+
 router.get('/me',            protect, getMe);
 
 export default router;
