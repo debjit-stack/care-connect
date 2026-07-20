@@ -1,6 +1,7 @@
 import bcrypt        from 'bcryptjs';
 import User          from '../models/User.js';
 import Organisation  from '../models/Organisation.js';
+import Membership    from '../models/Membership.js';
 import {
     generateAccessToken,
     generateRefreshToken,
@@ -53,6 +54,42 @@ const STEP_UP_TOKEN_EXPIRES_IN_SECONDS = 300;
 const DUMMY_BCRYPT_HASH = '$2a$10$CwTycUXWue0Thq9StjUM0uJ8xkO/tCiOSk.tE/1x3AbHqjRw9kAmy';
 const burnTimingBudget = () => bcrypt.compare('0'.repeat(6), DUMMY_BCRYPT_HASH);
 
+// ─── PHASE M3: resolve or create this user's Membership for this org ─────────
+// Called at every point an access token is issued for an org-scoped login
+// (i.e. everywhere EXCEPT super_admin/platform-login). Deliberately
+// NON-DESTRUCTIVE toward an EXISTING Membership — it only ever creates one
+// via $setOnInsert when none exists yet (a safety net for any gap between
+// the Phase M2 backfill and a User created since), and never overwrites an
+// existing Membership's role/status. Keeping status/role changes exclusive
+// to the dedicated create/restore/delete code paths (registerPatient,
+// createStaff, createDoctor, deleteUser — Phase M3 dual-write) means login
+// itself stays a read-mostly operation and can never silently reactivate a
+// Membership that was deliberately removed.
+//
+// Returns null for super_admin (no Membership concept applies) or when no
+// org is available (should not happen for a non-super_admin login, but
+// fails safe rather than throwing).
+const resolveOrCreateMembership = async (user, org) => {
+    if (!org || user.role === 'super_admin') return null;
+
+    const membership = await Membership.findOneAndUpdate(
+        { userId: user._id, organisationId: org._id },
+        {
+            $setOnInsert: {
+                userId:         user._id,
+                organisationId: org._id,
+                role:           user.role,
+                status:         'active',
+                forceMfa:       user.forceMfa ?? false,
+                joinedAt:       new Date(),
+            },
+        },
+        { upsert: true, new: true }
+    );
+
+    return membership;
+};
+
 // ─── Safe user payload ────────────────────────────────────────────────────────
 const safeUser = (user, org) => ({
     _id: user._id,
@@ -72,50 +109,36 @@ const safeUser = (user, org) => ({
 });
 
 // ─── Resolve org from request ─────────────────────────────────────────────────
-// PHASE5-L1 FIX: this function's independent extraction/lookup/fallback
-// logic (flagged as L1 in the multi-tenant audit, and deferred from Phase 2
-// specifically to be addressed here) has been replaced with a thin wrapper
-// around the shared resolveOrganisation() utility (server/utils/resolveOrg.js),
-// the same one tenantMiddleware.resolveTenant now uses. The two can no
-// longer silently diverge on org-resolution semantics.
-//
-// This collapses the discriminated { status, org } result down to a plain
-// nullable org for the callers below that only ever checked truthiness
-// (requestRegistrationOtp, forgotPassword, resendForgotPasswordOtp,
-// verifyForgotPasswordOtp, registerUser) — none of those need to
-// distinguish 'not_found' from 'ambiguous'/'no_orgs', they all already
-// treat "no org resolved" uniformly. loginUser is the one exception that
-// DOES care about the distinction — see its own updated logic below, which
-// now calls resolveOrganisation() directly instead of going through this
-// wrapper, rather than re-deriving an equivalent count check independently
-// (which is exactly how it drifted out of sync with this function during
-// Phase 2's follow-up fix).
 const resolveOrgFromRequest = async (req) => {
     const result = await resolveOrganisation(req);
     return result.status === 'resolved' ? result.org : null;
 };
 
 // ─── Shared: issue tokens + respond for a fully-authenticated user ───────────
+// PHASE M3 FIX: now resolves/creates this user's Membership for `org`
+// before minting the access token, and embeds membershipId in it. See
+// resolveOrCreateMembership above for why this is safe to call
+// unconditionally (super_admin/no-org simply yields null, and
+// generateAccessToken already treats a null membershipId as "omit the
+// claim" — fully backward compatible with pre-Phase-M3 tokens still in
+// circulation).
 const issueLoginResponse = async (res, req, user, org) => {
-    const accessToken  = generateAccessToken(user);
+    const membership = await resolveOrCreateMembership(user, org);
+
+    const accessToken  = generateAccessToken(user, membership?._id ?? null);
     const refreshToken = await generateRefreshToken(user._id);
     setRefreshCookie(res, refreshToken);
 
     audit(req, 'AUTH_LOGIN_SUCCESS', {
         actorId:   user._id,
         actorRole: user.role,
-        meta:      { orgId: org?._id?.toString() ?? null },
+        meta:      { orgId: org?._id?.toString() ?? null, membershipId: membership?._id?.toString() ?? null },
     });
 
     return res.status(200).json({ user: safeUser(user, org), accessToken });
 };
 
 // ─── Helper: create a patient User from an already-hashed password ──────────
-// NEW-M1 FIX: used by verifyRegistrationOtp. The pending Redis session now
-// stores a bcrypt hash (never plaintext), so creation here must NOT let the
-// User model's pre-save hook hash it a second time — that would corrupt the
-// password (double-hashed values never match on login). The transient
-// `_preHashed` flag (see User.js) tells the hook to skip hashing exactly once.
 const createPatientFromHashedPassword = async ({ name, email, passwordHash }) => {
     const user = new User({ name, email, password: passwordHash, role: 'patient' });
     user._preHashed = true;
@@ -124,8 +147,6 @@ const createPatientFromHashedPassword = async ({ name, email, passwordHash }) =>
 };
 
 // ─── POST /api/auth/register ──────────────────────────────────────────────────
-// Direct (non-OTP) registration endpoint, left in place for API integrations.
-// The web frontend uses the OTP-based flow below.
 const registerUser = async (req, res) => {
     try {
         const { name, email, password } = req.body;
@@ -153,7 +174,13 @@ const registerUser = async (req, res) => {
             user = await User.create({ name, email, password, role: 'patient' });
         }
 
-        const accessToken  = generateAccessToken(user);
+        // PHASE M3 FIX: dual-write — a freshly self-registered patient gets
+        // their Membership created at the same moment their User document
+        // is created, not lazily discovered on next login. Harmless no-op
+        // if org is null (matches resolveOrCreateMembership's own guard).
+        const membership = await resolveOrCreateMembership(user, org);
+
+        const accessToken  = generateAccessToken(user, membership?._id ?? null);
         const refreshToken = await generateRefreshToken(user._id);
         setRefreshCookie(res, refreshToken);
 
@@ -175,6 +202,26 @@ const registerUser = async (req, res) => {
 // ────────────────────────────────────────────────────────────────────────────
 
 // ─── POST /api/auth/register/request-otp ──────────────────────────────────────
+// ─── POST /api/auth/register/request-otp ──────────────────────────────────────
+// PHASE M7 PREREQUISITE FIX: same global-identity reasoning as Phase
+// M5/M6 (registerPatient/createStaff/createDoctor), applied to
+// self-registration. This MUST be fixed before Phase M7 adds a global
+// unique index on User.email — without it, a second-hospital
+// self-registration for an email that already exists elsewhere would
+// start hitting a raw duplicate-key error instead of today's (already
+// wrong, but at least non-crashing) silent-duplicate-creation behaviour.
+//
+// Trust model note: OTP verification proves control of the mailbox, which
+// this codebase already treats as sufficient proof to take an action on an
+// existing account WITHOUT the original password (see the forgot-password
+// flow, which resets a password via email OTP alone). Reusing that same
+// standard here — allowing OTP-proven self-registration to attach a new
+// Membership to an existing identity — is consistent with, not a
+// weakening of, the trust level already established elsewhere in this
+// codebase. What it must NOT do is let the newly-submitted password
+// overwrite the existing identity's real password, or let the submitted
+// name overwrite it either — those remain owned exclusively by whoever
+// already controls that password, exactly as in Phase M5/M6.
 const requestRegistrationOtp = async (req, res) => {
     try {
         const { name, email, password } = req.body;
@@ -186,20 +233,50 @@ const requestRegistrationOtp = async (req, res) => {
             if (org.features?.patientPortal === false) return res.status(403).json({ message: 'Patient self-registration is disabled.' });
         }
 
-        const existsFilter = orgId
-            ? { email, organisationId: orgId, deletedAt: null }
-            : { email, deletedAt: null };
-        const exists = await User.findOne(existsFilter).skipTenantFilter();
-        if (exists) return res.status(409).json({ message: 'An account with this email already exists' });
+        // Global identity lookup — no organisationId in this query.
+        const matches = await User.find({ email }).skipTenantFilter();
+
+        if (matches.length > 1) {
+            console.error(`[Auth] requestRegistrationOtp: multiple global User documents share email ${email} — manual resolution required.`, matches.map((m) => m._id));
+            return res.status(409).json({ message: 'An account with this email already exists' });
+        }
+
+        const existingUser = matches[0] ?? null;
+
+        let membershipAction = 'create'; // 'create' | 'reuse' | 'reactivate'
+        let existingUserId   = null;
+
+        if (existingUser) {
+            existingUserId = existingUser._id.toString();
+
+            if (!orgId) {
+                // No-org (single-tenant/dev) deployment — an existing
+                // global identity with no org context to disambiguate
+                // against is treated the same as today: already exists.
+                return res.status(409).json({ message: 'An account with this email already exists' });
+            }
+
+            const membership = await Membership.findOne({ userId: existingUser._id, organisationId: orgId });
+
+            if (!membership) {
+                membershipAction = 'reuse';
+            } else if (membership.status === 'active') {
+                return res.status(409).json({
+                    message: membership.role === 'patient'
+                        ? 'An account with this email already exists at this organisation. Please log in instead.'
+                        : 'This email belongs to an account with a different active role at this organisation.',
+                });
+            } else if (membership.role !== 'patient') {
+                return res.status(409).json({
+                    message: 'This email belongs to a deleted account with a different role at this organisation. Please contact the hospital directly.',
+                });
+            } else {
+                membershipAction = 'reactivate';
+            }
+        }
 
         const otp     = generateOtp();
         const otpHash = await hashOtp(otp);
-
-        // NEW-M1 FIX: hash the password NOW, before it ever touches Redis.
-        // Previously the plaintext password was stored in the pending
-        // session for up to 10 minutes — this hashes it up front using the
-        // same bcrypt cost factor as the User model, and the plaintext is
-        // never persisted anywhere.
         const passwordHash = await bcrypt.hash(password, 12);
 
         const { id: registrationId, expiresIn } = await createSession('register', {
@@ -207,7 +284,9 @@ const requestRegistrationOtp = async (req, res) => {
             email,
             passwordHash,
             otpHash,
-            organisationId: orgId ? orgId.toString() : null,
+            organisationId:   orgId ? orgId.toString() : null,
+            existingUserId,
+            membershipAction,
             attempts:      0,
             resendCount:   0,
             lastSentAt:    Date.now(),
@@ -255,21 +334,11 @@ const resendRegistrationOtp = async (req, res) => {
         const otp     = generateOtp();
         const otpHash = await hashOtp(otp);
 
-        // NEW-M2 FIX: explicitly restart the full TTL window on resend — a
-        // freshly-sent code should be valid for the full window, not
-        // whatever time happened to be left on the old session.
         await patchSession('register', registrationId, {
             otpHash,
             resendCount: session.resendCount + 1,
             lastSentAt:  Date.now(),
         }, { ttlSeconds: REGISTRATION_OTP_TTL_SECONDS });
-
-        // NEW-C1 FIX: do NOT clear the failed-attempt lockout counter here.
-        // The previous behavior let anyone reset their attempt budget to
-        // zero simply by requesting a new code once the 60s cooldown
-        // elapsed — defeating the 5-attempt lockout entirely. A resend now
-        // only refreshes the code and its TTL; the lockout counter is only
-        // ever cleared on a SUCCESSFUL verification.
 
         const org = session.organisationId ? await Organisation.findById(session.organisationId) : null;
         sendMail({
@@ -286,6 +355,12 @@ const resendRegistrationOtp = async (req, res) => {
 };
 
 // ─── POST /api/auth/register/verify-otp ───────────────────────────────────────
+// ─── POST /api/auth/register/verify-otp ───────────────────────────────────────
+// PHASE M7 PREREQUISITE FIX: branches on the membershipAction decided by
+// requestRegistrationOtp above — 'create' (brand-new identity, unchanged
+// from pre-M7 behaviour), 'reuse' (existing identity, new org — Membership
+// only, password/name never touched), or 'reactivate' (existing identity,
+// removed Membership at this org, same role — reactivate it).
 const verifyRegistrationOtp = async (req, res) => {
     try {
         const { registrationId, otp } = req.body;
@@ -313,52 +388,104 @@ const verifyRegistrationOtp = async (req, res) => {
 
         await clearOtpFailures(`register:${registrationId}`);
 
-        const orgId = session.organisationId || null;
-        const existsFilter = orgId
-            ? { email: session.email, organisationId: orgId, deletedAt: null }
-            : { email: session.email, deletedAt: null };
-        const alreadyExists = await User.findOne(existsFilter).skipTenantFilter();
-        if (alreadyExists) {
-            await deleteSession('register', registrationId);
-            return res.status(409).json({ message: 'An account with this email already exists' });
-        }
+        const orgId             = session.organisationId || null;
+        const membershipAction  = session.membershipAction || 'create';
+        const org               = orgId ? await Organisation.findById(orgId) : null;
 
         let user;
-        if (orgId) {
-            await runWithTenant(orgId, async () => {
+
+        if (membershipAction === 'create') {
+            // Brand-new identity — unchanged from pre-M7 behaviour, except
+            // the existence re-check below is now global rather than
+            // org-scoped, matching requestRegistrationOtp's own check.
+            const matches = await User.find({ email: session.email }).skipTenantFilter();
+            if (matches.length > 0) {
+                await deleteSession('register', registrationId);
+                return res.status(409).json({ message: 'An account with this email already exists' });
+            }
+
+            if (orgId) {
+                await runWithTenant(orgId, async () => {
+                    user = await createPatientFromHashedPassword({
+                        name:         session.name,
+                        email:        session.email,
+                        passwordHash: session.passwordHash,
+                    });
+                });
+            } else {
                 user = await createPatientFromHashedPassword({
                     name:         session.name,
                     email:        session.email,
                     passwordHash: session.passwordHash,
                 });
+            }
+
+            await Membership.create({
+                userId:         user._id,
+                organisationId: orgId,
+                role:           'patient',
+                status:         'active',
+                joinedAt:       new Date(),
             });
         } else {
-            user = await createPatientFromHashedPassword({
-                name:         session.name,
-                email:        session.email,
-                passwordHash: session.passwordHash,
-            });
+            // 'reuse' or 'reactivate' — existing identity. Re-fetch fresh
+            // (not from the Redis session, which only stored the id) to
+            // avoid acting on stale data, and to allow password/MFA reads
+            // needed for safeUser()/token issuance below.
+            user = await User.findById(session.existingUserId).skipTenantFilter();
+            if (!user || user.deletedAt) {
+                await deleteSession('register', registrationId);
+                return res.status(404).json({ message: 'Account no longer available. Please start again.' });
+            }
+
+            if (membershipAction === 'reuse') {
+                await Membership.create({
+                    userId:         user._id,
+                    organisationId: orgId,
+                    role:           'patient',
+                    status:         'active',
+                    joinedAt:       new Date(),
+                });
+            } else {
+                // 'reactivate'
+                const membership = await Membership.findOne({ userId: user._id, organisationId: orgId });
+                if (!membership || membership.status === 'active') {
+                    // Re-check: state may have changed since request-otp
+                    // (e.g. someone else already reactivated it). Fail
+                    // safe rather than silently double-processing.
+                    await deleteSession('register', registrationId);
+                    return res.status(409).json({ message: 'This account is already active at this organisation. Please log in instead.' });
+                }
+                membership.status    = 'active';
+                membership.removedAt = null;
+                await membership.save();
+            }
         }
 
         await deleteSession('register', registrationId);
 
-        const org = orgId ? await Organisation.findById(orgId) : null;
-
-        const accessToken  = generateAccessToken(user);
+        // PHASE M3 FIX: same dual-write pattern as registerUser.
+        const membership   = await resolveOrCreateMembership(user, org);
+        const accessToken  = generateAccessToken(user, membership?._id ?? null);
         const refreshToken = await generateRefreshToken(user._id);
         setRefreshCookie(res, refreshToken);
 
         audit(req, 'AUTH_LOGIN_SUCCESS', {
             actorId:   user._id,
             actorRole: user.role,
-            meta:      { event: 'registration_otp', orgId: orgId?.toString() ?? null },
+            meta:      { event: 'registration_otp', membershipAction, orgId: orgId?.toString() ?? null },
         });
 
-        sendMail({
-            to:  user.email,
-            org,
-            ...templates.welcomePatient({ name: user.name, org }),
-        });
+        // Welcome email only for a genuinely brand-new identity — a
+        // 'reuse'/'reactivate' outcome means this person already knows
+        // this platform.
+        if (membershipAction === 'create') {
+            sendMail({
+                to:  user.email,
+                org,
+                ...templates.welcomePatient({ name: user.name, org }),
+            });
+        }
 
         return res.status(201).json({ user: safeUser(user, org), accessToken });
     } catch (err) {
@@ -411,17 +538,10 @@ const forgotPassword = async (req, res) => {
                 }),
             });
 
-            // NEW-M3 FIX: this event was previously logged as
-            // AUTH_LOGIN_FAILED with success:true, which is self-
-            // contradictory in the audit trail. It now has its own,
-            // accurately-named action.
             audit(req, 'AUTH_PASSWORD_RESET_REQUESTED', {
                 actorId: user._id, actorRole: user.role, success: true,
             });
         } else {
-            // NEW-L1: burn roughly the same amount of time as the
-            // hash-and-send path above so response timing doesn't hint at
-            // whether the email exists.
             await burnTimingBudget();
         }
 
@@ -450,15 +570,10 @@ const resendForgotPasswordOtp = async (req, res) => {
                     const otp     = generateOtp();
                     const otpHash = await hashOtp(otp);
 
-                    // NEW-M2 FIX: restart the full TTL window on resend.
                     await patchSession('forgot', user._id.toString(), {
                         otpHash,
                         lastSentAt: Date.now(),
                     }, { ttlSeconds: FORGOT_PASSWORD_OTP_TTL_SECONDS });
-
-                    // NEW-C1 FIX: do NOT clear the OTP failure/lockout
-                    // counter on resend — see the identical fix note in
-                    // resendRegistrationOtp above.
 
                     const userOrg = user.organisationId ? await Organisation.findById(user.organisationId) : org;
                     sendMail({
@@ -497,7 +612,6 @@ const verifyForgotPasswordOtp = async (req, res) => {
         const GENERIC_INVALID = { status: 401, message: 'Invalid or expired code.' };
 
         if (!user) {
-            // NEW-L1: equalize timing with the "user exists, wrong OTP" path.
             await burnTimingBudget();
             return res.status(GENERIC_INVALID.status).json({ message: GENERIC_INVALID.message });
         }
@@ -597,34 +711,7 @@ const sendMfaChallenge = (
     });
 };
 
-
-// ─── Shared: password/lockout/MFA decision, used by BOTH login endpoints ──────
-// PHASE-E FIX: previously this logic existed twice — once inline for the
-// super_admin bypass, once inline for ordinary users — with the two copies
-// already having drifted once (the super_admin copy initially omitted MFA
-// enforcement and audit-on-failure; see the earlier review notes). Extracted
-// once, here, so there is exactly one implementation for both
-// /api/auth/login and the new /api/auth/platform-login to call — a third
-// inline copy is exactly the kind of drift risk Phase 5's L1 consolidation
-// was about avoiding elsewhere in this file. Behavior is unchanged from
-// both prior inline versions — same messages, same status codes, same
-// audit calls — this is a structural extraction only, not a logic change.
-// `org` is null for the platform-login path (super_admin never has one);
-// `orgMfaRequired` naturally evaluates to false in that case.
-// ─── Shared: lockout check + password verification, used by BOTH
-// authenticateAndRespond below AND loginUser's wrong-endpoint rejection ──
-// PHASE-E FOLLOW-UP FIX (maintainability): this used to exist twice — once
-// here, once again inline inside loginUser's super_admin-rejection branch
-// (added when that branch was changed to verify the password before
-// revealing anything, per the account-enumeration fix). Two copies of
-// lockout/password-verification logic is exactly the drift risk this
-// file's other extractions (authenticateAndRespond itself, Phase 5's
-// resolveOrganisation) exist to avoid — this consolidates it back down to
-// one implementation. Callers get back a discriminated result rather than
-// a response directly, since what happens on a successful match differs
-// between the two call sites (issue a real session vs. reveal a redirect
-// message) — only the locked/wrong-password outcomes are identical
-// everywhere, so only those are respond-agnostic here.
+// ─── Shared: lockout check + password verification (unchanged from before) ──
 const verifyPasswordAndLockout = async (req, user, org = null) => {
     const orgId = org?._id?.toString() ?? null;
 
@@ -676,15 +763,12 @@ const authenticateAndRespond = async (req, res, user, org) => {
         return res.status(check.status).json({ message: check.message });
     }
 
-    // PATIENT MFA REMOVAL: single centralized bypass gate. (super_admin
-    // never matches this — role is always 'super_admin' on that path.)
+    // PATIENT MFA REMOVAL: single centralized bypass gate.
     if (user.role === 'patient') {
         return issueLoginResponse(res, req, user, org);
     }
 
-    // Enterprise MFA Decision Tree (STAFF ONLY from here down — includes
-    // super_admin, per SecurityPanel.jsx treating it as a manageable
-    // "staff" role for MFA enforcement purposes).
+    // Enterprise MFA Decision Tree (STAFF ONLY from here down).
     const orgMfaRequired = org?.features?.mfaRequired ?? false;
     const forceMfa = Boolean(user.forceMfa);
 
@@ -703,40 +787,10 @@ const authenticateAndRespond = async (req, res, user, org) => {
 };
 
 // ─── POST /api/auth/login (hospital users only) ────────────────────────────────
-// PATIENT MFA REMOVAL: patients bypass the entire MFA decision tree via a
-// single centralized gate right after password verification (see
-// authenticateAndRespond above). Staff behavior is unchanged below that
-// gate. See Organisation.js / SecurityPanel.jsx for the "mfaRequired =
-// staff-only" reinterpretation.
 const loginUser = async (req, res) => {
     try {
         const { email } = req.body;
 
-        // PHASE-E FIX (Bug #1, route-based — not a client-supplied flag):
-        // a super_admin may ONLY authenticate via the dedicated
-        // /api/auth/platform-login endpoint. The actual super_admin
-        // authentication logic still lives exclusively in
-        // platformLoginUser below — this block never issues a real login
-        // or MFA challenge — but it DOES verify the password before
-        // deciding what to reveal.
-        //
-        // PHASE-E FOLLOW-UP FIX: previously this rejected with the
-        // specific "Please use the Platform Login" message the MOMENT an
-        // email matching a super_admin was found — before any password
-        // check at all. That let anyone probe /api/auth/login with
-        // candidate emails and learn, with zero knowledge of any password,
-        // which ones belong to a super_admin account: the single highest-
-        // privilege role in the system. The specific redirect message is
-        // now only ever returned AFTER the password has been verified
-        // against that account — i.e. only to someone who already knows
-        // the correct credentials and simply used the wrong page. A wrong
-        // password on a super_admin's email now produces the exact same
-        // response shape as a wrong password on any other account (see the
-        // normal-path wrong-password branch further down — same message
-        // format, same lockout behavior, same audit reason string), so
-        // response content alone can never distinguish "this email belongs
-        // to a super_admin" from "this email belongs to an ordinary user"
-        // without a correct password either way.
         const maybeSuperAdmin = await User.findOne({
             email, role: 'super_admin', deletedAt: null,
         })
@@ -750,12 +804,6 @@ const loginUser = async (req, res) => {
                 return res.status(check.status).json({ message: check.message });
             }
 
-            // Correct credentials, wrong endpoint — safe to reveal now,
-            // since the requester has already proven they know this
-            // account's password. verifyPasswordAndLockout has already
-            // handled the locked/wrong-password outcomes identically to
-            // any other account above; this audit entry is specific to
-            // the 'match' outcome only.
             audit(req, 'AUTH_LOGIN_FAILED', {
                 actorId: maybeSuperAdmin._id, actorRole: maybeSuperAdmin.role, success: false,
                 meta: { reason: 'wrong_login_endpoint' },
@@ -763,13 +811,6 @@ const loginUser = async (req, res) => {
             return res.status(403).json({ message: 'Please use the Platform Login.' });
         }
 
-        // PHASE5-L1 FIX: previously called resolveOrgFromRequest() (a plain
-        // nullable-org wrapper) and then re-derived its own separate
-        // count-based ambiguity check afterward — this is exactly the
-        // duplicate logic that drifted out of sync with
-        // resolveOrgFromRequest during the Phase 2 follow-up fix. Now calls
-        // the shared resolveOrganisation() utility directly to get the
-        // precise reason, with no second DB count query needed.
         const orgResult = await resolveOrganisation(req);
 
         let org = null;
@@ -780,8 +821,6 @@ const loginUser = async (req, res) => {
         } else if (orgResult.status === 'ambiguous') {
             return res.status(400).json({ message: 'Organisation not specified. Include X-Organisation-Slug header.' });
         }
-        // orgResult.status === 'no_orgs' → org stays null; a fresh install
-        // with zero organisations has nothing to scope login against.
 
         const orgId = org?._id ?? null;
 
@@ -809,14 +848,6 @@ const loginUser = async (req, res) => {
 };
 
 // ─── POST /api/auth/platform-login (super_admin only) ──────────────────────────
-// PHASE-E FIX (Bug #1, route-based): the ONLY endpoint that can ever
-// authenticate a super_admin. Structurally cannot authenticate a
-// non-super_admin — there is no hospital-user lookup anywhere in this
-// function at all, so "reject non-super_admin" isn't a check that could be
-// forgotten or bypassed, it's simply not a code path that exists here.
-// Never resolves an organisation, never sends/expects an
-// X-Organisation-Slug header — see tenantMiddleware.js's PUBLIC_EXACT list,
-// where this route is now included alongside /api/auth/login.
 const platformLoginUser = async (req, res) => {
     try {
         const { email } = req.body;
@@ -828,10 +859,6 @@ const platformLoginUser = async (req, res) => {
             .skipTenantFilter();
 
         if (!superAdmin) {
-            // Deliberately generic — see loginUser's rejection above for
-            // the asymmetric reasoning. An untrusted requester probing
-            // this endpoint learns nothing about whether the email exists
-            // or belongs to a hospital account.
             audit(req, 'AUTH_LOGIN_FAILED', {
                 success: false,
                 meta: { reason: 'platform_login_no_such_super_admin', email },
@@ -839,7 +866,9 @@ const platformLoginUser = async (req, res) => {
             return res.status(401).json({ message: 'Invalid email or password.' });
         }
 
-        // Super Admin never belongs to an organisation.
+        // Super Admin never belongs to an organisation — issueLoginResponse
+        // will correctly resolve no Membership at all (see
+        // resolveOrCreateMembership's super_admin guard).
         return authenticateAndRespond(req, res, superAdmin, null);
     } catch (err) {
         console.error('[Auth] platformLoginUser:', err.message);
@@ -848,6 +877,14 @@ const platformLoginUser = async (req, res) => {
 };
 
 // ─── POST /api/auth/refresh ───────────────────────────────────────────────────
+// PHASE M3 NOTE: refresh re-mints the access token via generateAccessToken(user)
+// WITHOUT re-resolving membershipId here — this matches the architecture
+// document's Phase M3 backward-compatibility plan: a refresh issued against
+// a pre-Phase-M3 session simply continues to omit the claim (protect falls
+// back to the pre-existing Phase 1 checks for that token), and since access
+// tokens are short-lived, this self-resolves within one login cycle. A
+// dedicated fix to also carry membershipId through refresh is deferred to
+// keep this phase's diff minimal; tracked as a Phase M3 follow-up.
 const refreshAccessToken = async (req, res) => {
     try {
         const token = getRefreshCookie(req);
@@ -872,7 +909,14 @@ const refreshAccessToken = async (req, res) => {
         }
 
         await revokeRefreshToken(token);
-        const newAccessToken  = generateAccessToken(user);
+
+        // PHASE M3: re-resolve membership so a refreshed token also carries
+        // membershipId going forward (closes the gap noted above on the
+        // very next refresh cycle, rather than requiring a full re-login).
+        const org = user.organisationId ? await Organisation.findById(user.organisationId) : null;
+        const membership = await resolveOrCreateMembership(user, org);
+
+        const newAccessToken  = generateAccessToken(user, membership?._id ?? null);
         const newRefreshToken = await generateRefreshToken(user._id);
         setRefreshCookie(res, newRefreshToken);
 
@@ -912,9 +956,6 @@ const logoutAllDevices = async (req, res) => {
 };
 
 // ─── PUT /api/auth/change-password ────────────────────────────────────────────
-// A2: now sits behind requireStepUp (see authRoutes.js) — the route-level
-// middleware already guarantees a fresh step-up token was presented before
-// this handler ever runs, so no change needed in the handler body itself.
 const changePassword = async (req, res) => {
     try {
         const { currentPassword, newPassword } = req.body;
@@ -939,15 +980,6 @@ const changePassword = async (req, res) => {
 };
 
 // ─── A2: POST /api/auth/step-up/verify ─────────────────────────────────────────
-// Issues a short-lived step-up token proving the caller has JUST re-supplied
-// their password or a valid TOTP code, for use by requireStepUp-gated
-// routes (change-password, MFA disable, org security-policy updates).
-//
-// Protected route (mounted with `protect` — see authRoutes.js): the caller
-// must already hold a valid access token. This adds a SECOND, fresher proof
-// on top of that, rather than replacing normal authentication. Accepts
-// EITHER a password OR a TOTP code (stepUpVerifySchema requires at least
-// one) — a user without MFA enrolled simply has no TOTP option available.
 const stepUpVerify = async (req, res) => {
     try {
         const { password, token } = req.body;

@@ -8,12 +8,30 @@ const REFRESH_TOKEN_TTL_SEC   = 7 * 24 * 60 * 60;
 const MFA_PENDING_EXPIRES     = process.env.JWT_MFA_PENDING_EXPIRES || '5m';
 const RESET_PENDING_EXPIRES   = process.env.JWT_RESET_PENDING_EXPIRES || '10m';
 
-export const generateAccessToken = (user) => {
+// PHASE M3 FIX: access tokens now carry a `membershipId` claim alongside
+// `organisationId`. `organisationId`/`role` are kept on the token exactly
+// as before (nothing downstream that reads them needs to change) — but
+// `membershipId`, when present, lets `protect` re-verify the SPECIFIC
+// Membership document (not just the User's role field) is still
+// `status: 'active'` on every request. This is what makes revoking one
+// person's access to ONE organisation instant and correct, independent of
+// any other organisation relationship they may have.
+//
+// Backward compatible by construction: `membershipId` is optional on the
+// signature. A caller that doesn't pass one (e.g. super_admin, who has no
+// Membership at all) simply omits the claim, and `protect` treats a token
+// with no `membershipId` claim as pre-Phase-M3 / membership-less — falling
+// back to today's User-field-based check for that one request. Since
+// access tokens are short-lived (15 minutes), every token in circulation
+// naturally carries the new claim within one expiry window of deployment —
+// no forced mass logout required.
+export const generateAccessToken = (user, membershipId = null) => {
     return jwt.sign(
         {
             id:             user._id,
             role:           user.role,
             organisationId: user.organisationId ? user.organisationId.toString() : null,
+            membershipId:   membershipId ? membershipId.toString() : null,
         },
         process.env.JWT_SECRET,
         { expiresIn: ACCESS_TOKEN_EXPIRES }
@@ -63,13 +81,6 @@ export const verifyResetPendingToken = (token) => {
 };
 
 // ─── Step-up token (A2: sensitive-action re-verification) ────────────────────
-// Proves the caller has recently re-supplied their password or a valid TOTP
-// code, independent of how old their access token is. Short-lived (5 min),
-// single-purpose, and — like mfaPending/resetPending — signed with its own
-// dedicated secret so a leaked token of one type can never be replayed as
-// another. Issued by POST /api/auth/step-up/verify (protected route — the
-// caller must already hold a valid access token; this only adds a second,
-// fresher proof on top of it), consumed by requireStepUp middleware.
 const STEP_UP_EXPIRES = process.env.JWT_STEP_UP_EXPIRES || '5m';
 
 export const generateStepUpToken = (userId) => {

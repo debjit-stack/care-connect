@@ -1,42 +1,32 @@
-import User from '../models/User.js';
+import User       from '../models/User.js';
+import Membership from '../models/Membership.js';
 import { verifyAccessToken } from '../utils/tokens.js';
 
 // ─── protect ──────────────────────────────────────────────────────────────────
-// PHASE1-C1/C2 FIX: tenant-binding enforcement.
+// PHASE1-C1/C2 FIX: tenant-binding enforcement. (unchanged — see below)
 //
-// Previously this middleware verified the JWT signature and loaded the user
-// by ID (correctly using skipTenantFilter() for the ID lookup), but never
-// compared the resolved organisation for the request (req.orgId, set by
-// resolveTenant from the client-supplied X-Organisation-Slug/-Id header or
-// subdomain) against the authenticated user's OWN organisationId. That meant
-// a valid token for a Hospital A user, combined with a header claiming
-// Hospital B, was accepted end-to-end: every subsequent tenant-scoped query
-// in the request ran under Hospital B's AsyncLocalStorage context while
-// req.user (and all audit attribution) reflected the Hospital A identity.
+// PHASE M3 FIX: Membership becomes an additional, independent source of
+// truth for "is this specific org relationship still active" on every
+// request — layered ON TOP of the existing Phase 1 checks below, not
+// replacing them.
 //
-// Two checks are added below, in order:
-//   1. Token-vs-live-user drift check — the access token's `organisationId`
-//      claim (set at issuance, see tokens.js) is compared against the LIVE
-//      user document's organisationId. A mismatch means the user's org
-//      assignment changed after this token was issued (e.g. admin
-//      reassignment, or a future "move user between orgs" feature) — the
-//      token is stale and must not be trusted for tenant-scoped work, even
-//      though its signature is valid and the user still exists.
-//   2. Header-vs-user binding check — for any non-super_admin user, the
-//      resolved req.orgId (from resolveTenant, based on client-supplied
-//      metadata) must equal the user's own organisationId, or the request
-//      is rejected. This is the actual fix for C1: it makes tenant scoping
-//      a verified server-side invariant instead of an unenforced convention
-//      that only held because well-behaved clients always sent the header
-//      matching the org they authenticated against.
+// Why this is needed in addition to the existing User-field checks: those
+// checks compare the token against the LIVE User document's own
+// organisationId/role. That was sufficient when a User could only ever
+// have one organisation relationship at a time. Once Membership exists
+// (Phase M2) and a person can have several — or their relationship with
+// ONE specific org can be revoked (Membership.status → 'removed') without
+// touching the User document or any of their OTHER org relationships at
+// all — the User-field checks alone can no longer express "was THIS
+// specific relationship revoked." Membership can.
 //
-// super_admin is exempt from check #2 by design — a super_admin's own
-// organisationId is null, and legitimately operating across organisations
-// (e.g. via organisationRoutes) is an intended capability of that role.
-// Both checks are skipped entirely when req.orgId is not set (e.g. routes
-// that bypass resolveTenant, like /api/auth/logout — see
-// tenantMiddleware.js's PUBLIC_EXACT list), since there is no tenant context
-// to bind against on those routes.
+// Backward compatible: a token with no `membershipId` claim (issued before
+// this phase deployed, or issued for super_admin, who never has one) skips
+// this new check entirely and relies solely on the pre-existing Phase 1
+// checks — identical behaviour to before this phase. Access tokens are
+// short-lived (15 min), so every token in circulation naturally carries
+// the new claim within one expiry window of deployment; no forced mass
+// logout required.
 const protect = async (req, res, next) => {
     let token;
 
@@ -69,14 +59,89 @@ const protect = async (req, res, next) => {
             });
         }
 
-        // ── PHASE1-C2: token-vs-live-user org drift check ──────────────────
-        // Tokens issued before this fix shipped won't carry an
-        // organisationId claim at all (decoded.organisationId === undefined).
-        // Those are treated as stale/untrusted here too — the user is forced
-        // to log in again and receive a token with the claim, rather than
-        // silently being granted an unverified pass. This is an intentional,
-        // one-time break of pre-existing sessions as part of closing a
-        // critical tenant-isolation gap.
+        // ── PHASE M5 FIX: Membership supersedes the legacy single-org
+        // checks when present. ──────────────────────────────────────────────
+        //
+        // Why this can no longer just run "alongside" the Phase 1 checks:
+        // Phase 1's checks (C1/C2, directly below) assume a person has AT
+        // MOST ONE organisation relationship, encoded in the single
+        // User.organisationId field. That assumption is exactly what the
+        // Membership model exists to remove (Phase M2 onward) — a person
+        // can now hold active Memberships at several organisations
+        // concurrently (architecture doc scenario 3/4). For such a person,
+        // User.organisationId holds only ONE of their orgs (whichever was
+        // written there most recently by legacy code) — so the old check
+        // would incorrectly reject a perfectly valid session for any OTHER
+        // org they're a member of.
+        //
+        // The Membership check (added in Phase M3, below) is strictly more
+        // precise: it verifies the EXACT relationship this token was
+        // issued for, by its own dedicated identifier, not by a single
+        // shared field that can only describe one relationship at a time.
+        // Once that has been verified, re-running the coarser legacy check
+        // on top adds no safety and actively breaks the multi-org case
+        // this phase exists to support.
+        //
+        // A token with no membershipId claim (pre-Phase-M3, or
+        // super_admin, who never has one) still runs the original Phase 1
+        // checks unchanged — full backward compatibility preserved for
+        // anything not yet migrated.
+        if (decoded.membershipId) {
+            const membership = await Membership.findById(decoded.membershipId).lean();
+
+            if (!membership || membership.status !== 'active') {
+                return res.status(401).json({
+                    message: 'Your access to this organisation has been revoked or is no longer active. Please log in again.',
+                });
+            }
+
+            if (String(membership.userId) !== String(user._id)) {
+                return res.status(401).json({ message: 'Session is invalid. Please log in again.' });
+            }
+
+            // The membership's own organisationId is the authoritative org
+            // for this session — compare THAT against the request's
+            // resolved org, not User.organisationId.
+            if (req.orgId && String(membership.organisationId) !== String(req.orgId)) {
+                return res.status(403).json({
+                    message: 'Access denied. This session is not valid for the requested organisation.',
+                });
+            }
+
+            // ── PHASE M7 PREREQUISITE FIX: effective role/org overlay ──────
+            // req.user.role (the raw User document field) is a SINGLE
+            // global value — it cannot correctly represent a person who
+            // holds different roles at different organisations (exactly
+            // the case Phase M5/M6 now allow: doctor at Org A, patient at
+            // Org B, concurrently). Every role guard in this app
+            // (requireRole/admin/doctor/isPatient/isReceptionistOrAdmin)
+            // reads req.user.role directly, and audit.js reads
+            // req.user.organisationId for its cross-org attribution
+            // marker — both need to reflect the CAPACITY this specific
+            // session is acting in, not whichever org happened to be
+            // written to the User document last.
+            //
+            // This mutates the in-memory `user` document's role/
+            // organisationId to match the resolved membership — NEVER
+            // persisted (no .save() call), scoped to this one request
+            // only. This is the correct place for it: `protect` has
+            // already proven the membership is valid and belongs to this
+            // user, so overlaying its role/org here is the single point
+            // every downstream guard, controller, and audit call
+            // transparently benefits from, with no per-controller changes
+            // required.
+            user.role           = membership.role;
+            user.organisationId = membership.organisationId;
+
+            req.membership = membership;
+            req.user = user;
+            return next();
+        }
+
+        // ── Everything below this line only runs for tokens WITHOUT a
+        // membershipId claim — i.e. not yet migrated to Phase M3/M5. ───────
+
+        // ── PHASE1-C2: token-vs-live-user org drift check (unchanged) ──────
         if (user.role !== 'super_admin') {
             const tokenOrgId = decoded.organisationId ? String(decoded.organisationId) : null;
             const liveOrgId  = user.organisationId    ? String(user.organisationId)    : null;
@@ -88,7 +153,7 @@ const protect = async (req, res, next) => {
             }
         }
 
-        // ── PHASE1-C1: header-resolved org vs. user's own org ──────────────
+        // ── PHASE1-C1: header-resolved org vs. user's own org (unchanged) ──
         if (req.orgId && user.role !== 'super_admin') {
             if (String(user.organisationId ?? '') !== String(req.orgId)) {
                 return res.status(403).json({

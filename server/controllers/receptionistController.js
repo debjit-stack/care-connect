@@ -3,88 +3,174 @@ import Appointment    from '../models/Appointment.js';
 import PackageBooking from '../models/PackageBooking.js';
 import HealthPackage  from '../models/HealthPackage.js';
 import Doctor         from '../models/Doctor.js';
+import Membership     from '../models/Membership.js';
 import Notification   from '../models/Notification.js';
 import audit          from '../utils/audit.js';
 import { sendMail, templates } from '../utils/mailer.js';
 import { validateBookingSlot } from '../utils/bookingValidation.js';
 
 // ─── POST /api/receptionist/register-patient ─────────────────────────────────
-// PHASE5-L2 FIX: the existence/restore check below previously ran
-// `User.findOne({ email }).skipTenantFilter()` — fully global, with NO
-// organisationId in the filter at all. This caused two distinct bugs:
+// PHASE M5 FIX: this is a full redesign, not an incremental patch — it
+// implements the architecture doc's scenario 4 ("patient visits Hospital A,
+// later wants to register at Hospital B") as a first-class, safe operation.
 //
-//   1. Cross-tenant restore: if a patient with this email was soft-deleted
-//      in a DIFFERENT organisation, this lookup would match that deleted
-//      record and the code below would restore it — reactivating another
-//      org's patient data, invisible to that org, triggered by an
-//      unrelated org's receptionist action. organisationId was never
-//      touched by the restore branch, compounding the confusion.
-//   2. False conflict: the compound (email, organisationId) unique index
-//      on User exists specifically so the same email CAN belong to
-//      different orgs' patients. This global check returned 409 "already
-//      exists" whenever ANY org had that email active, even when the
-//      CURRENT org had no conflict — actively blocking a legitimate,
-//      by-design multi-tenant scenario.
+// The core behavioural shift: a patient is now looked up GLOBALLY by email
+// (one identity, full stop — see architecture doc §2/§3), not scoped to
+// req.orgId. What differs per-organisation is only whether a Membership
+// exists for THIS org, not whether a separate User document exists.
 //
-// Scoping the filter to `organisationId: req.orgId` (kept explicit
-// alongside .skipTenantFilter(), same pattern as the Phase 3B fixes) closes
-// both: restore now only ever matches a deleted record within the SAME
-// org, and the same email in a different org no longer false-conflicts.
+// Three possible outcomes:
+//
+//   (a) No User exists anywhere for this email
+//       → create a brand-new User (this org's receptionist becomes the
+//         first point of contact for this identity) + an active Membership
+//         for this org.
+//
+//   (b) A User already exists, but has NO Membership at this org yet
+//       → this is the actual "same person, new hospital" case. The
+//         EXISTING identity (password, MFA enrollment, everything) is
+//         reused as-is. A NEW Membership is created for this org. The
+//         User document itself — name, password — is NEVER modified here.
+//         This is a deliberate security boundary: if this org's
+//         receptionist's submitted password/name were allowed to
+//         overwrite an existing identity's real credentials, any
+//         receptionist could hijack any patient's account by "registering"
+//         them at their own hospital with a guessed/known email. The
+//         person keeps signing in with the password they already have.
+//
+//   (c) A User already exists AND already has a Membership at this org
+//       → depends on that Membership's role/status:
+//         - active, role 'patient'   → 409, already registered here.
+//         - active, role != 'patient' → 409, this identity already has a
+//           different role at this specific organisation; a role change
+//           within one org is a distinct, deliberate operation and is not
+//           performed silently by patient registration.
+//         - removed, role 'patient'  → reactivate this Membership
+//           (status → active). Matches the pre-Membership "restore" case,
+//           now scoped correctly to ONE org's relationship rather than
+//           the whole identity.
+//         - removed, role != 'patient' → 409, same reasoning as the active
+//           different-role case — this is the exact scenario the
+//           role-continuity gate was built to catch, now expressed at the
+//           Membership level (where it belongs) instead of the User level.
+//
+// NOTE (scope): this fixes the STAFF-ASSISTED registration path only.
+// Patient SELF-registration (requestRegistrationOtp/verifyRegistrationOtp
+// in authController.js) still performs an org-scoped existence check and
+// will create a second, disconnected User for the same email at a
+// different org — it has not yet been migrated to this identity-reuse
+// model. Flagged as a required M5 follow-up, not silently left as if it
+// were already handled.
 const registerPatient = async (req, res) => {
     try {
         const { name, email, password } = req.body;
 
-        const existingUser = await User
-            .findOne({ email, organisationId: req.orgId })
-            .skipTenantFilter();
+        // Global identity lookup — no organisationId in this query at all.
+        const matches = await User.find({ email }).skipTenantFilter();
 
-        if (existingUser && existingUser.deletedAt) {
-            // FIX: role-continuity gate. A soft-deleted identity may only be
-            // auto-restored if it was previously the SAME role being
-            // requested. Without this, a deleted doctor/staff account could
-            // be silently relabelled 'patient' here — a cross-role identity
-            // conversion, not a restore — leaving role-specific child
-            // records (e.g. Doctor, still soft-deleted but still pointing at
-            // this same User._id) orphaned yet intact. Any later code path
-            // that looks up those child records without a deletedAt guard
-            // would then treat them as live again the moment this User
-            // becomes non-deleted. See MIGRATIONS.md / AUTH_FLOW.md context:
-            // this restore branch existed to solve legitimate same-role
-            // re-registration (patient → patient), not role conversion.
-            if (existingUser.role !== 'patient') {
-                return res.status(409).json({
-                    message: 'This email belongs to a deleted account with a different role. ' +
-                              'Restore or convert it through account management instead of patient registration.',
-                });
-            }
-
-            existingUser.name      = name;
-            existingUser.password  = password;
-            existingUser.role      = 'patient';
-            existingUser.deletedAt = undefined;
-            await existingUser.save();
-
-            return res.status(200).json({
-                message: 'Patient restored successfully',
-                patient: { _id: existingUser._id, name: existingUser.name, email: existingUser.email },
+        if (matches.length > 1) {
+            // Defensive: should not occur (Phase M1's audit found zero
+            // cross-org duplicate emails in production at the time this
+            // was written), but a generic algorithm must not silently
+            // guess which of several same-email identities is "the" one.
+            console.error(`[Receptionist] registerPatient: multiple global User documents share email ${email} — manual resolution required.`, matches.map((m) => m._id));
+            return res.status(409).json({
+                message: 'Multiple accounts exist for this email. Please contact support to resolve this before registering.',
             });
         }
 
-        if (existingUser) {
-            return res.status(409).json({ message: 'A patient with this email already exists' });
+        const existingUser = matches[0] ?? null;
+
+        // ── Outcome (a): brand-new identity ─────────────────────────────────
+        if (!existingUser) {
+            const patient = await User.create({ name, email, password, role: 'patient' });
+
+            await Membership.create({
+                userId:         patient._id,
+                organisationId: req.orgId,
+                role:           'patient',
+                status:         'active',
+                joinedAt:       new Date(),
+                invitedBy:      req.user._id,
+            });
+
+            audit(req, 'DATA_CREATE', {
+                actorId:      req.user._id,
+                actorRole:    req.user.role,
+                resourceType: 'User',
+                resourceId:   patient._id,
+                meta:         { createdRole: 'patient', orgId: req.orgId },
+            });
+
+            return res.status(201).json({ _id: patient._id, name: patient.name, email: patient.email });
         }
 
-        const patient = await User.create({ name, email, password, role: 'patient' });
-
-        audit(req, 'DATA_CREATE', {
-            actorId:      req.user._id,
-            actorRole:    req.user.role,
-            resourceType: 'User',
-            resourceId:   patient._id,
-            meta:         { createdRole: 'patient', orgId: req.orgId },
+        // Existing identity found — check this org's Membership.
+        const membership = await Membership.findOne({
+            userId:         existingUser._id,
+            organisationId: req.orgId,
         });
 
-        res.status(201).json({ _id: patient._id, name: patient.name, email: patient.email });
+        // ── Outcome (b): existing identity, new to THIS org ─────────────────
+        if (!membership) {
+            await Membership.create({
+                userId:         existingUser._id,
+                organisationId: req.orgId,
+                role:           'patient',
+                status:         'active',
+                joinedAt:       new Date(),
+                invitedBy:      req.user._id,
+            });
+
+            audit(req, 'DATA_CREATE', {
+                actorId:      req.user._id,
+                actorRole:    req.user.role,
+                resourceType: 'Membership',
+                resourceId:   existingUser._id,
+                meta:         { event: 'existing_identity_added_to_org', role: 'patient', orgId: req.orgId },
+            });
+
+            return res.status(201).json({
+                message: 'This person already has an account and has been added as a patient at your organisation.',
+                _id:     existingUser._id,
+                name:    existingUser.name,
+                email:   existingUser.email,
+            });
+        }
+
+        // ── Outcome (c): existing Membership at this org ─────────────────────
+        if (membership.status === 'active') {
+            return res.status(409).json({
+                message: membership.role === 'patient'
+                    ? 'A patient with this email already exists at this organisation.'
+                    : 'This email belongs to an account with a different active role at this organisation. Restore or convert it through account management instead of patient registration.',
+            });
+        }
+
+        // membership.status === 'removed' from here down.
+        if (membership.role !== 'patient') {
+            return res.status(409).json({
+                message: 'This email belongs to a deleted account with a different role at this organisation. ' +
+                          'Restore or convert it through account management instead of patient registration.',
+            });
+        }
+
+        membership.status    = 'active';
+        membership.removedAt = null;
+        await membership.save();
+
+        audit(req, 'DATA_UPDATE', {
+            actorId:      req.user._id,
+            actorRole:    req.user.role,
+            resourceType: 'Membership',
+            resourceId:   existingUser._id,
+            meta:         { action: 'restore', role: 'patient', orgId: req.orgId },
+        });
+
+        return res.status(200).json({
+            message: 'Patient restored successfully',
+            patient: { _id: existingUser._id, name: existingUser.name, email: existingUser.email },
+        });
     } catch (err) {
         console.error('[Receptionist] registerPatient:', err.message);
         res.status(500).json({ message: 'Failed to register patient' });

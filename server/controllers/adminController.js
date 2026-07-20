@@ -3,6 +3,7 @@ import User          from '../models/User.js';
 import Doctor        from '../models/Doctor.js';
 import Appointment   from '../models/Appointment.js';
 import HealthPackage from '../models/HealthPackage.js';
+import Membership    from '../models/Membership.js';
 import Notification  from '../models/Notification.js';
 import audit         from '../utils/audit.js';
 import { revokeAllRefreshTokens } from '../utils/tokens.js';
@@ -137,6 +138,20 @@ const deleteUser = async (req, res) => {
         user.deletedAt = new Date();
         await user.save({ session });
 
+        // PHASE M3 FIX: dual-write — the Membership for this user+org must
+        // be removed in the SAME transaction as the User deletion, not
+        // discovered as drift later. This is the Membership-level
+        // equivalent of the Doctor cascade above, and closes the same class
+        // of "child record silently out of sync with its owner" bug for the
+        // new model before it can ever occur.
+        if (user.organisationId) {
+            await Membership.updateOne(
+                { userId: user._id, organisationId: user.organisationId },
+                { $set: { status: 'removed', removedAt: user.deletedAt } },
+                { session }
+            );
+        }
+
         await session.commitTransaction();
         session.endSession();
 
@@ -160,6 +175,42 @@ const deleteUser = async (req, res) => {
 };
 
 // ─── POST /api/admin/doctors ──────────────────────────────────────────────────
+// ─── POST /api/admin/doctors ──────────────────────────────────────────────────
+// PHASE M6 FIX: full redesign, same global-identity pattern as Phase M5's
+// registerPatient, extended to cover the Doctor profile that must travel
+// alongside a doctor's Membership.
+//
+// Four possible outcomes:
+//
+//   (a) No User exists anywhere for this email
+//       → create User(role:'doctor') + Membership(active, role:'doctor') +
+//         Doctor profile, all in one transaction. Identical to the
+//         pre-M6 behaviour for a genuinely new person.
+//
+//   (b) A User already exists, but has NO Membership at this org yet
+//       → THIS is scenario 1/3 from the architecture doc: a doctor moving
+//         to a new hospital, or a doctor working at several hospitals
+//         concurrently (the "celebrity doctor" case). The existing
+//         identity (password, MFA) is reused untouched — same security
+//         reasoning as registerPatient's outcome (b): this org's admin
+//         must never be able to overwrite another org's doctor's real
+//         password by "creating" them here. Only a NEW Membership + a NEW
+//         Doctor profile (this org's own specialty/availability/etc,
+//         independent of any other org's) are created.
+//
+//   (c) A User exists AND already has an active Membership at this org
+//       → 409, distinguishing "already a doctor here" from "already has a
+//         different active role here" (same pattern as registerPatient).
+//
+//   (d) A User exists AND has a REMOVED Membership at this org, previously
+//       role 'doctor'
+//       → reactivate the Membership, and reactivate-or-recreate the
+//         corresponding Doctor profile for that membership (using the
+//         newly submitted specialty/qualifications/experienceYears — this
+//         is effectively "re-hiring," and the clinical details may well
+//         have changed since they left). A removed Membership with a
+//         DIFFERENT prior role still requires an explicit conversion
+//         workflow, not silent creation.
 const createDoctor = async (req, res) => {
     const session = await mongoose.startSession();
     session.startTransaction();
@@ -167,38 +218,174 @@ const createDoctor = async (req, res) => {
     try {
         const { name, email, password, specialty, qualifications, experienceYears } = req.body;
 
-        // PHASE5-L2 FIX: scoped to the current org, same reasoning as
-        // createStaff/registerPatient below — a global (no organisationId)
-        // existence check here would both incorrectly block a legitimate
-        // same-email-different-org doctor creation, and (though this
-        // function has no soft-delete-restore branch, so no cross-tenant
-        // restore risk specifically) would report a false 409 for an email
-        // that has no actual conflict within this organisation.
-        const exists = await User.findOne({ email, organisationId: req.orgId }).skipTenantFilter();
-        if (exists) {
+        const matches = await User.find({ email }).session(session).skipTenantFilter();
+
+        if (matches.length > 1) {
             await session.abortTransaction();
             session.endSession();
-            return res.status(409).json({ message: 'A user with this email already exists' });
+            console.error(`[Admin] createDoctor: multiple global User documents share email ${email} — manual resolution required.`, matches.map((m) => m._id));
+            return res.status(409).json({
+                message: 'Multiple accounts exist for this email. Please contact support to resolve this before onboarding.',
+            });
         }
 
-        const [user]   = await User.create([{ name, email, password, role: 'doctor' }], { session });
-        const [doctor] = await Doctor.create(
-            [{ user: user._id, specialty, qualifications, experienceYears }],
-            { session }
-        );
+        const existingUser = matches[0] ?? null;
+
+        // ── Outcome (a): brand-new identity ─────────────────────────────────
+        if (!existingUser) {
+            const [user] = await User.create([{ name, email, password, role: 'doctor' }], { session });
+
+            const [membership] = await Membership.create(
+                [{
+                    userId:         user._id,
+                    organisationId: req.orgId,
+                    role:           'doctor',
+                    status:         'active',
+                    joinedAt:       new Date(),
+                    invitedBy:      req.user._id,
+                }],
+                { session }
+            );
+
+            const [doctor] = await Doctor.create(
+                [{
+                    user:         user._id,
+                    membershipId: membership._id,
+                    specialty,
+                    qualifications,
+                    experienceYears,
+                }],
+                { session }
+            );
+
+            await session.commitTransaction();
+            session.endSession();
+
+            audit(req, 'DATA_CREATE', {
+                actorId:      req.user._id,
+                actorRole:    req.user.role,
+                resourceType: 'Doctor',
+                resourceId:   doctor._id,
+                meta:         { orgId: req.orgId },
+            });
+
+            return res.status(201).json({ message: 'Doctor created successfully', userId: user._id, doctorId: doctor._id });
+        }
+
+        // Existing identity found — check this org's Membership.
+        const membership = await Membership.findOne({
+            userId:         existingUser._id,
+            organisationId: req.orgId,
+        }).session(session);
+
+        // ── Outcome (b): existing identity, new to THIS org ─────────────────
+        if (!membership) {
+            const [newMembership] = await Membership.create(
+                [{
+                    userId:         existingUser._id,
+                    organisationId: req.orgId,
+                    role:           'doctor',
+                    status:         'active',
+                    joinedAt:       new Date(),
+                    invitedBy:      req.user._id,
+                }],
+                { session }
+            );
+
+            const [doctor] = await Doctor.create(
+                [{
+                    user:         existingUser._id,
+                    membershipId: newMembership._id,
+                    specialty,
+                    qualifications,
+                    experienceYears,
+                }],
+                { session }
+            );
+
+            await session.commitTransaction();
+            session.endSession();
+
+            audit(req, 'DATA_CREATE', {
+                actorId:      req.user._id,
+                actorRole:    req.user.role,
+                resourceType: 'Doctor',
+                resourceId:   doctor._id,
+                meta:         { event: 'existing_identity_added_to_org', orgId: req.orgId },
+            });
+
+            return res.status(201).json({
+                message: 'This person already has an account and has been onboarded as a doctor at your organisation.',
+                userId:  existingUser._id,
+                doctorId: doctor._id,
+            });
+        }
+
+        // ── Outcome (c): active Membership already at this org ──────────────
+        if (membership.status === 'active') {
+            await session.abortTransaction();
+            session.endSession();
+            return res.status(409).json({
+                message: membership.role === 'doctor'
+                    ? 'A doctor with this email already exists at this organisation.'
+                    : 'This email belongs to an account with a different active role at this organisation. Restore or convert it through account management instead of creating a new doctor.',
+            });
+        }
+
+        // ── Outcome (d): removed Membership at this org ──────────────────────
+        if (membership.role !== 'doctor') {
+            await session.abortTransaction();
+            session.endSession();
+            return res.status(409).json({
+                message: 'This email belongs to a deleted account with a different role at this organisation. ' +
+                          'Restore or convert it through account management instead of creating a new doctor.',
+            });
+        }
+
+        membership.status    = 'active';
+        membership.removedAt = null;
+        await membership.save({ session });
+
+        let doctor = await Doctor.findOne({ membershipId: membership._id }).session(session);
+
+        if (doctor) {
+            doctor.deletedAt        = null;
+            doctor.specialty        = specialty;
+            doctor.qualifications   = qualifications;
+            doctor.experienceYears  = experienceYears;
+            await doctor.save({ session });
+        } else {
+            // Defensive: should not happen given Phase M4's dual-write, but
+            // fails toward creating a fresh profile rather than leaving the
+            // reactivated Membership without any Doctor profile at all.
+            [doctor] = await Doctor.create(
+                [{
+                    user:         existingUser._id,
+                    membershipId: membership._id,
+                    specialty,
+                    qualifications,
+                    experienceYears,
+                }],
+                { session }
+            );
+        }
 
         await session.commitTransaction();
         session.endSession();
 
-        audit(req, 'DATA_CREATE', {
+        audit(req, 'DATA_UPDATE', {
             actorId:      req.user._id,
             actorRole:    req.user.role,
             resourceType: 'Doctor',
             resourceId:   doctor._id,
-            meta:         { orgId: req.orgId },
+            meta:         { action: 'restore', orgId: req.orgId },
         });
 
-        res.status(201).json({ message: 'Doctor created successfully', userId: user._id, doctorId: doctor._id });
+        return res.status(200).json({
+            message:  'Doctor restored successfully',
+            userId:   existingUser._id,
+            doctorId: doctor._id,
+        });
     } catch (err) {
         await session.abortTransaction();
         session.endSession();
@@ -247,69 +434,144 @@ const updateDoctorProfile = async (req, res) => {
 // creation would incorrectly 409 even though the current org has no actual
 // conflict. Scoping the filter to `organisationId: req.orgId` (kept
 // explicit alongside .skipTenantFilter()) closes both.
+// ─── POST /api/admin/staff ────────────────────────────────────────────────────
+// PHASE M6 FIX: same global-identity redesign as createDoctor/registerPatient
+// above — see those for the full outcome-by-outcome rationale. Applied here
+// to receptionist/admin creation (scenario 5 from the architecture doc:
+// "receptionist leaves Hospital A, later joins Hospital B").
 const createStaff = async (req, res) => {
+    const session = await mongoose.startSession();
+    session.startTransaction();
+
     try {
         const { name, email, password, role } = req.body;
 
-        const existingUser = await User
-            .findOne({ email, organisationId: req.orgId })
-            .skipTenantFilter();
+        const matches = await User.find({ email }).session(session).skipTenantFilter();
 
-        if (existingUser && existingUser.deletedAt) {
-            // FIX: role-continuity gate, mirroring the identical fix in
-            // receptionistController.registerPatient. Previously this branch
-            // allowed a silent cross-role conversion (roleChanged was
-            // computed and even surfaced in the response message, but never
-            // used to BLOCK the conversion) — e.g. a deleted doctor account
-            // being restored as 'admin' or 'receptionist' with one API call.
-            // That leaves the deleted-but-still-user-linked Doctor document
-            // orphaned and re-activatable via any deletedAt-unguarded
-            // lookup. Restoration is now only permitted when the requested
-            // role matches the identity's previous role; anything else must
-            // go through an explicit account-conversion workflow.
-            if (existingUser.role !== role) {
-                return res.status(409).json({
-                    message: 'This email belongs to a deleted account with a different role. ' +
-                              'Restore or convert it through account management instead of creating new staff.',
-                });
-            }
+        if (matches.length > 1) {
+            await session.abortTransaction();
+            session.endSession();
+            console.error(`[Admin] createStaff: multiple global User documents share email ${email} — manual resolution required.`, matches.map((m) => m._id));
+            return res.status(409).json({
+                message: 'Multiple accounts exist for this email. Please contact support to resolve this before creating staff.',
+            });
+        }
 
-            existingUser.name      = name;
-            existingUser.password  = password;
-            existingUser.role      = role;
-            existingUser.deletedAt = undefined;
-            await existingUser.save();
+        const existingUser = matches[0] ?? null;
 
-            audit(req, 'DATA_UPDATE', {
+        // ── Outcome (a): brand-new identity ─────────────────────────────────
+        if (!existingUser) {
+            const [user] = await User.create([{ name, email, password, role }], { session });
+
+            await Membership.create(
+                [{
+                    userId:         user._id,
+                    organisationId: req.orgId,
+                    role,
+                    status:         'active',
+                    joinedAt:       new Date(),
+                    invitedBy:      req.user._id,
+                }],
+                { session }
+            );
+
+            await session.commitTransaction();
+            session.endSession();
+
+            audit(req, 'DATA_CREATE', {
                 actorId:      req.user._id,
                 actorRole:    req.user.role,
                 resourceType: 'User',
+                resourceId:   user._id,
+                meta:         { createdRole: role, orgId: req.orgId },
+            });
+
+            return res.status(201).json({ _id: user._id, name: user.name, email: user.email, role: user.role });
+        }
+
+        // Existing identity found — check this org's Membership.
+        const membership = await Membership.findOne({
+            userId:         existingUser._id,
+            organisationId: req.orgId,
+        }).session(session);
+
+        // ── Outcome (b): existing identity, new to THIS org ─────────────────
+        if (!membership) {
+            await Membership.create(
+                [{
+                    userId:         existingUser._id,
+                    organisationId: req.orgId,
+                    role,
+                    status:         'active',
+                    joinedAt:       new Date(),
+                    invitedBy:      req.user._id,
+                }],
+                { session }
+            );
+
+            await session.commitTransaction();
+            session.endSession();
+
+            audit(req, 'DATA_CREATE', {
+                actorId:      req.user._id,
+                actorRole:    req.user.role,
+                resourceType: 'Membership',
                 resourceId:   existingUser._id,
-                meta:         { action: 'restore', newRole: role, orgId: req.orgId },
+                meta:         { event: 'existing_identity_added_to_org', role, orgId: req.orgId },
             });
 
-            return res.status(200).json({
-                message: 'Staff restored successfully',
-                user:    { _id: existingUser._id, name: existingUser.name, email: existingUser.email, role: existingUser.role },
+            return res.status(201).json({
+                message: 'This person already has an account and has been added as staff at your organisation.',
+                _id:     existingUser._id,
+                name:    existingUser.name,
+                email:   existingUser.email,
+                role,
             });
         }
 
-        if (existingUser) {
-            return res.status(409).json({ message: 'A user with this email already exists' });
+        // ── Outcome (c): active Membership already at this org ──────────────
+        if (membership.status === 'active') {
+            await session.abortTransaction();
+            session.endSession();
+            return res.status(409).json({
+                message: membership.role === role
+                    ? 'A user with this email and role already exists at this organisation.'
+                    : 'This email belongs to an account with a different active role at this organisation. Restore or convert it through account management instead of creating new staff.',
+            });
         }
 
-        const user = await User.create({ name, email, password, role });
+        // ── Outcome (d): removed Membership at this org ──────────────────────
+        if (membership.role !== role) {
+            await session.abortTransaction();
+            session.endSession();
+            return res.status(409).json({
+                message: 'This email belongs to a deleted account with a different role at this organisation. ' +
+                          'Restore or convert it through account management instead of creating new staff.',
+            });
+        }
 
-        audit(req, 'DATA_CREATE', {
+        membership.status    = 'active';
+        membership.removedAt = null;
+        await membership.save({ session });
+
+        await session.commitTransaction();
+        session.endSession();
+
+        audit(req, 'DATA_UPDATE', {
             actorId:      req.user._id,
             actorRole:    req.user.role,
-            resourceType: 'User',
-            resourceId:   user._id,
-            meta:         { createdRole: role, orgId: req.orgId },
+            resourceType: 'Membership',
+            resourceId:   existingUser._id,
+            meta:         { action: 'restore', role, orgId: req.orgId },
         });
 
-        res.status(201).json({ _id: user._id, name: user.name, email: user.email, role: user.role });
+        return res.status(200).json({
+            message: 'Staff restored successfully',
+            user:    { _id: existingUser._id, name: existingUser.name, email: existingUser.email, role },
+        });
     } catch (err) {
+        await session.abortTransaction();
+        session.endSession();
         console.error('[Admin] createStaff:', err.message);
         res.status(500).json({ message: 'Failed to create staff member' });
     }

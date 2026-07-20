@@ -1,0 +1,11 @@
+{
+  "generatedAt": "2026-07-17T19:06:40.635Z",
+  "totalDuplicateEmailGroups": 0,
+  "groups": [],
+  "summary": {
+    "crossOrgDuplicateGroups": 0,
+    "sameOrgDuplicateGroups_unexpected": 0,
+    "groupsWhereAllRowsAlreadyDeleted": 0,
+    "groupsNeedingActiveDecision": 0
+  }
+}

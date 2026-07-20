@@ -5,6 +5,40 @@ import Notification from '../models/Notification.js';
 import audit        from '../utils/audit.js';
 import { sendMail, templates } from '../utils/mailer.js';
 
+// PHASE M4 FIX: shared helper for every "find MY doctor profile" lookup.
+//
+// Why this exists: once a single User can hold a Doctor profile at
+// MULTIPLE organisations (the entire point of the Membership redesign —
+// see architecture doc scenario 3, "celebrity doctor at 4 hospitals"),
+// `Doctor.findOne({ user: req.user._id })` becomes ambiguous. It has no
+// way to know which of that person's several Doctor documents belongs to
+// the hospital they're CURRENTLY logged into — it would return whichever
+// one Mongo happens to return first, silently wrong the moment such a
+// doctor exists.
+//
+// `req.membership` (populated by `protect` — see authMiddleware.js Phase
+// M3) is unambiguous: it's the SPECIFIC organisation relationship the
+// current access token was issued for. Doctor.membershipId (Phase M4,
+// backfilled by migration 008) lets every self-service query key off that
+// instead.
+//
+// Backward compatible: a request authenticated with a pre-Phase-M3 token
+// has no `req.membership` at all — falls back to the old user-keyed query.
+// This is safe (not silently wrong) specifically because it's a temporary
+// condition that resolves itself: access tokens are short-lived, so within
+// one 15-minute cycle every session re-authenticates and picks up a
+// membership-bearing token. It does NOT protect against the ambiguity
+// described above for a doctor with multiple orgs during that narrow
+// window — that tradeoff is accepted as part of a zero-forced-logout
+// rollout, consistent with every other Phase M3/M4 backward-compat
+// decision in this migration.
+const buildDoctorSelfFilter = (req) => {
+    if (req.membership && req.membership.role === 'doctor') {
+        return { membershipId: req.membership._id, deletedAt: null };
+    }
+    return { user: req.user._id, deletedAt: null };
+};
+
 // GET /api/doctors
 const getDoctors = async (req, res) => {
     try {
@@ -113,7 +147,7 @@ const getDoctorAvailability = async (req, res) => {
 // GET /api/doctors/my-appointments
 const getMyAssignedAppointments = async (req, res) => {
     try {
-        const doctorProfile = await Doctor.findOne({ user: req.user._id, deletedAt: null }).lean();
+        const doctorProfile = await Doctor.findOne(buildDoctorSelfFilter(req)).lean();
         if (!doctorProfile) return res.status(404).json({ message: 'Doctor profile not found' });
 
         const appointments = await Appointment.find({
@@ -134,7 +168,7 @@ const getMyAssignedAppointments = async (req, res) => {
 // GET /api/doctors/my-profile
 const getMyProfile = async (req, res) => {
     try {
-        const doctorProfile = await Doctor.findOne({ user: req.user._id, deletedAt: null })
+        const doctorProfile = await Doctor.findOne(buildDoctorSelfFilter(req))
             .populate('user', 'name email')
             .lean();
 
@@ -154,7 +188,7 @@ const getPatientHistory = async (req, res) => {
     try {
         const { patientId } = req.params;
 
-        const doctorProfile = await Doctor.findOne({ user: req.user._id, deletedAt: null }).lean();
+        const doctorProfile = await Doctor.findOne(buildDoctorSelfFilter(req)).lean();
         if (!doctorProfile) return res.status(404).json({ message: 'Doctor profile not found' });
 
         const hasRelationship = await Appointment.exists({
@@ -219,7 +253,7 @@ const updateAppointment = async (req, res) => {
         // which let a soft-deleted-then-role-converted user's stale Doctor
         // record still authorise updates against appointments it no longer
         // legitimately owns.
-        const doctorProfile = await Doctor.findOne({ user: req.user._id, deletedAt: null }).lean();
+        const doctorProfile = await Doctor.findOne(buildDoctorSelfFilter(req)).lean();
         if (!doctorProfile || appointment.doctor.toString() !== doctorProfile._id.toString()) {
             return res.status(403).json({ message: 'Not authorised to update this appointment' });
         }
@@ -277,7 +311,7 @@ const updateAppointment = async (req, res) => {
 const updateMyAvailability = async (req, res) => {
     try {
         const { availability } = req.body;
-        const doctorProfile = await Doctor.findOne({ user: req.user._id, deletedAt: null });
+        const doctorProfile = await Doctor.findOne(buildDoctorSelfFilter(req));
         if (!doctorProfile) return res.status(404).json({ message: 'Doctor profile not found' });
 
         doctorProfile.availability = availability;
