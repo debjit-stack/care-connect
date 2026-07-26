@@ -624,7 +624,11 @@ const resetPassword = async (req, res) => {
 // ─── GET /api/admin/doctors-full ─────────────────────────────────────────────
 const getDoctorsWithProfiles = async (req, res) => {
     try {
-        const doctors = await Doctor.find({ deletedAt: null })
+        // FIX (this audit round): no explicit organisationId filter — was
+        // relying purely on tenantPlugin's implicit ambient-context
+        // filter. Made explicit as defense-in-depth, matching the same
+        // fix applied to the public doctor routes in doctorController.js.
+        const doctors = await Doctor.find({ organisationId: req.orgId, deletedAt: null })
             .populate('user', 'name email')
             .lean();
         res.json(doctors);
