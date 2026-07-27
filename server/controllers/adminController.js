@@ -10,13 +10,71 @@ import { revokeAllRefreshTokens } from '../utils/tokens.js';
 import { sendMail, templates }    from '../utils/mailer.js';
 
 // ─── GET /api/admin/users ─────────────────────────────────────────────────────
+// ─── GET /api/admin/users ──────────────────────────────────────────────────
+// PHASE M6/M7 FOLLOW-UP FIX: redesigned to be Membership-first.
+//
+// The old implementation queried User.find({ deletedAt, role }) directly,
+// relying on tenantPlugin's implicit ambient-org filter (comparing against
+// User.organisationId — a single, legacy field) to scope the list to this
+// organisation. That assumption — "one User belongs to one organisation" —
+// is exactly what died with the M5/M6 Identity/Membership redesign: an
+// existing identity's User.organisationId only ever reflects wherever they
+// were FIRST created, and is deliberately never updated when they're added
+// to a second org. Under the old query, any such person became permanently
+// invisible to every org EXCEPT whichever one happened to still match that
+// stale field — which is precisely what caused the admin dashboard to lose
+// the second-hospital doctor in this investigation.
+//
+// The corrected model: Membership is the authoritative source for "who
+// belongs to this organisation, in what capacity." This now queries
+// Membership first (scoped to req.orgId + status:'active', optionally
+// filtered by the requested role — which is the per-org role, not the
+// legacy global one), then resolves the underlying User identities by
+// explicit _id (via .skipTenantFilter(), for the same reason as the
+// doctorController fixes above — identity resolution by _id must not be
+// re-filtered by the User's own stale organisationId once org-scoping has
+// already been correctly established on the Membership side).
+//
+// Response shape is deliberately kept compatible with every existing
+// frontend consumer (AdminDashboard.jsx's users.filter(u => u.role ===
+// 'doctor'/'patient'/...) and DoctorList/PatientList/UserList component
+// props) — each returned object still has a flat `role` field, EXCEPT it
+// is now the correct, per-organisation Membership role rather than the
+// vestigial User.role. No frontend changes required.
 const getUsers = async (req, res) => {
     try {
         const { role } = req.query;
-        const filter = { deletedAt: null };
-        if (role) filter.role = role;
-        const users = await User.find(filter).select('-password').lean();
-        res.json(users);
+
+        const membershipFilter = { organisationId: req.orgId, status: 'active' };
+        if (role) membershipFilter.role = role;
+
+        const memberships = await Membership.find(membershipFilter).lean();
+
+        if (memberships.length === 0) {
+            return res.json([]);
+        }
+
+        const userIds = memberships.map((m) => m.userId);
+
+        const users = await User.find({ _id: { $in: userIds }, deletedAt: null })
+            .select('-password')
+            .skipTenantFilter()
+            .lean();
+
+        const userById = new Map(users.map((u) => [u._id.toString(), u]));
+
+        const result = memberships
+            .filter((m) => userById.has(m.userId.toString()))
+            .map((m) => {
+                const u = userById.get(m.userId.toString());
+                return {
+                    ...u,
+                    role:         m.role,   // authoritative for THIS org — overrides the legacy User.role field
+                    membershipId: m._id,
+                };
+            });
+
+        res.json(result);
     } catch (err) {
         console.error('[Admin] getUsers:', err.message);
         res.status(500).json({ message: 'Failed to fetch users' });
@@ -624,13 +682,16 @@ const resetPassword = async (req, res) => {
 // ─── GET /api/admin/doctors-full ─────────────────────────────────────────────
 const getDoctorsWithProfiles = async (req, res) => {
     try {
-        // FIX (this audit round): no explicit organisationId filter — was
-        // relying purely on tenantPlugin's implicit ambient-context
-        // filter. Made explicit as defense-in-depth, matching the same
-        // fix applied to the public doctor routes in doctorController.js.
+        // FIX (this audit round): explicit organisationId filter —
+        // defense-in-depth, matching the public doctor routes.
+        console.log(`[Admin][getDoctorsWithProfiles] req.orgId = ${req.orgId} (${typeof req.orgId})`);
+
         const doctors = await Doctor.find({ organisationId: req.orgId, deletedAt: null })
             .populate('user', 'name email')
             .lean();
+
+        console.log(`[Admin][getDoctorsWithProfiles] org=${req.orgId} found ${doctors.length} Doctor doc(s)`);
+
         res.json(doctors);
     } catch (err) {
         console.error('[Admin] getDoctorsWithProfiles:', err.message);

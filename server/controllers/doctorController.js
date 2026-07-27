@@ -1,4 +1,5 @@
 import Doctor       from '../models/Doctor.js';
+import Membership   from '../models/Membership.js';
 import Appointment  from '../models/Appointment.js';
 import User         from '../models/User.js';
 import Notification from '../models/Notification.js';
@@ -42,38 +43,55 @@ const buildDoctorSelfFilter = (req) => {
 // GET /api/doctors
 const getDoctors = async (req, res) => {
     try {
-        // FIX (this audit round): two separate bugs closed together.
-        //   1. No explicit organisationId filter — was relying purely on
-        //      tenantPlugin's implicit ambient-context filter. Made
-        //      explicit here as defense-in-depth, consistent with every
-        //      other explicit-over-implicit decision in this migration.
-        //   2. The populate `match: { role: 'doctor' }` checked the
-        //      GLOBAL User.role field — a single value that cannot
-        //      correctly describe a person who is 'doctor' at this org
-        //      but something else (or nothing) at another. Now checks the
-        //      per-org Membership's own role/status instead, which is the
-        //      authoritative source since Phase M3.
-        const doctors = await Doctor.find({ organisationId: req.orgId, deletedAt: null })
-            .populate({
-                path:   'user',
-                select: 'name',
-                match:  { $or: [{ deletedAt: null }, { deletedAt: { $exists: false } }] },
-            })
-            .populate({ path: 'membershipId', select: 'status role' })
-            .lean();
+        // FIX (this audit round, 2nd pass): replaced the previous
+        // .populate({path:'membershipId',...}) approach with an explicit,
+        // SEPARATE query against Membership. This is not just a style
+        // preference — nested populate() combined with .lean() has known
+        // edge cases (silently returning the raw unpopulated ObjectId
+        // instead of the referenced document, particularly sensitive to
+        // exactly when/whether the referenced model has been registered
+        // in this process) that are very hard to diagnose remotely. A
+        // plain, explicit $in query removes that entire class of failure
+        // mode and is trivially easy to log/inspect if it's ever wrong.
+        const doctors = await Doctor.find({ organisationId: req.orgId, deletedAt: null }).lean();
 
-        const visible = doctors.filter((d) =>
-            d.user &&
-            d.membershipId &&
-            d.membershipId.status === 'active' &&
-            d.membershipId.role === 'doctor'
-        );
+        console.log(`[Doctor][getDoctors] org=${req.orgId} found ${doctors.length} non-deleted Doctor doc(s) before membership/user filtering`);
 
-        // membershipId is an internal linkage detail — not part of the
-        // public response shape.
-        const result = visible.map(({ membershipId, ...rest }) => rest);
+        if (doctors.length === 0) {
+            return res.json([]);
+        }
 
-        res.json(result);
+        const membershipIds = doctors.map((d) => d.membershipId).filter(Boolean);
+
+        const activeMemberships = await Membership.find({
+            _id:    { $in: membershipIds },
+            status: 'active',
+            role:   'doctor',
+        }).select('_id').lean();
+
+        const activeMembershipIdSet = new Set(activeMemberships.map((m) => m._id.toString()));
+
+        const userIds = doctors.map((d) => d.user).filter(Boolean);
+        const liveUsers = await User.find({
+            _id: { $in: userIds },
+            $or: [{ deletedAt: null }, { deletedAt: { $exists: false } }],
+        }).select('_id name').skipTenantFilter().lean();
+
+        const liveUserById = new Map(liveUsers.map((u) => [u._id.toString(), u]));
+
+        const visible = doctors
+            .filter((d) =>
+                d.membershipId && activeMembershipIdSet.has(d.membershipId.toString()) &&
+                d.user && liveUserById.has(d.user.toString())
+            )
+            .map((d) => ({
+                ...d,
+                user: liveUserById.get(d.user.toString()),
+            }));
+
+        console.log(`[Doctor][getDoctors] org=${req.orgId} ${visible.length} doctor(s) visible after filtering`);
+
+        res.json(visible);
     } catch (err) {
         console.error('[Doctor] getDoctors:', err.message);
         res.status(500).json({ message: 'Failed to fetch doctors' });
@@ -83,26 +101,28 @@ const getDoctors = async (req, res) => {
 // GET /api/doctors/:id
 const getDoctorById = async (req, res) => {
     try {
-        // FIX (this audit round): same two fixes as getDoctors — explicit
-        // organisationId scoping (also closes a tenant-isolation gap: a
-        // Hospital A visitor could previously fetch Hospital B's doctor
-        // detail page by guessing/enumerating a Doctor _id, since this
-        // query never checked which org it belonged to) and Membership-
-        // based role/status instead of the global User.role field.
-        const doctor = await Doctor.findOne({ _id: req.params.id, organisationId: req.orgId, deletedAt: null })
-            .populate({
-                path:   'user',
-                select: 'name',
-                match:  { $or: [{ deletedAt: null }, { deletedAt: { $exists: false } }] },
-            })
-            .populate({ path: 'membershipId', select: 'status role' })
-            .lean();
+        const doctor = await Doctor.findOne({ _id: req.params.id, organisationId: req.orgId, deletedAt: null }).lean();
+        if (!doctor) return res.status(404).json({ message: 'Doctor not found' });
 
-        const isVisible = doctor && doctor.user && doctor.membershipId?.status === 'active' && doctor.membershipId?.role === 'doctor';
-        if (!isVisible) return res.status(404).json({ message: 'Doctor not found' });
+        console.log(`[Doctor][getDoctorById] org=${req.orgId} doctorId=${req.params.id} membershipId=${doctor.membershipId}`);
 
-        const { membershipId, ...result } = doctor;
-        res.json(result);
+        const membership = doctor.membershipId
+            ? await Membership.findOne({ _id: doctor.membershipId, status: 'active', role: 'doctor' }).lean()
+            : null;
+
+        if (!membership) {
+            console.log(`[Doctor][getDoctorById] no active doctor Membership found for membershipId=${doctor.membershipId}`);
+            return res.status(404).json({ message: 'Doctor not found' });
+        }
+
+        const user = await User.findOne({
+            _id: doctor.user,
+            $or: [{ deletedAt: null }, { deletedAt: { $exists: false } }],
+        }).select('name').skipTenantFilter().lean();
+
+        if (!user) return res.status(404).json({ message: 'Doctor not found' });
+
+        res.json({ ...doctor, user });
     } catch (err) {
         console.error('[Doctor] getDoctorById:', err.message);
         res.status(500).json({ message: 'Failed to fetch doctor' });
@@ -114,19 +134,18 @@ const getDoctorAvailability = async (req, res) => {
     try {
         const { date } = req.query;
 
-        const doctor = await Doctor.findOne({ _id: req.params.id, organisationId: req.orgId, deletedAt: null })
-            .populate({ path: 'membershipId', select: 'status role' })
-            .lean();
+        const doctor = await Doctor.findOne({ _id: req.params.id, organisationId: req.orgId, deletedAt: null }).lean();
         if (!doctor) return res.status(404).json({ message: 'Doctor not found' });
 
-        // FIX (this audit round): same organisationId + Membership-based
-        // check as getDoctors/getDoctorById — previously checked the
-        // GLOBAL User.role field, which cannot correctly describe a person
-        // who holds 'doctor' at one org and something else at another.
-        const linkedUser = await User.findById(doctor.user).select('deletedAt').lean();
-        const isVisible = linkedUser && !linkedUser.deletedAt &&
-            doctor.membershipId?.status === 'active' && doctor.membershipId?.role === 'doctor';
-        if (!isVisible) {
+        const membership = doctor.membershipId
+            ? await Membership.findOne({ _id: doctor.membershipId, status: 'active', role: 'doctor' }).lean()
+            : null;
+        if (!membership) {
+            return res.status(404).json({ message: 'Doctor not found' });
+        }
+
+        const linkedUser = await User.findById(doctor.user).select('deletedAt').skipTenantFilter().lean();
+        if (!linkedUser || linkedUser.deletedAt) {
             return res.status(404).json({ message: 'Doctor not found' });
         }
 
