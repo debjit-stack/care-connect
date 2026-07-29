@@ -1,18 +1,38 @@
 import User           from '../models/User.js';
-import Doctor         from '../models/Doctor.js';
+import Doctor          from '../models/Doctor.js';
+import Membership      from '../models/Membership.js';
 import Appointment    from '../models/Appointment.js';
 import PackageBooking from '../models/PackageBooking.js';
 import HealthPackage  from '../models/HealthPackage.js';
 
 // ─── GET /api/dashboard/stats ─────────────────────────────────────────────────
+// PHASE M6/M7 FOLLOW-UP FIX: totalPatients/totalDoctors and
+// newPatientsLast30Days/newPatientsByMonth previously counted directly
+// against User (filtered by the legacy, single-value User.organisationId +
+// User.role fields, via tenantPlugin's implicit ambient-org filter). Same
+// root cause as the doctor-visibility bug fixed earlier in this
+// investigation: an identity that belongs to MULTIPLE organisations only
+// ever has one (stale) value in User.organisationId — so a "common" doctor
+// or patient who has an active relationship with this org, but was
+// originally CREATED at a different org, was silently excluded from every
+// count here, regardless of having a perfectly valid active Membership at
+// this org right now. This is exactly what was reported: "common doctors
+// are getting excluded in total counting number."
+//
+// Fixed by counting Membership documents (status: 'active', scoped by
+// organisationId + role) instead of User documents — Membership is the
+// authoritative source for "who currently belongs to this organisation, in
+// what capacity" since Phase M3, and every other admin-facing count in this
+// function should eventually follow the same pattern (see follow-up note
+// at the bottom of this file).
 const getDashboardStats = async (req, res) => {
     try {
         const orgId = req.orgId;
 
-        // ── Existing KPIs ─────────────────────────────────────────────────────
+        // ── KPIs — now Membership-based ─────────────────────────────────────
         const [totalPatients, totalDoctors, totalAppointments] = await Promise.all([
-            User.countDocuments({ organisationId: orgId, role: 'patient',  deletedAt: null }).skipTenantFilter(),
-            User.countDocuments({ organisationId: orgId, role: 'doctor',   deletedAt: null }).skipTenantFilter(),
+            Membership.countDocuments({ organisationId: orgId, role: 'patient', status: 'active' }),
+            Membership.countDocuments({ organisationId: orgId, role: 'doctor',  status: 'active' }),
             Appointment.countDocuments({ organisationId: orgId }).skipTenantFilter(),
         ]);
 
@@ -28,10 +48,17 @@ const getDashboardStats = async (req, res) => {
         const thirtyDaysAgo = new Date();
         thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
 
-        const newPatientsLast30Days = await User.countDocuments({
-            organisationId: orgId, role: 'patient', deletedAt: null,
-            createdAt: { $gte: thirtyDaysAgo },
-        }).skipTenantFilter();
+        // "New patients" now means "new active patient MEMBERSHIP at this
+        // org" (joinedAt within the window) rather than "new User document
+        // created" — correctly counts an existing identity who was JUST
+        // added as a patient at this org (e.g. via the M5 identity-reuse
+        // flow), not only genuinely brand-new accounts.
+        const newPatientsLast30Days = await Membership.countDocuments({
+            organisationId: orgId,
+            role:           'patient',
+            status:         'active',
+            joinedAt:       { $gte: thirtyDaysAgo },
+        });
 
         const recentAppointments = await Appointment
             .find({ organisationId: orgId })
@@ -42,15 +69,8 @@ const getDashboardStats = async (req, res) => {
             .limit(5)
             .lean();
 
-        // ── WS3: New chart aggregations ───────────────────────────────────────
+        // ── Chart aggregations ────────────────────────────────────────────────
 
-        // 1. Appointments by month (last 12 months) — line chart
-        // B8 FIX: setHours (local server time) → setUTCHours. All stored
-        // dates in this app are UTC (see Appointment.appointmentDate, always
-        // constructed as `${date}T00:00:00Z`). Using local time here made the
-        // 12-month window boundary drift by the server's UTC offset on any
-        // non-UTC host — a real (if subtle) bug even though Render defaults
-        // to UTC and masks it in production today.
         const twelveMonthsAgo = new Date();
         twelveMonthsAgo.setMonth(twelveMonthsAgo.getMonth() - 11);
         twelveMonthsAgo.setDate(1);
@@ -63,21 +83,18 @@ const getDashboardStats = async (req, res) => {
             { $project: { _id: 0, year: '$_id.year', month: '$_id.month', count: 1 } },
         ]);
 
-        // 2. Appointments by status — pie chart
         const appointmentsByStatus = await Appointment.aggregate([
             { $match: { organisationId: orgId } },
             { $group: { _id: '$status', count: { $sum: 1 } } },
             { $project: { _id: 0, status: '$_id', count: 1 } },
         ]);
 
-        // 3. Appointments by type (Online vs Offline) — donut chart
         const appointmentsByType = await Appointment.aggregate([
             { $match: { organisationId: orgId } },
             { $group: { _id: '$type', count: { $sum: 1 } } },
             { $project: { _id: 0, type: '$_id', count: 1 } },
         ]);
 
-        // 4. Top 5 doctors by appointment count — horizontal bar chart
         const topDoctors = await Appointment.aggregate([
             { $match: { organisationId: orgId, status: { $ne: 'Cancelled' } } },
             { $group: { _id: '$doctor', count: { $sum: 1 } } },
@@ -90,7 +107,6 @@ const getDashboardStats = async (req, res) => {
             { $project: { _id: 0, name: '$user.name', specialty: '$doctor.specialty', count: 1 } },
         ]);
 
-        // 5. Package popularity — bar chart
         const packagePopularity = await PackageBooking.aggregate([
             { $match: { organisationId: orgId } },
             { $group: { _id: '$healthPackage', count: { $sum: 1 } } },
@@ -102,7 +118,6 @@ const getDashboardStats = async (req, res) => {
             { $project: { _id: 0, name: '$pkg.name', price: '$pkg.price', count: 1 } },
         ]);
 
-        // 6. Revenue by month (last 12 months) — area chart
         const revenueByMonth = await PackageBooking.aggregate([
             { $match: { organisationId: orgId, createdAt: { $gte: twelveMonthsAgo } } },
             { $lookup: { from: 'healthpackages', localField: 'healthPackage', foreignField: '_id', as: 'pkg' } },
@@ -117,16 +132,16 @@ const getDashboardStats = async (req, res) => {
             { $project: { _id: 0, year: '$_id.year', month: '$_id.month', revenue: 1, bookings: 1 } },
         ]);
 
-        // 7. New patients per month (last 6 months) — line chart
-        // B8 FIX: same setHours → setUTCHours correction.
+        // New patients per month — same Membership-based fix as
+        // newPatientsLast30Days above, applied to the 6-month chart series.
         const sixMonthsAgo = new Date();
         sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 5);
         sixMonthsAgo.setDate(1);
         sixMonthsAgo.setUTCHours(0, 0, 0, 0);
 
-        const newPatientsByMonth = await User.aggregate([
-            { $match: { organisationId: orgId, role: 'patient', deletedAt: null, createdAt: { $gte: sixMonthsAgo } } },
-            { $group: { _id: { year: { $year: '$createdAt' }, month: { $month: '$createdAt' } }, count: { $sum: 1 } } },
+        const newPatientsByMonth = await Membership.aggregate([
+            { $match: { organisationId: orgId, role: 'patient', status: 'active', joinedAt: { $gte: sixMonthsAgo } } },
+            { $group: { _id: { year: { $year: '$joinedAt' }, month: { $month: '$joinedAt' } }, count: { $sum: 1 } } },
             { $sort: { '_id.year': 1, '_id.month': 1 } },
             { $project: { _id: 0, year: '$_id.year', month: '$_id.month', count: 1 } },
         ]);
@@ -151,6 +166,8 @@ const getDashboardStats = async (req, res) => {
 };
 
 // ─── GET /api/dashboard/export ────────────────────────────────────────────────
+// Unchanged — Appointment records carry their own organisationId directly
+// and are not affected by the User-identity staleness issue.
 const exportAppointments = async (req, res) => {
     try {
         const { from, to } = req.query;
@@ -225,3 +242,12 @@ const exportAppointments = async (req, res) => {
 };
 
 export { getDashboardStats, exportAppointments };
+
+// PHASE M6/M7 FOLLOW-UP NOTE: `topDoctors` above still $lookup's `users` by
+// `doctor.user` (the legacy Doctor.user field, not membershipId) purely for
+// display purposes (doctor's name/specialty in an aggregation result) — not
+// for org-scoping (the pipeline is already correctly scoped to `orgId` at
+// the Appointment/Doctor level before that lookup happens), so it is not
+// affected by the staleness bug this fix addresses. Flagged for
+// completeness, not changed, since it's read-only display data already
+// correctly scoped upstream.

@@ -9,7 +9,50 @@ import audit         from '../utils/audit.js';
 import { revokeAllRefreshTokens } from '../utils/tokens.js';
 import { sendMail, templates }    from '../utils/mailer.js';
 
-// ─── GET /api/admin/users ─────────────────────────────────────────────────────
+// ─── PHASE M6/M7 FOLLOW-UP FIX: shared Membership-aware identity resolver ────
+// Every admin endpoint that acts on a target user by _id (getUserById,
+// updateUser, deleteUser, resetPassword) previously resolved that user via
+// User.findOne({ _id, deletedAt: null }) with NO explicit organisationId —
+// relying entirely on tenantPlugin's implicit ambient-org filter, which
+// compares against the legacy, single-value User.organisationId field.
+//
+// That was accidentally providing tenant isolation ("this admin can only
+// touch users belonging to their own org") as a SIDE EFFECT of an
+// assumption — one User belongs to one org — that died with the M5/M6
+// Identity/Membership redesign. For an identity with an active Membership
+// at a SECOND org, that implicit filter now does the wrong thing entirely:
+// it either hides the user completely (if req.orgId happens not to match
+// their stale field) or, worse, is simply irrelevant to whether they
+// actually belong to the org the admin is acting from.
+//
+// This helper explicitly REPLACES that protection with the correct check:
+// does an ACTIVE Membership exist for (userId, orgId)? Only if so does it
+// resolve the underlying User identity, via .skipTenantFilter() — safe to
+// bypass the legacy implicit filter here ONLY because the Membership check
+// has already independently proven this user belongs to this org.
+//
+// Returns { user, membership } or null if either check fails. Accepts an
+// optional Mongoose session for use inside a transaction (see deleteUser).
+const findOrgScopedUser = async (userId, orgId, session = null) => {
+    const membershipQuery = Membership.findOne({
+        userId,
+        organisationId: orgId,
+        status:         'active',
+    });
+    if (session) membershipQuery.session(session);
+    const membership = await membershipQuery;
+
+    if (!membership) return null;
+
+    const userQuery = User.findOne({ _id: userId, deletedAt: null }).skipTenantFilter();
+    if (session) userQuery.session(session);
+    const user = await userQuery;
+
+    if (!user) return null;
+
+    return { user, membership };
+};
+
 // ─── GET /api/admin/users ──────────────────────────────────────────────────
 // PHASE M6/M7 FOLLOW-UP FIX: redesigned to be Membership-first.
 //
@@ -84,10 +127,16 @@ const getUsers = async (req, res) => {
 // ─── GET /api/admin/users/:id ─────────────────────────────────────────────────
 const getUserById = async (req, res) => {
     try {
-        const user = await User.findOne({ _id: req.params.id, deletedAt: null })
-            .select('-password').lean();
-        if (!user) return res.status(404).json({ message: 'User not found' });
-        res.json(user);
+        const resolved = await findOrgScopedUser(req.params.id, req.orgId);
+        if (!resolved) return res.status(404).json({ message: 'User not found' });
+
+        const { user, membership } = resolved;
+        const plain = user.toObject();
+        delete plain.password;
+
+        // role reflects THIS org's Membership — authoritative, not the
+        // vestigial global User.role field. Matches getUsers()'s shape.
+        res.json({ ...plain, role: membership.role });
     } catch (err) {
         console.error('[Admin] getUserById:', err.message);
         res.status(500).json({ message: 'Failed to fetch user' });
@@ -104,15 +153,20 @@ const getUserById = async (req, res) => {
 const updateUser = async (req, res) => {
     try {
         const { name, email } = req.body;
-        const user = await User.findOne({ _id: req.params.id, deletedAt: null });
-        if (!user) return res.status(404).json({ message: 'User not found' });
+
+        const resolved = await findOrgScopedUser(req.params.id, req.orgId);
+        if (!resolved) return res.status(404).json({ message: 'User not found' });
+        const { user } = resolved;
 
         if (email && email.toLowerCase() !== user.email) {
-            const existsFilter = user.organisationId
-                ? { email: email.toLowerCase(), organisationId: user.organisationId, deletedAt: null, _id: { $ne: user._id } }
-                : { email: email.toLowerCase(), deletedAt: null, _id: { $ne: user._id } };
-
-            const duplicate = await User.findOne(existsFilter).skipTenantFilter();
+            // PHASE M7 FOLLOW-UP: email is now globally unique (see
+            // migration 009) — the duplicate check no longer needs (or
+            // should use) organisationId at all.
+            const duplicate = await User.findOne({
+                email: email.toLowerCase(),
+                deletedAt: null,
+                _id: { $ne: user._id },
+            }).skipTenantFilter();
             if (duplicate) {
                 return res.status(409).json({ message: 'Another account with this email already exists' });
             }
@@ -125,8 +179,6 @@ const updateUser = async (req, res) => {
         try {
             updated = await user.save();
         } catch (saveErr) {
-            // Defensive fallback: a race between the precheck above and the
-            // save (two concurrent requests) can still hit the unique index.
             if (saveErr.code === 11000) {
                 return res.status(409).json({ message: 'Another account with this email already exists' });
             }
@@ -148,7 +200,39 @@ const updateUser = async (req, res) => {
     }
 };
 
-// ─── DELETE /api/admin/users/:id  (soft delete) ───────────────────────────────
+// ─── DELETE /api/admin/users/:id  (remove from THIS organisation) ────────────
+// PHASE M6/M7 FOLLOW-UP FIX (closes the previously-flagged M6-1 issue):
+// full redesign, not a patch.
+//
+// The old implementation resolved the target user via the same
+// legacy-field-dependent lookup fixed elsewhere in this file, AND — more
+// seriously — used `user.organisationId` (the single, stale legacy field)
+// to decide which Membership to mark removed. For a multi-org identity,
+// this was doubly wrong: it could fail to find the user at all when acting
+// from a SECOND org, and even when it did find them, it could flip the
+// WRONG org's Membership to removed — an admin at Hospital B intending to
+// remove a doctor from Hospital B could, in principle, have silently
+// affected their Hospital A relationship instead.
+//
+// It also unconditionally set `user.deletedAt` — treating "remove this
+// person from my organisation" as equivalent to "erase this identity
+// entirely," even though the person might still have a perfectly valid,
+// active Membership at a completely different organisation that has
+// nothing to do with this action. Per the Identity/Membership architecture
+// principle established across this migration: User.deletedAt means the
+// IDENTITY is gone (rare — e.g. a GDPR-style erasure request), and
+// Membership.status is what "removed from THIS org" actually means. This
+// endpoint should only ever touch the latter.
+//
+// Corrected behaviour:
+//   1. Resolve the SPECIFIC active Membership for (userId, req.orgId) —
+//      this IS the tenant-isolation check (replaces the old implicit one).
+//   2. Cascade based on THAT membership's role, scoped to THIS org's data
+//      only (appointments, and — for a doctor — the specific Doctor
+//      profile linked to THIS membership via membershipId, never a bare
+//      "any Doctor for this user" lookup, since a multi-org doctor can
+//      have several).
+//   3. Flip Membership.status to 'removed' — never touch User.deletedAt.
 const deleteUser = async (req, res) => {
     if (req.params.id === req.user._id.toString()) {
         return res.status(400).json({ message: 'You cannot delete your own account' });
@@ -158,72 +242,63 @@ const deleteUser = async (req, res) => {
     session.startTransaction();
 
     try {
-        const user = await User.findOne({ _id: req.params.id, deletedAt: null }).session(session);
-        if (!user) {
+        const resolved = await findOrgScopedUser(req.params.id, req.orgId, session);
+        if (!resolved) {
             await session.abortTransaction();
             session.endSession();
-            return res.status(404).json({ message: 'User not found' });
+            return res.status(404).json({ message: 'User not found at this organisation' });
         }
 
-        if (user.role === 'patient') {
+        const { user, membership } = resolved;
+
+        if (membership.role === 'patient') {
             await Appointment.updateMany(
-                { patient: user._id, status: 'Scheduled' },
-                { $set: { status: 'Cancelled', notes: 'Cancelled: patient account deleted' } },
+                { patient: user._id, organisationId: req.orgId, status: 'Scheduled' },
+                { $set: { status: 'Cancelled', notes: 'Cancelled: patient removed from organisation' } },
                 { session }
             );
         }
 
-        // FIX: was gated on `user.role === 'doctor'` — if a User's role had
-        // ever drifted away from 'doctor' (e.g. via the now-fixed
-        // registerPatient/createStaff role-conversion bug) while a live
-        // Doctor document still existed for them, this cascade would be
-        // silently skipped and the Doctor record would be permanently
-        // orphaned (never soft-deleted, still surfaced by public doctor
-        // routes). Now looks up any live Doctor document linked to this
-        // user directly, regardless of the user's current role, so deletion
-        // always cleans up whatever role-specific records actually exist.
-        const doctorProfile = await Doctor.findOne({ user: user._id, deletedAt: null }).session(session);
-        if (doctorProfile) {
-            await Appointment.updateMany(
-                { doctor: doctorProfile._id, status: 'Scheduled' },
-                { $set: { status: 'Cancelled', notes: 'Cancelled: doctor account deleted' } },
-                { session }
-            );
-            doctorProfile.deletedAt = new Date();
-            await doctorProfile.save({ session });
+        if (membership.role === 'doctor') {
+            // Scoped to the SPECIFIC Doctor profile linked to THIS
+            // membership — not a bare `{ user: user._id }` lookup, which
+            // could match a DIFFERENT organisation's Doctor profile for a
+            // multi-org doctor.
+            const doctorProfile = await Doctor.findOne({ membershipId: membership._id, deletedAt: null }).session(session);
+            if (doctorProfile) {
+                await Appointment.updateMany(
+                    { doctor: doctorProfile._id, organisationId: req.orgId, status: 'Scheduled' },
+                    { $set: { status: 'Cancelled', notes: 'Cancelled: doctor removed from organisation' } },
+                    { session }
+                );
+                doctorProfile.deletedAt = new Date();
+                await doctorProfile.save({ session });
+            }
         }
 
-        user.deletedAt = new Date();
-        await user.save({ session });
-
-        // PHASE M3 FIX: dual-write — the Membership for this user+org must
-        // be removed in the SAME transaction as the User deletion, not
-        // discovered as drift later. This is the Membership-level
-        // equivalent of the Doctor cascade above, and closes the same class
-        // of "child record silently out of sync with its owner" bug for the
-        // new model before it can ever occur.
-        if (user.organisationId) {
-            await Membership.updateOne(
-                { userId: user._id, organisationId: user.organisationId },
-                { $set: { status: 'removed', removedAt: user.deletedAt } },
-                { session }
-            );
-        }
+        membership.status    = 'removed';
+        membership.removedAt = new Date();
+        await membership.save({ session });
 
         await session.commitTransaction();
         session.endSession();
 
+        // Conservative: revoke all of this identity's sessions, forcing
+        // re-login. A fresh login correctly re-resolves whichever OTHER
+        // active memberships (if any) still remain — this is not the same
+        // as deleting the identity, it just ensures no stale token for
+        // THIS removed relationship keeps working past this point.
         await revokeAllRefreshTokens(user._id);
 
         audit(req, 'DATA_DELETE', {
             actorId:      req.user._id,
             actorRole:    req.user.role,
-            resourceType: 'User',
-            resourceId:   user._id,
-            meta:         { orgId: req.orgId },
+            resourceType: 'Membership',
+            resourceId:   membership._id,
+            meta:         { userId: user._id.toString(), role: membership.role, orgId: req.orgId },
         });
 
-        res.json({ message: 'User deactivated successfully' });
+        res.json({ message: 'User removed from this organisation successfully' });
     } catch (err) {
         await session.abortTransaction();
         session.endSession();
@@ -639,8 +714,10 @@ const createStaff = async (req, res) => {
 const resetPassword = async (req, res) => {
     try {
         const { newPassword } = req.body;
-        const user = await User.findOne({ _id: req.params.id, deletedAt: null });
-        if (!user) return res.status(404).json({ message: 'User not found' });
+
+        const resolved = await findOrgScopedUser(req.params.id, req.orgId);
+        if (!resolved) return res.status(404).json({ message: 'User not found' });
+        const { user } = resolved;
 
         user.password = newPassword;
         await user.save();
@@ -684,13 +761,11 @@ const getDoctorsWithProfiles = async (req, res) => {
     try {
         // FIX (this audit round): explicit organisationId filter —
         // defense-in-depth, matching the public doctor routes.
-        console.log(`[Admin][getDoctorsWithProfiles] req.orgId = ${req.orgId} (${typeof req.orgId})`);
 
         const doctors = await Doctor.find({ organisationId: req.orgId, deletedAt: null })
             .populate('user', 'name email')
             .lean();
 
-        console.log(`[Admin][getDoctorsWithProfiles] org=${req.orgId} found ${doctors.length} Doctor doc(s)`);
 
         res.json(doctors);
     } catch (err) {

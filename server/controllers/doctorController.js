@@ -55,7 +55,6 @@ const getDoctors = async (req, res) => {
         // mode and is trivially easy to log/inspect if it's ever wrong.
         const doctors = await Doctor.find({ organisationId: req.orgId, deletedAt: null }).lean();
 
-        console.log(`[Doctor][getDoctors] org=${req.orgId} found ${doctors.length} non-deleted Doctor doc(s) before membership/user filtering`);
 
         if (doctors.length === 0) {
             return res.json([]);
@@ -89,7 +88,6 @@ const getDoctors = async (req, res) => {
                 user: liveUserById.get(d.user.toString()),
             }));
 
-        console.log(`[Doctor][getDoctors] org=${req.orgId} ${visible.length} doctor(s) visible after filtering`);
 
         res.json(visible);
     } catch (err) {
@@ -104,14 +102,12 @@ const getDoctorById = async (req, res) => {
         const doctor = await Doctor.findOne({ _id: req.params.id, organisationId: req.orgId, deletedAt: null }).lean();
         if (!doctor) return res.status(404).json({ message: 'Doctor not found' });
 
-        console.log(`[Doctor][getDoctorById] org=${req.orgId} doctorId=${req.params.id} membershipId=${doctor.membershipId}`);
 
         const membership = doctor.membershipId
             ? await Membership.findOne({ _id: doctor.membershipId, status: 'active', role: 'doctor' }).lean()
             : null;
 
         if (!membership) {
-            console.log(`[Doctor][getDoctorById] no active doctor Membership found for membershipId=${doctor.membershipId}`);
             return res.status(404).json({ message: 'Doctor not found' });
         }
 
