@@ -1,17 +1,11 @@
 import mongoose      from 'mongoose';
 import Organisation from '../models/Organisation.js';
 import User         from '../models/User.js';
+import Membership   from '../models/Membership.js';
 import audit        from '../utils/audit.js';
 import { revokeAllRefreshTokens } from '../utils/tokens.js';
 
 // ─── GET /api/organisations/slug-availability/:slug (super-admin only) ───────
-// PHASE-C addition: supports live slug-availability checking in the
-// guided Hospital Onboarding flow (client/src/pages/HospitalOnboardingPage.jsx),
-// so a conflict surfaces while the user is still typing rather than only on
-// final submit (a 409 from createOrganisation). Deliberately checks
-// EXISTENCE only (deletedAt: null) — a slug belonging to a suspended org is
-// still "taken" and must not be reused, since reactivating that org later
-// would then collide with whatever new org took its slug.
 export const checkSlugAvailability = async (req, res) => {
     try {
         const slug = (req.params.slug || '').toLowerCase().trim();
@@ -29,16 +23,6 @@ export const checkSlugAvailability = async (req, res) => {
 };
 
 // ─── GET /api/organisations (super-admin only) ────────────────────────────────
-// PHASE-B FIX: previously filtered to { deletedAt: null }, which silently
-// excluded every suspended organisation from this list entirely. That was
-// harmless before Phase A added reactivateOrganisation (there was no UI
-// action a suspended org's row could ever need), but now that a super_admin
-// needs to actually SEE a suspended org to reactivate it, filtering it out
-// of the one endpoint that lists organisations makes reactivation
-// unreachable through the UI — the only way to find a suspended org's ID
-// would be a direct database query. This now returns every organisation
-// regardless of status; the client is responsible for displaying status
-// (see SuperAdminDashboard.jsx's Active/Suspended badge).
 export const getAllOrganisations = async (req, res) => {
     try {
         const orgs = await Organisation.find({})
@@ -58,7 +42,6 @@ export const getOrganisationById = async (req, res) => {
         const org = await Organisation.findOne({ _id: req.params.id, deletedAt: null }).lean();
         if (!org) return res.status(404).json({ message: 'Organisation not found' });
 
-        // Org-admin can only read their own org
         if (req.user.role !== 'super_admin' &&
             org._id.toString() !== req.user.organisationId?.toString()) {
             return res.status(403).json({ message: 'Access denied' });
@@ -72,11 +55,6 @@ export const getOrganisationById = async (req, res) => {
 };
 
 // ─── POST /api/organisations (super-admin only) ───────────────────────────────
-// PHASE4 FIX: optionally creates the organisation's first admin user
-// ATOMICALLY with the organisation itself, when `adminUser` is provided in
-// the request body (see organisationValidators.js's adminUserSchema). Both
-// documents are created in a single MongoDB transaction: either both
-// succeed, or neither is persisted.
 export const createOrganisation = async (req, res) => {
     const session = await mongoose.startSession();
     session.startTransaction();
@@ -106,6 +84,26 @@ export const createOrganisation = async (req, res) => {
                 password:       adminUser.password,
                 role:           'admin',
                 organisationId: org._id,
+            }], { session });
+
+            // PHASE M6/M7 FOLLOW-UP FIX: this atomic onboarding path
+            // creates a User directly (bypassing createStaff/registerPatient's
+            // global-identity logic, correctly so — a brand-new organisation's
+            // first admin should always be a fresh identity, never a reuse
+            // decision). It was previously missing the corresponding
+            // Membership document entirely, which every OTHER user-creation
+            // path in the app has created since Phase M3's dual-write. That
+            // gap would have made this admin invisible to every
+            // Membership-based read (getUsers, getDashboardStats,
+            // getPlatformStats, etc.) despite existing and being able to
+            // log in.
+            await Membership.create([{
+                userId:         createdAdmin._id,
+                organisationId: org._id,
+                role:           'admin',
+                status:         'active',
+                joinedAt:       new Date(),
+                invitedBy:      req.user._id,
             }], { session });
         }
 
@@ -225,23 +223,30 @@ export const deleteOrganisation = async (req, res) => {
         org.isActive   = false;
         await org.save();
 
-        const orgUsers = await User
-            .find({ organisationId: org._id, deletedAt: null })
-            .select('_id')
-            .skipTenantFilter()
+        // PHASE M6/M7 FOLLOW-UP FIX: was resolving affected users via
+        // User.find({ organisationId: org._id }) — the legacy, single-value
+        // field. For a multi-org identity whose active relationship with
+        // THIS org is real but whose stale User.organisationId points
+        // elsewhere, that query would miss them entirely, leaving their
+        // session for the now-suspended org still valid. Resolved via
+        // Membership instead — the authoritative source for "who currently
+        // has a relationship with this org."
+        const affectedMemberships = await Membership
+            .find({ organisationId: org._id, status: 'active' })
+            .select('userId')
             .lean();
 
-        await Promise.all(orgUsers.map((u) => revokeAllRefreshTokens(u._id)));
+        await Promise.all(affectedMemberships.map((m) => revokeAllRefreshTokens(m.userId)));
 
         audit(req, 'DATA_DELETE', {
             actorId:      req.user._id,
             actorRole:    req.user.role,
             resourceType: 'Organisation',
             resourceId:   org._id,
-            meta:         { revokedSessionsForUserCount: orgUsers.length },
+            meta:         { revokedSessionsForUserCount: affectedMemberships.length },
         });
 
-        res.json({ message: 'Organisation deactivated successfully', revokedSessionsFor: orgUsers.length });
+        res.json({ message: 'Organisation deactivated successfully', revokedSessionsFor: affectedMemberships.length });
     } catch (err) {
         console.error('[Org] deleteOrganisation:', err.message);
         res.status(500).json({ message: 'Failed to delete organisation' });
@@ -249,29 +254,8 @@ export const deleteOrganisation = async (req, res) => {
 };
 
 // ─── PATCH /api/organisations/:id/reactivate (super-admin only) ──────────────
-// PHASE-A FIX: closes the gap identified during the Super Admin frontend
-// readiness review — deleteOrganisation (above) could suspend an org, but
-// nothing in the API could ever reverse it; the only path back to active
-// was a direct database edit. Deliberately the narrow inverse of
-// deleteOrganisation: clears deletedAt/isActive/suspendedAt only.
-//
-// Does NOT attempt to restore the sessions that were revoked at suspension
-// time (see deleteOrganisation) — that revocation was correct and complete
-// at the time it happened; reactivation just means the org's users CAN log
-// in again going forward, not that their old sessions come back. They log
-// in normally, same as any session-expired user.
-//
-// Does NOT touch billingStatus or plan/trialEndsAt — those are separate,
-// billing-flow concerns (deleteOrganisation never set them either, so
-// there's nothing for this endpoint to symmetrically undo there). If an
-// org's `isAccessible` virtual is still false after reactivation because of
-// an expired trial or a billing-side suspension, that's correct and
-// intentional — this endpoint only reverses what deleteOrganisation does,
-// not every possible reason an org could be inaccessible.
 export const reactivateOrganisation = async (req, res) => {
     try {
-        // Deliberately NOT filtering by deletedAt: null here — the whole
-        // point is to find an org that IS currently deleted/suspended.
         const org = await Organisation.findOne({ _id: req.params.id });
         if (!org) return res.status(404).json({ message: 'Organisation not found' });
 
@@ -300,14 +284,22 @@ export const reactivateOrganisation = async (req, res) => {
 };
 
 // ─── GET /api/organisations/:id/stats (super-admin overview) ──────────────────
+// PHASE M6/M7 FOLLOW-UP FIX: previously counted directly against User,
+// filtered by { organisationId, role } — the same legacy single-value
+// fields responsible for every other instance of this bug fixed in this
+// investigation (doctor visibility, dashboard KPIs, admin user list). An
+// identity whose active relationship with THIS org is real, but whose
+// stale User.organisationId points elsewhere (added to this org via the
+// M5/M6 identity-reuse flow), was silently excluded from every count here.
+// Now counts Membership directly — the authoritative source since Phase M3.
 export const getOrganisationStats = async (req, res) => {
     try {
         const orgId = req.params.id;
 
         const [totalUsers, totalDoctors, totalPatients] = await Promise.all([
-            User.countDocuments({ organisationId: orgId, deletedAt: null }).skipTenantFilter(),
-            User.countDocuments({ organisationId: orgId, role: 'doctor', deletedAt: null }).skipTenantFilter(),
-            User.countDocuments({ organisationId: orgId, role: 'patient', deletedAt: null }).skipTenantFilter(),
+            Membership.countDocuments({ organisationId: orgId, status: 'active' }),
+            Membership.countDocuments({ organisationId: orgId, role: 'doctor',  status: 'active' }),
+            Membership.countDocuments({ organisationId: orgId, role: 'patient', status: 'active' }),
         ]);
 
         res.json({ orgId, totalUsers, totalDoctors, totalPatients });
@@ -318,26 +310,39 @@ export const getOrganisationStats = async (req, res) => {
 };
 
 // ─── GET /api/organisations/platform-stats (super-admin only) ────────────────
-// PHASE-B FIX: totalOrganisations previously counted only { deletedAt: null }
-// — but deleteOrganisation always sets deletedAt alongside isActive: false,
-// so that filter silently excluded every suspended org from the total too.
-// Since activeOrganisations was ALSO scoped to { deletedAt: null }, the two
-// counts were almost always identical in practice, meaning
-// suspendedOrDeletedOrganisations (computed as their difference) would show
-// ~0 regardless of how many organisations were actually suspended — the
-// same "deletedAt used as a combined delete+suspend flag, but read as if it
-// only meant delete" mismatch that also affected getAllOrganisations (see
-// that function's fix above). totalOrganisations now counts every
-// organisation regardless of status; only activeOrganisations stays scoped
-// to the accessible subset, so the subtraction is now meaningful.
+// PHASE M6/M7 FOLLOW-UP FIX: same root cause as getOrganisationStats above,
+// at platform scope. totalDoctors/totalPatients previously counted
+// User.countDocuments({ role: 'doctor'/'patient' }) — a person's GLOBAL
+// User.role field only ever reflects whichever role they had when their
+// identity was first created. Someone created as a doctor at Hospital A
+// who is ALSO an active patient at Hospital B (or vice versa) was
+// permanently invisible to whichever count didn't match their original
+// role, platform-wide, regardless of how many real, active relationships
+// they actually have.
+//
+// Fixed by counting DISTINCT identities with at least one active
+// Membership of that role (Membership.distinct('userId', ...)), rather
+// than counting User documents by their single legacy role field. Note
+// this deliberately counts PEOPLE, not memberships — a doctor active at
+// three hospitals still counts once in totalDoctors, which is the
+// meaningful platform-level metric (distinguishing "how many doctor
+// relationships exist" from "how many distinct people are doctors
+// somewhere" is a product decision; this implements the latter as the more
+// intuitive one for a platform-wide KPI card).
 export const getPlatformStats = async (req, res) => {
     try {
-        const [totalOrganisations, activeOrganisations, totalUsers, totalDoctors, totalPatients] = await Promise.all([
+        const [
+            totalOrganisations,
+            activeOrganisations,
+            totalUsers,
+            doctorUserIds,
+            patientUserIds,
+        ] = await Promise.all([
             Organisation.countDocuments({}),
             Organisation.countDocuments({ deletedAt: null, isActive: true }),
             User.countDocuments({ deletedAt: null }).skipTenantFilter(),
-            User.countDocuments({ deletedAt: null, role: 'doctor' }).skipTenantFilter(),
-            User.countDocuments({ deletedAt: null, role: 'patient' }).skipTenantFilter(),
+            Membership.distinct('userId', { role: 'doctor',  status: 'active' }),
+            Membership.distinct('userId', { role: 'patient', status: 'active' }),
         ]);
 
         res.json({
@@ -345,8 +350,8 @@ export const getPlatformStats = async (req, res) => {
             activeOrganisations,
             suspendedOrDeletedOrganisations: totalOrganisations - activeOrganisations,
             totalUsers,
-            totalDoctors,
-            totalPatients,
+            totalDoctors:  doctorUserIds.length,
+            totalPatients: patientUserIds.length,
         });
     } catch (err) {
         console.error('[Org] getPlatformStats:', err.message);
