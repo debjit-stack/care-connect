@@ -19,6 +19,15 @@ import { verifyMfaPendingToken } from '../utils/tokens.js';
  *   - POST /api/auth/mfa/verify-setup
  *
  * It should NEVER replace the normal protect() middleware.
+ *
+ * PHASE M-follow-up FIX: also surfaces req.mfaOrgId, decoded from the
+ * pending token's orgId claim (see tokens.js). Without this, the MFA
+ * completion step for a multi-org identity had no way to know which
+ * organisation's login attempt the eventual access token should be scoped
+ * to — it would always fall back to whatever generateAccessToken(user)
+ * derives from the (possibly stale, legacy) User.organisationId field.
+ * null for super_admin / platform-login, matching that flow's lack of any
+ * org context at all.
  */
 export const requireMfaPending = async (req, res, next) => {
     try {
@@ -50,9 +59,10 @@ export const requireMfaPending = async (req, res, next) => {
             });
         }
 
-        // Make the user available to downstream controllers
+        // Make the user (and org context) available to downstream controllers
         req.mfaUserId = user._id;
         req.mfaUser = user;
+        req.mfaOrgId = payload.orgId || null;
 
         next();
     } catch (err) {

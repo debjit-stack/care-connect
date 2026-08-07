@@ -1,13 +1,34 @@
 /**
  * server/controllers/adminSecurityController.js
  * P3D: Added sendMail calls on resetUserMfa and updateUserSecurity (forceMfa=true).
- * All existing handler logic preserved exactly from live repo.
+ *
+ * PHASE M-follow-up FIX: getUserSecurity, updateUserSecurity, and
+ * resetUserMfa previously resolved their target user via
+ * User.findOne({ _id, deletedAt: null }) with NO explicit organisationId —
+ * relying entirely on tenantPlugin's implicit ambient-org filter against
+ * the legacy, single-value User.organisationId field. Same root cause as
+ * every other bug fixed in this investigation: for a multi-org identity
+ * whose stale field points elsewhere, these endpoints would 404 a
+ * perfectly valid target user at a second organisation.
+ *
+ * Now resolved via the SAME findOrgScopedUser helper adminController.js
+ * uses (imported from there rather than duplicated) — an ACTIVE Membership
+ * at req.orgId is the explicit tenant-isolation check, replacing the
+ * accidental protection the old implicit filter used to provide.
+ *
+ * Also: forceMfa policy moves from User.forceMfa (global — silently forced
+ * MFA on EVERY organisation an identity belongs to) to Membership.forceMfa
+ * (correctly scoped to the organisation the admin is actually managing).
+ * MFA ENROLLMENT itself (mfaSecret, mfaEnabled, recoveryCodes) stays on
+ * User — that remains identity-level, shared across every org relationship,
+ * which is correct and unchanged.
  */
 
 import Organisation from '../models/Organisation.js';
 import User         from '../models/User.js';
 import audit        from '../utils/audit.js';
 import { sendMail, templates } from '../utils/mailer.js';
+import { findOrgScopedUser }   from './adminController.js';
 
 // ─── GET /api/admin/security ──────────────────────────────────────────────────
 export const getSecuritySettings = async (req, res) => {
@@ -60,8 +81,10 @@ export const updateSecuritySettings = async (req, res) => {
 // ─── GET /api/admin/users/:id/security ───────────────────────────────────────
 export const getUserSecurity = async (req, res) => {
     try {
-        const user = await User.findOne({ _id: req.params.id, deletedAt: null });
-        if (!user) return res.status(404).json({ message: 'User not found.' });
+        const resolved = await findOrgScopedUser(req.params.id, req.orgId);
+        if (!resolved) return res.status(404).json({ message: 'User not found.' });
+
+        const { user, membership } = resolved;
 
         audit(req, 'SECURITY_USER_VIEWED', {
             actorId:      req.user._id,
@@ -72,7 +95,9 @@ export const getUserSecurity = async (req, res) => {
 
         return res.json({
             mfaEnabled:     user.mfaEnabled,
-            forceMfa:       user.forceMfa       ?? false,
+            // forceMfa now read from THIS organisation's Membership, not
+            // the global User field — see file header.
+            forceMfa:       membership.forceMfa ?? false,
             lastMfaResetAt: user.lastMfaResetAt ?? null,
         });
     } catch (err) {
@@ -98,19 +123,21 @@ export const updateUserSecurity = async (req, res) => {
             return res.status(400).json({ message: 'forceMfa must be a boolean.' });
         }
 
-        const user = await User.findOne({ _id: req.params.id, deletedAt: null });
-        if (!user) return res.status(404).json({ message: 'User not found.' });
+        const resolved = await findOrgScopedUser(req.params.id, req.orgId);
+        if (!resolved) return res.status(404).json({ message: 'User not found.' });
 
-        const wasAlreadyForced = user.forceMfa;
-        user.forceMfa = forceMfa;
-        await user.save();
+        const { user, membership } = resolved;
+
+        const wasAlreadyForced = membership.forceMfa ?? false;
+        membership.forceMfa = forceMfa;
+        await membership.save();
 
         audit(req, 'SECURITY_FORCE_MFA_UPDATED', {
             actorId:      req.user._id,
             actorRole:    req.user.role,
-            resourceType: 'User',
-            resourceId:   user._id,
-            meta:         { forceMfa },
+            resourceType: 'Membership',
+            resourceId:   membership._id,
+            meta:         { forceMfa, userId: user._id.toString(), orgId: req.orgId },
         });
 
         // P3D: Notify user when admin forces MFA on their account (not when removing)
@@ -132,7 +159,7 @@ export const updateUserSecurity = async (req, res) => {
             message:  'User security updated successfully.',
             security: {
                 mfaEnabled:     user.mfaEnabled,
-                forceMfa:       user.forceMfa,
+                forceMfa:       membership.forceMfa,
                 lastMfaResetAt: user.lastMfaResetAt,
             },
         });
@@ -144,11 +171,23 @@ export const updateUserSecurity = async (req, res) => {
 
 // ─── POST /api/admin/users/:id/reset-mfa ─────────────────────────────────────
 // P3D: Sends mfaResetByAdmin email to the affected user.
+//
+// NOTE: MFA enrollment (mfaSecret/mfaEnabled/recoveryCodes) is
+// identity-level, not organisation-level — resetting it here affects the
+// person's login EVERYWHERE they have an active Membership, not just at
+// req.orgId. This is a deliberate, existing product decision (see the
+// architecture discussion on resetPassword having the same property), not
+// something this fix changes — flagged here only so it's explicit rather
+// than assumed.
 export const resetUserMfa = async (req, res) => {
     try {
+        const resolved = await findOrgScopedUser(req.params.id, req.orgId);
+        if (!resolved) return res.status(404).json({ message: 'User not found.' });
+
         const user = await User
-            .findOne({ _id: req.params.id, deletedAt: null })
-            .select('+mfaSecret +recoveryCodes');
+            .findById(resolved.user._id)
+            .select('+mfaSecret +recoveryCodes')
+            .skipTenantFilter();
 
         if (!user) return res.status(404).json({ message: 'User not found.' });
 
@@ -163,6 +202,7 @@ export const resetUserMfa = async (req, res) => {
             actorRole:    req.user.role,
             resourceType: 'User',
             resourceId:   user._id,
+            meta:         { orgId: req.orgId },
         });
 
         // P3D: Security email to affected user (fire-and-forget)

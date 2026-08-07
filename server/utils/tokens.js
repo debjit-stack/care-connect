@@ -42,9 +42,16 @@ export const verifyAccessToken = (token) => {
     return jwt.verify(token, process.env.JWT_SECRET);
 };
 
-export const generateMfaPendingToken = (userId) => {
+// PHASE M-follow-up FIX: mfaPending tokens now carry an optional orgId
+// claim. Previously this token identified ONLY the user, with no record of
+// which organisation's login attempt produced it — meaning the MFA
+// completion step (verifySetup/validateMfa/recoverWithCode) had no way to
+// know which Membership to attach the eventual access token to for a
+// multi-org identity. Backward compatible: orgId defaults to null (matches
+// super_admin/platform-login, which has no org at all).
+export const generateMfaPendingToken = (userId, orgId = null) => {
     return jwt.sign(
-        { id: userId, mfaPending: true },
+        { id: userId, orgId: orgId ? orgId.toString() : null, mfaPending: true },
         process.env.JWT_MFA_PENDING_SECRET || process.env.JWT_SECRET + '_mfa',
         { expiresIn: MFA_PENDING_EXPIRES }
     );

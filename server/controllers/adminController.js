@@ -805,4 +805,5 @@ export {
     getUsers, getUserById, updateUser, deleteUser,
     createDoctor, updateDoctorProfile, createStaff,
     resetPassword, getDoctorsWithProfiles, getPackagesFull,
+    findOrgScopedUser,
 };

@@ -502,16 +502,40 @@ const GENERIC_FORGOT_PASSWORD_MESSAGE =
     'If an account with that email exists, a verification code has been sent.';
 
 // ─── POST /api/auth/forgot-password ───────────────────────────────────────────
+// PHASE M-follow-up FIX: shared identity+membership resolver for the whole
+// forgot-password family below. Previously each of these three functions
+// looked up User scoped by { email, organisationId: org._id } — the same
+// legacy, single-value field responsible for every other bug in this
+// investigation. A multi-org identity whose stale User.organisationId
+// pointed elsewhere would silently fail every lookup here, receiving the
+// generic "if an account exists..." response with NO OTP ever sent —
+// indistinguishable from a wrong email, but for a real, valid account at
+// a second organisation.
+//
+// Fixed by resolving the identity GLOBALLY (by email alone), then
+// requiring an ACTIVE Membership at the resolved org (if any) before
+// treating the account as eligible. No-org deployments are unaffected —
+// org is null, the membership check is skipped, matching prior behaviour.
+const resolveForgotPasswordEligibleUser = async (email, org) => {
+    const user = await User.findOne({ email, deletedAt: null }).skipTenantFilter();
+    if (!user) return null;
+
+    if (org) {
+        const membership = await Membership.findOne({
+            userId: user._id, organisationId: org._id, status: 'active',
+        });
+        if (!membership) return null;
+    }
+
+    return user;
+};
+
 const forgotPassword = async (req, res) => {
     try {
         const { email } = req.body;
         const org = await resolveOrgFromRequest(req);
 
-        const userFilter = org
-            ? { email, organisationId: org._id, deletedAt: null }
-            : { email, deletedAt: null };
-
-        const user = await User.findOne(userFilter).skipTenantFilter();
+        const user = await resolveForgotPasswordEligibleUser(email, org);
 
         if (user) {
             const otp     = generateOtp();
@@ -526,7 +550,7 @@ const forgotPassword = async (req, res) => {
                 userAgent:  req.headers['user-agent'] || null,
             }, FORGOT_PASSWORD_OTP_TTL_SECONDS, user._id.toString());
 
-            const userOrg = user.organisationId ? await Organisation.findById(user.organisationId) : org;
+            const userOrg = org ?? (user.organisationId ? await Organisation.findById(user.organisationId) : null);
             sendMail({
                 to:  user.email,
                 org: userOrg,
@@ -557,10 +581,7 @@ const resendForgotPasswordOtp = async (req, res) => {
     try {
         const { email } = req.body;
         const org = await resolveOrgFromRequest(req);
-        const userFilter = org
-            ? { email, organisationId: org._id, deletedAt: null }
-            : { email, deletedAt: null };
-        const user = await User.findOne(userFilter).skipTenantFilter();
+        const user = await resolveForgotPasswordEligibleUser(email, org);
 
         if (user) {
             const session = await getSession('forgot', user._id.toString());
@@ -575,7 +596,7 @@ const resendForgotPasswordOtp = async (req, res) => {
                         lastSentAt: Date.now(),
                     }, { ttlSeconds: FORGOT_PASSWORD_OTP_TTL_SECONDS });
 
-                    const userOrg = user.organisationId ? await Organisation.findById(user.organisationId) : org;
+                    const userOrg = org ?? (user.organisationId ? await Organisation.findById(user.organisationId) : null);
                     sendMail({
                         to:  user.email,
                         org: userOrg,
@@ -604,10 +625,7 @@ const verifyForgotPasswordOtp = async (req, res) => {
     try {
         const { email, otp } = req.body;
         const org = await resolveOrgFromRequest(req);
-        const userFilter = org
-            ? { email, organisationId: org._id, deletedAt: null }
-            : { email, deletedAt: null };
-        const user = await User.findOne(userFilter).skipTenantFilter();
+        const user = await resolveForgotPasswordEligibleUser(email, org);
 
         const GENERIC_INVALID = { status: 401, message: 'Invalid or expired code.' };
 
@@ -698,10 +716,11 @@ const resetPasswordWithToken = async (req, res) => {
 const sendMfaChallenge = (
     res,
     userId,
+    orgId,
     setupRequired,
     message
 ) => {
-    const mfaPending = generateMfaPendingToken(userId);
+    const mfaPending = generateMfaPendingToken(userId, orgId);
 
     return res.status(200).json({
         mfaRequired: true,
@@ -756,7 +775,17 @@ const verifyPasswordAndLockout = async (req, user, org = null) => {
     return { outcome: 'match' };
 };
 
-const authenticateAndRespond = async (req, res, user, org) => {
+// PHASE M-follow-up FIX: authenticateAndRespond now accepts the ALREADY-
+// RESOLVED Membership for this login attempt (membership = null for
+// super_admin/platform-login, which has none). forceMfa policy is read
+// from membership.forceMfa — the per-organisation setting — instead of the
+// global user.forceMfa field. That field was never actually scoped to any
+// one org; an admin forcing MFA "for this organisation" via
+// adminSecurityController.updateUserSecurity was silently forcing it on
+// EVERY organisation that identity belongs to. See Membership.js's own
+// schema comment, which flagged this exact migration as a Phase M3
+// TODO that was never completed until now.
+const authenticateAndRespond = async (req, res, user, org, membership = null) => {
     const check = await verifyPasswordAndLockout(req, user, org);
 
     if (check.outcome !== 'match') {
@@ -770,23 +799,44 @@ const authenticateAndRespond = async (req, res, user, org) => {
 
     // Enterprise MFA Decision Tree (STAFF ONLY from here down).
     const orgMfaRequired = org?.features?.mfaRequired ?? false;
-    const forceMfa = Boolean(user.forceMfa);
+    const forceMfa = membership ? Boolean(membership.forceMfa) : Boolean(user.forceMfa);
+    const orgId = org?._id ?? null;
 
     if (orgMfaRequired || forceMfa) {
         if (user.mfaEnabled) {
-            return sendMfaChallenge(res, user._id, false, 'Please enter your authenticator code.');
+            return sendMfaChallenge(res, user._id, orgId, false, 'Please enter your authenticator code.');
         }
-        return sendMfaChallenge(res, user._id, true, 'Your organisation requires MFA.');
+        return sendMfaChallenge(res, user._id, orgId, true, 'Your organisation requires MFA.');
     }
 
     if (user.mfaEnabled) {
-        return sendMfaChallenge(res, user._id, false, 'Please enter your authenticator code.');
+        return sendMfaChallenge(res, user._id, orgId, false, 'Please enter your authenticator code.');
     }
 
     return issueLoginResponse(res, req, user, org);
 };
 
 // ─── POST /api/auth/login (hospital users only) ────────────────────────────────
+// PHASE M-follow-up FIX (CRITICAL): full redesign of identity resolution.
+//
+// Previously looked up User scoped by { email, organisationId: orgId } —
+// the same legacy, single-value field responsible for every other bug in
+// this investigation. For an identity added to a SECOND organisation via
+// the M6 identity-reuse flow (createDoctor/createStaff), User.organisationId
+// permanently reflects only wherever they were FIRST created. Logging into
+// that second organisation therefore found NO user at all, and the person
+// received "Invalid email or password" — indistinguishable from a wrong
+// password, for a perfectly valid account. This made every multi-org
+// scenario this migration exists to support (celebrity doctor, staff
+// moving hospitals) unreachable via the normal login page for any
+// organisation after the first.
+//
+// Fixed by resolving the identity GLOBALLY (by email alone, exactly as
+// registerPatient/createStaff/createDoctor already do), then requiring an
+// ACTIVE Membership at the resolved org before proceeding — using the
+// SAME generic "Invalid email or password" message as every other failure
+// mode here, so this never becomes an account-enumeration oracle for
+// "does this email exist, just not at this org."
 const loginUser = async (req, res) => {
     try {
         const { email } = req.body;
@@ -826,12 +876,9 @@ const loginUser = async (req, res) => {
 
         if (org && !org.isAccessible) return res.status(403).json({ message: 'Organisation account is not active.' });
 
-        const userFilter = orgId
-            ? { email, organisationId: orgId, deletedAt: null }
-            : { email, deletedAt: null };
-
+        // Global identity lookup — no organisationId in this query at all.
         const user = await User
-            .findOne(userFilter)
+            .findOne({ email, deletedAt: null })
             .select('+password +loginAttempts +lockUntil +passwordChangedAt +forceMfa')
             .skipTenantFilter();
 
@@ -840,7 +887,23 @@ const loginUser = async (req, res) => {
             return res.status(401).json({ message: 'Invalid email or password' });
         }
 
-        return authenticateAndRespond(req, res, user, org);
+        // If a specific org was resolved for this request, this identity
+        // must have an ACTIVE Membership there — this check REPLACES the
+        // protection the old org-scoped query provided, since email is no
+        // longer sufficient on its own to prove "belongs to this org."
+        let membership = null;
+        if (orgId) {
+            membership = await Membership.findOne({ userId: user._id, organisationId: orgId, status: 'active' });
+            if (!membership) {
+                audit(req, 'AUTH_LOGIN_FAILED', {
+                    actorId: user._id, actorRole: user.role, success: false,
+                    meta: { reason: 'no_active_membership_at_org', orgId: orgId.toString() },
+                });
+                return res.status(401).json({ message: 'Invalid email or password' });
+            }
+        }
+
+        return authenticateAndRespond(req, res, user, org, membership);
     } catch (err) {
         console.error('[Auth] loginUser:', err.message);
         return res.status(500).json({ message: 'Login failed. Please try again.' });
@@ -866,10 +929,11 @@ const platformLoginUser = async (req, res) => {
             return res.status(401).json({ message: 'Invalid email or password.' });
         }
 
-        // Super Admin never belongs to an organisation — issueLoginResponse
-        // will correctly resolve no Membership at all (see
-        // resolveOrCreateMembership's super_admin guard).
-        return authenticateAndRespond(req, res, superAdmin, null);
+        // Super Admin never belongs to an organisation — no Membership to
+        // resolve; forceMfa evaluation falls back to superAdmin.forceMfa
+        // (the global field), which is the correct source for a role that
+        // structurally cannot have a per-org policy.
+        return authenticateAndRespond(req, res, superAdmin, null, null);
     } catch (err) {
         console.error('[Auth] platformLoginUser:', err.message);
         return res.status(500).json({ message: 'Login failed. Please try again.' });
@@ -1050,4 +1114,5 @@ export {
     logoutUser, logoutAllDevices, changePassword, getMe, stepUpVerify,
     requestRegistrationOtp, resendRegistrationOtp, verifyRegistrationOtp,
     forgotPassword, resendForgotPasswordOtp, verifyForgotPasswordOtp, resetPasswordWithToken,
+    resolveOrCreateMembership,
 };

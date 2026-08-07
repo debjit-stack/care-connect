@@ -6,10 +6,31 @@
  * P3C: POST /mfa/recover, POST /mfa/regenerate-codes
  * P3D: Security emails on enable/disable
  *
- * All existing handler logic is preserved exactly.
+ * PHASE M-follow-up FIX: verifySetup, validateMfa, and recoverWithCode all
+ * previously called generateAccessToken(user) with NO second argument, so
+ * every token minted via these three paths permanently omitted the
+ * membershipId claim — regardless of how many phases of the M1–M7
+ * migration had otherwise been completed. Combined with the (now also
+ * fixed) loginUser bug, this meant even a correctly-onboarded multi-org
+ * identity whose destination org required MFA had no way to reach a
+ * correctly-scoped session: the mfaPending token itself carried no org
+ * information at all (see tokens.js's generateMfaPendingToken), so there
+ * was nothing here to resolve a Membership FROM even if these functions
+ * had remembered to try.
+ *
+ * Fixed by threading org context through the whole MFA challenge/response
+ * cycle: the mfaPending token now carries an optional orgId claim (set at
+ * the point sendMfaChallenge is called in authController.js), decoded here
+ * via requireMfaPending (for the header-token routes) or directly via
+ * verifyMfaPendingToken (for the body-token routes), and used to resolve
+ * or create the correct Membership before minting the final access token —
+ * reusing the exact same resolveOrCreateMembership helper authController.js
+ * already uses for the ordinary (non-MFA) login path, imported from there
+ * rather than duplicated.
  */
 
 import User      from '../models/User.js';
+import Organisation from '../models/Organisation.js';
 import audit     from '../utils/audit.js';
 import {
     generateSecret,
@@ -35,6 +56,7 @@ import {
     deleteMfaSetupSession,
 } from '../utils/mfaSetupStore.js';
 import { sendMail, templates } from '../utils/mailer.js';
+import { resolveOrCreateMembership } from './authController.js';
 
 // ─── GET /api/auth/mfa/setup ──────────────────────────────────────────────────
 export const setupMfa = async (req, res) => {
@@ -155,14 +177,23 @@ export const verifySetup = async (req, res) => {
             ...templates.mfaEnabled({ userName: user.name, org }),
         });
 
-        const accessToken  = generateAccessToken(user);
+        // PHASE M-follow-up FIX: resolve/create the Membership for the org
+        // this MFA challenge was originally issued for (req.mfaOrgId, set
+        // by requireMfaPending from the pending token's orgId claim — see
+        // tokens.js and mfaPendingMiddleware.js), and embed it in the
+        // final access token. Previously this always omitted membershipId
+        // entirely, regardless of which org the login attempt was for.
+        const mfaOrg = req.mfaOrgId ? await Organisation.findById(req.mfaOrgId) : null;
+        const membership = await resolveOrCreateMembership(user, mfaOrg);
+
+        const accessToken  = generateAccessToken(user, membership?._id ?? null);
         const refreshToken = await generateRefreshToken(user._id);
         setRefreshCookie(res, refreshToken);
 
         audit(req, 'AUTH_LOGIN_SUCCESS', {
             actorId:   user._id,
             actorRole: user.role,
-            meta:      { method: 'mfa_setup' },
+            meta:      { method: 'mfa_setup', orgId: req.mfaOrgId ?? null, membershipId: membership?._id?.toString() ?? null },
         });
 
         return res.json({
@@ -251,14 +282,21 @@ export const validateMfa = async (req, res) => {
         // P3B: Clear counter on success
         await clearOtpFailures(user._id);
 
-        const accessToken  = generateAccessToken(user);
+        // PHASE M-follow-up FIX: resolve/create the Membership for the org
+        // carried by the mfaPending token (pending.orgId — see tokens.js),
+        // and embed it in the final access token, exactly like the setup
+        // path above.
+        const pendingOrg = pending.orgId ? await Organisation.findById(pending.orgId) : null;
+        const membership = await resolveOrCreateMembership(user, pendingOrg);
+
+        const accessToken  = generateAccessToken(user, membership?._id ?? null);
         const refreshToken = await generateRefreshToken(user._id);
         setRefreshCookie(res, refreshToken);
 
         audit(req, 'AUTH_LOGIN_SUCCESS', {
             actorId:   user._id,
             actorRole: user.role,
-            meta:      { method: 'mfa_totp' },
+            meta:      { method: 'mfa_totp', orgId: pending.orgId ?? null, membershipId: membership?._id?.toString() ?? null },
         });
 
         return res.json({
@@ -412,7 +450,12 @@ export const recoverWithCode = async (req, res) => {
 
         await clearOtpFailures(`recover:${user._id}`);
 
-        const accessToken  = generateAccessToken(user);
+        // PHASE M-follow-up FIX: same org-context resolution as
+        // validateMfa above.
+        const pendingOrg = pending.orgId ? await Organisation.findById(pending.orgId) : null;
+        const membership = await resolveOrCreateMembership(user, pendingOrg);
+
+        const accessToken  = generateAccessToken(user, membership?._id ?? null);
         const refreshToken = await generateRefreshToken(user._id);
         setRefreshCookie(res, refreshToken);
 
@@ -422,7 +465,7 @@ export const recoverWithCode = async (req, res) => {
         audit(req, 'AUTH_LOGIN_SUCCESS', {
             actorId:   user._id,
             actorRole: user.role,
-            meta:      { method: 'recovery_code', remainingCodes },
+            meta:      { method: 'recovery_code', remainingCodes, orgId: pending.orgId ?? null, membershipId: membership?._id?.toString() ?? null },
         });
 
         return res.json({
